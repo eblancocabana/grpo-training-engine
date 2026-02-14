@@ -89,6 +89,7 @@ class GSM8KBenchmark:
                     max_new_tokens=512,
                     do_sample=False,
                     temperature=1.0,
+                    top_p=None,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                 )

@@ -20,7 +20,8 @@ class RuleBasedVerifier:
         self.answer_tag_pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
         
         # Pattern to extract boxed answer: \boxed{...}
-        self.boxed_pattern = re.compile(r'\\boxed\{([^{}]+)\}', re.DOTALL)
+        # Handles nested braces by matching balanced curly braces
+        self.boxed_pattern = re.compile(r'\\boxed\{((?:[^{}]|\{[^{}]*\})+)\}', re.DOTALL)
         
         # Pattern to extract "The answer is X" or "Final Answer: X"
         self.final_answer_pattern = re.compile(
@@ -63,7 +64,13 @@ class RuleBasedVerifier:
         # Try \boxed{}
         matches = self.boxed_pattern.findall(text)
         if matches:
-            return matches[-1].strip()
+            boxed_content = matches[-1].strip()
+            # Extract the first number from boxed content
+            # Boxed content may contain LaTeX like "1250 \text{ fluid ounces}"
+            number_matches = self.number_pattern.findall(boxed_content)
+            if number_matches:
+                return number_matches[0]
+            return boxed_content
             
         return None
     

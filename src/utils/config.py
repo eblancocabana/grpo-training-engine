@@ -86,7 +86,7 @@ class TrainingConfig:
     # Data
     dataset_name: str = "gsm8k"
     max_prompt_length: int = 512
-    max_response_length: int = 512
+    max_response_length: int = 384
     verbosity: int = 0
     
     # Training loop
@@ -121,9 +121,13 @@ class TrainingConfig:
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
 
+    @property
+    def debug(self) -> bool:
+        """Backward-compatible debug property."""
+        return self.verbosity >= 1
 
-# Backward-compatible debug property
-TrainingConfig.debug = property(lambda self: self.verbosity >= 1)
+
+# (debug property implemented on the TrainingConfig dataclass)
 
 
 @dataclass
@@ -191,7 +195,7 @@ def get_8gb_vram_config() -> Config:
     config.training.gradient_accumulation_steps = 16
     config.training.enable_gradient_checkpointing = True
     config.training.max_prompt_length = 128
-    config.training.max_response_length = 512
+    config.training.max_response_length = 384
     config.training.clear_cache_frequency = 50
     
     # WandB settings
@@ -201,4 +205,3 @@ def get_8gb_vram_config() -> Config:
     config.wandb.implementation = "python"
     
     return config
-

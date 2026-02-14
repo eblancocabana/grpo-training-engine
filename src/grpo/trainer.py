@@ -15,15 +15,10 @@ import time
 import math
 import argparse
 import logging
+import json
+import hashlib
 
 from src.utils.logging_utils import get_logger, TRACE, log_tensor_meta
-
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
 
 # Module-level logger
 logger = get_logger("trainer")
@@ -40,6 +35,13 @@ from src.data.gsm8k_loader import create_grpo_dataloader
 from src.grpo.benchmark import GSM8KBenchmark
 from src.utils.checkpoint import CheckpointManager, save_training_config
 from src.utils.config import Config, get_8gb_vram_config
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 class GRPOTrainerLoop:
@@ -374,8 +376,6 @@ class GRPOTrainerLoop:
         attention_mask = batch["attention_mask"].to(self.device)
         ground_truths = batch["answers"]
 
-        batch_size = input_ids.shape[0]
-
         # Phase 1: Generation (no gradients)
         self.memory_manager.optimize_for_inference()
 
@@ -419,19 +419,39 @@ class GRPOTrainerLoop:
                 batch_rewards = rewards_list[start_idx:end_idx]
                 batch_infos = debug_infos[start_idx:end_idx]
 
+                # Calculate statistics
+                correct_count = sum(1 for rew in batch_rewards if rew > 0.5)
+                total_count = len(batch_rewards)
+                failed_count = total_count - correct_count
+
+                logger.debug(
+                    "Responses: %d total | %d correct | %d failed",
+                    total_count, correct_count, failed_count
+                )
+                logger.debug("")
+
+                # Only show failed responses
+                failed_shown = 0
                 for i, (resp, rew, info) in enumerate(
                     zip(batch_responses, batch_rewards, batch_infos)
                 ):
-                    logger.debug("Response %s (Reward: %.2f):", i + 1, rew)
+                    if rew > 0.5:
+                        continue  # Skip correct responses
+
+                    failed_shown += 1
+                    logger.debug("[FAILED] Response %d (Reward: %.2f):", i + 1, rew)
                     clean_resp = resp.replace("\n", "\\n")
-                    logger.debug("%s", clean_resp)
+                    logger.debug("  -> Text: %s", clean_resp[:200])
+                    if len(clean_resp) > 200:
+                        logger.debug("     ... (truncated)")
 
                     logger.debug("  -> Extracted: %s", info.get("extracted_answer"))
-                    logger.debug(
-                        "  -> GT Extracted: %s", info.get("ground_truth_answer")
-                    )
+                    logger.debug("  -> GT: %s", info.get("ground_truth_answer"))
                     logger.debug("  -> Match: %s", info.get("match"))
                     logger.debug("-" * 10)
+
+                if failed_shown == 0:
+                    logger.debug("All responses correct!")
             logger.debug("=" * 40)
         # -------------------
 
@@ -496,7 +516,6 @@ class GRPOTrainerLoop:
         # Create response-only mask: 0 for prompt tokens, 1 for response tokens
         # This ensures only response tokens contribute to loss (like grpo_zero's batch_masks)
         prompt_len = prompt_ids_expanded.shape[1]
-        resp_len = response_ids.shape[1]
         num_samples = all_input_ids.shape[0]
 
         # response_only_mask: [batch*G, prompt_len + resp_len]
@@ -723,9 +742,12 @@ class GRPOTrainerLoop:
                 if self.global_step % self.config.training.log_interval == 0:
                     self.memory_manager.print_memory_stats(f"[Step {self.global_step}]")
 
-                # Benchmark evaluation
-                if self.global_step % self.config.training.eval_interval == 0:
-                    self.benchmark.run(self.global_step)
+                # Benchmark evaluation every 100 steps
+                if self.global_step % 100 == 0:
+                    try:
+                        self.benchmark.run(self.global_step)
+                    except Exception as e:
+                        logger.info("[Benchmark] Failed at step %s: %s", self.global_step, e)
 
                 # Save checkpoint
                 if self.global_step % self.config.training.save_interval == 0:
@@ -803,6 +825,79 @@ class GRPOTrainerLoop:
         save_training_config(
             self.config, os.path.join(self.config.training.output_dir, "config.json")
         )
+
+        # Run initial benchmark once per model/config (sentinel)
+        baseline_marker = os.path.join(self.config.training.output_dir, "baseline_benchmark_done.json")
+        force = getattr(self.config.training, "force_initial_benchmark", False)
+
+        def _has_checkpoints() -> bool:
+            ckpt_dir = getattr(self.config.training, "checkpoint_dir", None)
+            if not ckpt_dir:
+                return False
+            if not os.path.isdir(ckpt_dir):
+                return False
+            for f in os.listdir(ckpt_dir):
+                if f.startswith("checkpoint_step_") or f.endswith(".pt"):
+                    return True
+            return False
+
+        run_initial = True
+        if not force:
+            if _has_checkpoints():
+                logger.info("[Benchmark] Checkpoints detected; skipping initial benchmark.")
+                run_initial = False
+            elif os.path.exists(baseline_marker):
+                try:
+                    with open(baseline_marker, "r") as fh:
+                        meta = json.load(fh)
+                    if meta.get("model_id") == self.config.model.model_id:
+                        logger.info("[Benchmark] Baseline benchmark already present for this model; skipping.")
+                        run_initial = False
+                    else:
+                        logger.info("[Benchmark] Baseline marker exists but model_id differs; re-running benchmark.")
+                        run_initial = True
+                except Exception:
+                    run_initial = True
+
+        if run_initial:
+            try:
+                logger.info("[Train] Running initial benchmark before training start...")
+                metrics = self.benchmark.run(self.global_step)
+                # write marker with minimal metadata
+                try:
+                    model_repr = repr(self.config.model.__dict__)
+                except Exception:
+                    model_repr = str(self.config.model.model_id)
+
+                checksum_src = model_repr + "|" + str(getattr(self.tokenizer, "vocab_size", ""))
+                model_checksum = hashlib.sha256(checksum_src.encode()).hexdigest()
+
+                meta = {
+                    "model_id": self.config.model.model_id,
+                    "model_checksum": model_checksum,
+                    "tokenizer_vocab_size": getattr(self.tokenizer, "vocab_size", None),
+                    "time": time.time(),
+                    "metrics": metrics,
+                    "generation": {
+                        "max_new_tokens": self.config.training.max_response_length,
+                        "do_sample": self.config.training.generation_do_sample,
+                    },
+                }
+                os.makedirs(self.config.training.output_dir, exist_ok=True)
+                with open(baseline_marker, "w") as fh:
+                    json.dump(meta, fh)
+                logger.info("[Benchmark] Initial benchmark complete; marker saved at %s.", baseline_marker)
+
+                # Log baseline metrics to WandB if available
+                if self._wandb_run is not None and metrics:
+                    try:
+                        wandb.log({f"baseline/{k}": v for k, v in metrics.items()}, step=self.global_step)
+                        logger.info("[WandB] Baseline metrics logged to WandB.")
+                    except Exception as e:
+                        logger.info("[WandB] Failed to log baseline metrics: %s", e)
+
+            except Exception as e:
+                logger.info("[Benchmark] Initial benchmark failed: %s", e)
 
         # Training loop
         for epoch in range(num_epochs):
@@ -898,6 +993,12 @@ def main():
         help="Output directory for checkpoints and logs",
     )
 
+    parser.add_argument(
+        "--force-initial-benchmark",
+        action="store_true",
+        help="Force running the initial benchmark even if sentinel/checkpoints exist",
+    )
+
     args = parser.parse_args()
 
     # Get base config
@@ -932,6 +1033,10 @@ def main():
         config.training.output_dir = args.output_dir
         config.training.checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
         config.training.log_dir = os.path.join(args.output_dir, "logs")
+
+    # Force initial benchmark via CLI flag
+    if getattr(args, "force_initial_benchmark", None) is not None:
+        config.training.force_initial_benchmark = args.force_initial_benchmark
 
     # Print configuration
     logger.info("\n" + "=" * 60)
