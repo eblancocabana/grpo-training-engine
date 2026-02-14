@@ -1,0 +1,67 @@
+# .gitignore for Python / PyTorch project (tailored)
+# Keeps README.md in repo root; ignores other .md files
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+env.bak/
+.env
+
+# PyTorch / model artifacts (do NOT commit large weights)
+*.pt
+*.pth
+*.bin
+
+# Logs
+logs/
+*.log
+wandb/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sisyphus working files (hidden control / drafts)
+.sisyphus/
+.sisyphus*
+
+# Docs and markdown files
+docs/
+*.md
+!/.gitignore
+!/README.md
+
+# Other common Python caches
+.mypy_cache/
+.pytest_cache/
+.cache/
+htmlcov/
+coverage.xml
+coverage/
+
+# local test / build outputs
+outputs/
