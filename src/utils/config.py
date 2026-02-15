@@ -62,6 +62,23 @@ class EntropyConfig:
 
 
 @dataclass
+class SENTConfig:
+    """Semantic Entropy-based Curriculum Learning (SENT) configuration."""
+    enabled: bool = True  # Use SENT by default
+    num_samples: int = 4  # M: number of responses per query
+    temperature: float = 1.0  # Sampling temperature
+    cache_path: str = "data/cache/gsm8k_sent_sorted.pt"
+    checkpoint_interval: int = 100  # Save checkpoint every N queries
+    curriculum_stages: int = 2  # N: number of curriculum stages (paper default: 2)
+    resume_from_checkpoint: bool = True
+    seed: Optional[int] = None  # Random seed for reproducibility
+    
+    def to_dict(self) -> dict:
+        """Convert config to dictionary."""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+
+@dataclass
 class WandBConfig:
     """Weights & Biases configuration for experiment tracking."""
     enabled: bool = True
@@ -139,6 +156,7 @@ class Config:
     entropy: EntropyConfig = field(default_factory=EntropyConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    sent: SENTConfig = field(default_factory=SENTConfig)
     
     @classmethod
     def from_dict(cls, config_dict: dict) -> "Config":
@@ -149,6 +167,7 @@ class Config:
         entropy_config = EntropyConfig(**config_dict.get("entropy", {}))
         training_config = TrainingConfig(**config_dict.get("training", {}))
         wandb_config = WandBConfig(**config_dict.get("wandb", {}))
+        sent_config = SENTConfig(**config_dict.get("sent", {}))
         
         return cls(
             model=model_config,
@@ -156,7 +175,8 @@ class Config:
             grpo=grpo_config,
             entropy=entropy_config,
             training=training_config,
-            wandb=wandb_config
+            wandb=wandb_config,
+            sent=sent_config
         )
     
     def to_dict(self) -> dict:
@@ -168,6 +188,7 @@ class Config:
             "entropy": self.entropy.__dict__,
             "training": self.training.__dict__,
             "wandb": self.wandb.__dict__,
+            "sent": self.sent.__dict__,
         }
 
 
@@ -203,5 +224,12 @@ def get_8gb_vram_config() -> Config:
     config.wandb.project = "grpo-training"
     config.wandb.tags = ["grpo", "deepseek-r1", "8gb-vram", "python"]
     config.wandb.implementation = "python"
+    
+    # SENT settings (8GB optimized)
+    config.sent.enabled = True
+    config.sent.num_samples = 4
+    config.sent.cache_path = "data/cache/gsm8k_sent_sorted.pt"
+    config.sent.checkpoint_interval = 100
+    config.sent.curriculum_stages = 2
     
     return config
