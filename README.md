@@ -70,6 +70,12 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 │   ├── inference.py             # Post-training inference
 │   ├── preprocess_sent_vllm.py  # SENT Preprocessing (vLLM optimized)
 │   └── install_dependencies.sh  # Auto-installation script
+├── tests/                   # Comprehensive Test Suite
+│   ├── test_grpo_algorithm.py   # GRPO logic validation
+│   ├── test_lora.py             # LoRA injection tests
+│   ├── test_sent.py             # Curriculum Learning tests
+│   ├── test_memory_manager.py   # VRAM constraints tests
+│   └── ... (see tests/ for full list)
 └── requirements.txt             # Dependencies
 ```
 
@@ -87,7 +93,22 @@ Runs tests to verify:
 - Text generation
 - Memory management
 
-### 2. Preprocessing (SENT Curriculum)
+- Memory management
+
+### 2. Running Tests
+
+The project includes a comprehensive test suite using `pytest`.
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test category
+pytest tests/test_sent.py        # Test Curriculum Learning
+pytest tests/test_grpo_algorithm.py # Validate GRPO Math
+```
+
+### 3. Preprocessing (SENT Curriculum)
 
 To enable Curriculum Learning, you must generate the sorted dataset cache. We provide a vLLM-optimized script for speed:
 
