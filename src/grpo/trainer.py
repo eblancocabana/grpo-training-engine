@@ -791,25 +791,43 @@ class GRPOTrainerLoop:
                         ) / len(epoch_metrics)
             wandb.log(epoch_summary, step=self.global_step)
 
-    def train(self, num_epochs: Optional[int] = None):
+    def train(self, num_epochs: Optional[int] = None, sent_stage: int = 1):
         """
         Main training loop.
 
         Args:
             num_epochs: Number of epochs (uses config if None)
+            sent_stage: Curriculum stage to train on (1-indexed, default=1 = easiest)
         """
         if num_epochs is None:
             num_epochs = self.config.training.num_epochs
 
         # Create dataloader
         logger.info("\n[Train] Creating dataloader...")
+        # Determine shuffle based on SENT
+        # If SENT is enabled, we MUST NOT shuffle (curriculum depends on order)
+        use_sent = self.config.sent.enabled
+        do_shuffle = not use_sent
+        
         dataloader = create_grpo_dataloader(
             tokenizer=self.tokenizer,
             split="train",
             batch_size=self.config.training.batch_size,
             max_prompt_length=self.config.training.max_prompt_length,
-            shuffle=True,
+            shuffle=do_shuffle,
+            use_sent=use_sent,
+            sent_config=self.config.sent,
+            num_stages=self.config.sent.curriculum_stages,
+            cache_path=self.config.sent.cache_path,
         )
+
+        # Set curriculum stage if SENT is enabled
+        if use_sent and hasattr(dataloader.dataset, 'set_stage'):
+            dataloader.dataset.set_stage(sent_stage)
+            stage_info = dataloader.dataset.get_stage_info()
+            logger.info("[SENT] Training on stage %d/%d (samples %d-%d)",
+                        sent_stage, stage_info["num_stages"],
+                        stage_info["stage_start_idx"], stage_info["stage_end_idx"])
 
         logger.info("[Train] Starting training for %s epochs...", num_epochs)
         logger.info("[Train] Steps per epoch: ~%s", len(dataloader))
@@ -976,6 +994,13 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     parser.add_argument(
+        "--sent-stage",
+        type=int,
+        default=1,
+        help="Curriculum stage to train on (1=easiest, default: 1)",
+    )
+
+    parser.add_argument(
         "--epsilon-high",
         type=float,
         default=None,
@@ -1064,7 +1089,7 @@ def main():
     trainer.setup()
 
     # Train
-    trainer.train()
+    trainer.train(sent_stage=args.sent_stage)
 
 
 if __name__ == "__main__":
