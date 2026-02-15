@@ -8,6 +8,7 @@ A native PyTorch training engine for GRPO (Group Relative Policy Optimization) s
 - **Manual LoRA Implementation** without PEFT dependencies
 - **GRPO from Scratch** without HF Trainer or TRL
 - **Selective Backpropagation** based on token entropy
+- **Curriculum Learning (SENT)**: Sorts training data by semantic entropy (easy to hard)
 - **Surgical Memory Management** designed for 8GB VRAM constraints
 
 ## 📋 System Requirements
@@ -58,7 +59,8 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 │   ├── selective/
 │   │   └── entropy_mask.py      # Entropy-based masking
 │   ├── data/
-│   │   └── gsm8k_loader.py      # GSM8K Dataset loader
+│   │   ├── gsm8k_loader.py      # GSM8K Dataset loader (with Curriculum)
+│   │   └── sent_calculator.py   # Semantic Entropy calculation
 │   └── utils/
 │       ├── config.py            # Configuration management
 │       └── checkpoint.py        # Checkpoint save/load
@@ -66,6 +68,7 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 ├── test_setup.py                # System verification
 ├── scripts/
 │   ├── inference.py             # Post-training inference
+│   ├── preprocess_sent_vllm.py  # SENT Preprocessing (vLLM optimized)
 │   └── install_dependencies.sh  # Auto-installation script
 └── requirements.txt             # Dependencies
 ```
@@ -84,7 +87,21 @@ Runs tests to verify:
 - Text generation
 - Memory management
 
-### 2. Training
+### 2. Preprocessing (SENT Curriculum)
+
+To enable Curriculum Learning, you must generate the sorted dataset cache. We provide a vLLM-optimized script for speed:
+
+```bash
+# 1. Be sure to have vLLM installed (optional but recommended for speed)
+pip install vllm
+
+# 2. Run preprocessing (generates data/cache/gsm8k_sent_sorted.pt)
+python scripts/preprocess_sent_vllm.py
+```
+
+> **Note:** If you skip this, training will proceed without Curriculum Learning (standard shuffling).
+
+### 3. Training
 
 **Basic training:**
 ```bash
@@ -107,7 +124,7 @@ python train.py \
 python train.py --dry-run
 ```
 
-### 3. Inference
+### 4. Inference
 
 ```bash
 python scripts/inference.py \
@@ -203,7 +220,16 @@ loss = (loss * mask).mean()
 - Accelerates training
 - Focuses on "hard" tokens
 
-### 4. Memory Manager (`src/core/memory_manager.py`)
+### 5. Curriculum Learning (`src/data/sent_calculator.py`)
+
+Implementation of **SENT (Semantic Entropy)**:
+1. Sample `M` responses for each query (Temperature=1.0)
+2. Cluster responses by semantic meaning (exact answer match)
+3. Compute Entropy: `H = -sum(P(c) * log P(c))`
+4. Sort dataset: Low Entropy (Easy) → High Entropy (Hard)
+5. Train in stages (Curriculum)
+
+### 6. Memory Manager (`src/core/memory_manager.py`)
 
 Aggressive VRAM management:
 
@@ -317,7 +343,9 @@ checkpoints/
 ├── checkpoint_step_1000.pt
 ├── best_model.pt               # Best model
 ├── lora_weights_final.pt       # LoRA weights only
-└── latest.json                 # Last checkpoint info
+├── latest.json                 # Last checkpoint info
+└── data/cache/                 # SENT Cache (generated)
+    └── gsm8k_sent_sorted.pt    # Sorted dataset indices
 ```
 
 **Load checkpoint:**
