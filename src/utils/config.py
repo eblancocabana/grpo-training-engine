@@ -50,6 +50,7 @@ class GRPOConfig:
     kl_coef: float = 0.1
     use_kl: bool = False  # Set to False for 8GB VRAM
     mask_truncated_completions: bool = True  # Zero out loss for truncated generations
+    length_penalty_coef: float = 0.001  # Penalty per token (reward = reward - coef * length)
 
 
 @dataclass

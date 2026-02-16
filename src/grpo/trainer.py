@@ -381,6 +381,21 @@ class GRPOTrainerLoop:
 
         generated_texts = self.generate_responses(input_ids, attention_mask)
 
+        # Tokenize responses (without prompt) early for length penalty
+        gen_encodings = self.tokenizer(
+            generated_texts,
+            truncation=True,
+            max_length=self.config.training.max_response_length,
+            padding="longest",
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        response_ids = gen_encodings["input_ids"].to(self.device)
+        response_mask = gen_encodings["attention_mask"].to(self.device)
+        
+        # Calculate lengths for penalty
+        response_lengths = response_mask.sum(dim=1).float()
+
         # Compute rewards
         rewards_list = []
         debug_infos = []
@@ -391,8 +406,14 @@ class GRPOTrainerLoop:
         for gt in ground_truths:
             expanded_ground_truths.extend([gt] * group_size)
 
-        for gen_text, gt in zip(generated_texts, expanded_ground_truths):
+        for i, (gen_text, gt) in enumerate(zip(generated_texts, expanded_ground_truths)):
             reward, info = self.verifier.verify(gen_text, gt)
+            
+            # Apply length penalty
+            if self.config.grpo.length_penalty_coef > 0:
+                penalty = response_lengths[i] * self.config.grpo.length_penalty_coef
+                reward -= penalty.item()
+                
             rewards_list.append(reward)
             debug_infos.append(info)
 
@@ -420,7 +441,8 @@ class GRPOTrainerLoop:
                 batch_infos = debug_infos[start_idx:end_idx]
 
                 # Calculate statistics
-                correct_count = sum(1 for rew in batch_rewards if rew > 0.5)
+                correct_count = sum(1 for info in batch_infos if info.get("match", False))
+                
                 total_count = len(batch_rewards)
                 failed_count = total_count - correct_count
 
@@ -435,7 +457,7 @@ class GRPOTrainerLoop:
                 for i, (resp, rew, info) in enumerate(
                     zip(batch_responses, batch_rewards, batch_infos)
                 ):
-                    if rew > 0.5:
+                    if info.get("match", False):
                         continue  # Skip correct responses
 
                     failed_shown += 1
@@ -471,18 +493,6 @@ class GRPOTrainerLoop:
             group_size, dim=0
         )  # [batch*G, prompt_len]
         prompt_mask_expanded = attention_mask.repeat_interleave(group_size, dim=0)
-
-        # Tokenize responses (without prompt)
-        gen_encodings = self.tokenizer(
-            generated_texts,
-            truncation=True,
-            max_length=self.config.training.max_response_length,
-            padding="longest",
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        response_ids = gen_encodings["input_ids"].to(self.device)
-        response_mask = gen_encodings["attention_mask"].to(self.device)
 
         num_samples = response_ids.shape[0]
 
