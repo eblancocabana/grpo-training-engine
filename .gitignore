@@ -65,3 +65,17 @@ coverage/
 
 # local test / build outputs
 outputs/
+profiler_output/
+# local test / build outputs
+outputs/
+profiler_output/*.json
+profiler_output_time/
+log_profiler_tb/
+tools/vram_profiler/app/snapshot_data.js
+!**/.gemini/**/*.json
+!**/package.json
+!**/tsconfig.json
+!tools/**/*.md
+tools/vram_profiler/app/snapshot_data.orig.js
+*.gz
+log_profiler_tb/
