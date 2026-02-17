@@ -463,10 +463,7 @@ class GRPOTrainerLoop:
                     failed_shown += 1
                     logger.debug("[FAILED] Response %d (Reward: %.2f):", i + 1, rew)
                     clean_resp = resp.replace("\n", "\\n")
-                    logger.debug("  -> Text: %s", clean_resp[:200])
-                    if len(clean_resp) > 200:
-                        logger.debug("     ... (truncated)")
-
+                    logger.debug("  -> Text: %s", clean_resp)
                     logger.debug("  -> Extracted: %s", info.get("extracted_answer"))
                     logger.debug("  -> GT: %s", info.get("ground_truth_answer"))
                     logger.debug("  -> Match: %s", info.get("match"))
