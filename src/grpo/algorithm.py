@@ -210,7 +210,6 @@ class GRPOTrainer:
                 'ratio_mean': ratio.mean().item(),
                 'ratio_std': ratio_std,
                 'ratio_capped_pct': ratio_capped,
-                'advantage_mean': advantages.mean().item(),
                 'advantage_std': adv_std,
             }
             

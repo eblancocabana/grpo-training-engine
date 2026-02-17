@@ -247,7 +247,6 @@ class GRPOTrainerLoop:
             return
 
         log_dict = {
-            f"{prefix}/step": self.global_step,
             f"{prefix}/epoch": self.current_epoch,
         }
 
@@ -258,7 +257,7 @@ class GRPOTrainerLoop:
         if vram_stats:
             log_dict["memory/vram_used_gb"] = vram_stats.get("reserved_gb", 0)
             log_dict["memory/vram_allocated_gb"] = vram_stats.get("allocated_gb", 0)
-            log_dict["memory/vram_free_gb"] = vram_stats.get("free_gb", 0)
+
 
         log_dict["train/learning_rate"] = self.scheduler.get_last_lr()[0]
         log_dict["train/gen_micro_batch"] = self._gen_micro_batch
@@ -268,7 +267,6 @@ class GRPOTrainerLoop:
         if self._step_start_time:
             step_time = time.time() - self._step_start_time
             log_dict["perf/step_time_s"] = step_time
-            log_dict["perf/steps_per_second"] = 1.0 / step_time if step_time > 0 else 0
 
         wandb.log(log_dict, step=self.global_step)
 
@@ -674,7 +672,7 @@ class GRPOTrainerLoop:
         avg_metrics = {
             "loss": total_loss / num_samples,
             "avg_reward": rewards.mean().item(),
-            "avg_advantage": advantages.mean().item(),
+            "avg_response_length": response_lengths.mean().item(),
         }
 
         if all_metrics:
@@ -683,13 +681,13 @@ class GRPOTrainerLoop:
 
         # Add entropy stats
         if self.config.entropy.use_entropy_mask:
-            avg_metrics["entropy_masked_ratio"] = avg_metrics.get("masked_ratio", 0.0)
+            avg_metrics["entropy_masked_ratio"] = avg_metrics.get("selected_tokens_ratio", 0.0)
 
         # Add reward distribution stats
         avg_metrics["reward_std"] = rewards.std().item()
         avg_metrics["reward_max"] = rewards.max().item()
         avg_metrics["reward_min"] = rewards.min().item()
-        avg_metrics["advantage_std"] = advantages.std().item()
+
         avg_metrics["positive_advantages_ratio"] = (
             (advantages > 0).float().mean().item()
         )
@@ -788,7 +786,6 @@ class GRPOTrainerLoop:
                 "epoch/loss": avg_loss,
                 "epoch/avg_reward": avg_reward,
                 "epoch/steps": len(epoch_metrics),
-                "epoch/number": epoch + 1,
             }
             if epoch_metrics:
                 for key in epoch_metrics[0].keys():
