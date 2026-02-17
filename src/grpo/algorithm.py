@@ -251,29 +251,7 @@ class GroupSampler:
             group_size: Number of responses per prompt (G)
         """
         self.group_size = group_size
-    
-    def expand_batch(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Expand batch by repeating each prompt G times.
-        
-        Args:
-            input_ids: Input token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            
-        Returns:
-            Expanded input_ids and attention_mask [batch*G, seq_len]
-        """
-        # Repeat each sample G times
-        # [batch, seq_len] -> [batch*G, seq_len]
-        input_ids_expanded = input_ids.repeat_interleave(self.group_size, dim=0)
-        attention_mask_expanded = attention_mask.repeat_interleave(self.group_size, dim=0)
-        
-        return input_ids_expanded, attention_mask_expanded
-    
+
     def group_responses(
         self,
         responses: List[str],

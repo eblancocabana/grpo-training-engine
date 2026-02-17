@@ -293,65 +293,136 @@ class GRPOTrainerLoop:
         except Exception as e:
             logger.info("[WandB] Error finishing run: %s", e)
 
+    def _prefill_prompt_cache(self, real_ids: torch.Tensor, real_mask: torch.Tensor):
+        """Run a single forward pass on the prompt to build the KV cache.
+
+        Returns a DynamicCache with ``prompt_len - 1`` positions filled
+        (i.e. the last token is *not* cached).  This is exactly what
+        ``generate()`` expects: it receives the full ``input_ids`` and
+        discovers via ``cache_position`` that only the last token still
+        needs a forward pass.
+
+        Args:
+            real_ids:  [1, prompt_len] – token ids (no padding)
+            real_mask: [1, prompt_len] – attention mask (all 1s)
+
+        Returns:
+            past_key_values: DynamicCache for the prompt (prompt_len-1 positions).
+        """
+        prompt_len = real_ids.shape[1]
+        outputs = self.model(
+            input_ids=real_ids,
+            attention_mask=real_mask,
+            use_cache=True,
+        )
+        past_kv = outputs.past_key_values          # DynamicCache, seq_len = prompt_len
+        past_kv.crop(prompt_len - 1)                # keep [0 .. prompt_len-2]
+        del outputs
+        return past_kv
+
     def generate_responses(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> List[str]:
         """
-        Generate responses for GRPO group sampling.
+        Generate responses for GRPO group sampling with KV-cache prefix sharing.
+
+        For each prompt:
+          1. Run a single prefill forward to build the prompt KV cache
+             (cropped to prompt_len-1 positions).
+          2. For each micro-batch of group_size, expand the cached prefix
+             tensors via ``expand().contiguous()`` into a fresh DynamicCache,
+             then call ``generate()`` with the full ``input_ids``.
+             ``generate()`` sees that the cache already covers positions
+             [0..prompt_len-2] and only needs to process the last prompt
+             token before starting autoregressive decoding — saving a full
+             prompt re-computation per micro-batch.
 
         Args:
             input_ids: Input token IDs [batch, seq_len]
             attention_mask: Attention mask [batch, seq_len]
 
         Returns:
-            List of generated text strings
+            List of generated text strings (batch * group_size total)
         """
         self.model.eval()
 
-        input_ids_expanded, attention_mask_expanded = self.group_sampler.expand_batch(
-            input_ids, attention_mask
-        )
-
         generated_texts = []
-
+        group_size = self.group_sampler.group_size
+        batch_size = input_ids.shape[0]
         micro_batch_size = self._gen_micro_batch
-        total_samples = input_ids_expanded.shape[0]
 
         with torch.no_grad():
-            for i in range(0, total_samples, micro_batch_size):
-                end_idx = min(i + micro_batch_size, total_samples)
+            for prompt_idx in range(batch_size):
+                single_ids = input_ids[prompt_idx:prompt_idx + 1].to(self.device)
+                single_mask = attention_mask[prompt_idx:prompt_idx + 1].to(self.device)
 
-                batch_input_ids = input_ids_expanded[i:end_idx].to(self.device)
-                batch_attention_mask = attention_mask_expanded[i:end_idx].to(
-                    self.device
-                )
+                # Strip left-padding: only process real tokens
+                first_real = single_mask[0].argmax().item()
+                real_ids = single_ids[:, first_real:]
+                real_mask = single_mask[:, first_real:]
+                prompt_len = real_ids.shape[1]
 
-                # Standard generation loop
-                outputs = self.model.generate(
-                    input_ids=batch_input_ids,
-                    attention_mask=batch_attention_mask,
-                    max_new_tokens=self.config.training.max_response_length,
-                    do_sample=self.config.training.generation_do_sample,
-                    temperature=self.config.training.generation_temperature,
-                    top_p=self.config.training.generation_top_p,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=True,
-                )
+                # --- Prefill: compute prompt KV cache once ---
+                prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
 
-                for j in range(outputs.shape[0]):
-                    response_ids = outputs[j, batch_input_ids.shape[1] :]
-                    response_text = self.tokenizer.decode(
-                        response_ids, skip_special_tokens=True
+                # Generate group_size responses via micro-batching
+                for g_start in range(0, group_size, micro_batch_size):
+                    g_end = min(g_start + micro_batch_size, group_size)
+                    current_micro = g_end - g_start
+
+                    # Expand prefix cache to micro-batch size (no deepcopy)
+                    mb_cache = self._expand_prefix_cache(
+                        prefix_cache, current_micro
                     )
-                    generated_texts.append(response_text)
 
-                del outputs, batch_input_ids, batch_attention_mask
+                    outputs = self.model.generate(
+                        input_ids=real_ids.expand(current_micro, -1),
+                        attention_mask=real_mask.expand(current_micro, -1),
+                        past_key_values=mb_cache,
+                        max_new_tokens=self.config.training.max_response_length,
+                        do_sample=self.config.training.generation_do_sample,
+                        temperature=self.config.training.generation_temperature,
+                        top_p=self.config.training.generation_top_p,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        use_cache=True,
+                    )
 
-                if (i // micro_batch_size) % 2 == 0:
-                    self.memory_manager.clear_cache()
+                    for j in range(outputs.shape[0]):
+                        response_ids = outputs[j, prompt_len:]
+                        generated_texts.append(self.tokenizer.decode(
+                            response_ids, skip_special_tokens=True
+                        ))
+
+                    del outputs, mb_cache
+
+                    if (g_start // micro_batch_size) % 2 == 0:
+                        self.memory_manager.clear_cache()
+
+                del single_ids, single_mask, real_ids, real_mask, prefix_cache
 
         return generated_texts
+
+    @staticmethod
+    def _expand_prefix_cache(cache, repeats: int):
+        """Create a new DynamicCache with tensors expanded to ``repeats`` copies.
+
+        Instead of ``deepcopy`` + ``batch_repeat_interleave``, this builds a
+        fresh cache using ``expand().contiguous()`` per layer.  This is more
+        efficient because:
+          • It skips Python-level deep-copy of the cache object hierarchy.
+          • Each layer's keys/values go from [1, H, S, D] → [repeats, H, S, D]
+            in one GPU operation.
+          • The original cache is not mutated.
+        """
+        from transformers import DynamicCache
+
+        expanded = DynamicCache()
+        for layer in cache.layers:
+            k = layer.keys.expand(repeats, -1, -1, -1).contiguous()
+            v = layer.values.expand(repeats, -1, -1, -1).contiguous()
+            expanded.update(k, v, len(expanded.layers))
+        return expanded
 
     def training_step(self, batch: Dict) -> Dict[str, float]:
         """
