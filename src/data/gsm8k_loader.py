@@ -7,6 +7,7 @@ from datasets import load_dataset
 from typing import Dict, Any, Optional, List
 import logging
 import os
+import torch
 
 from ..utils.logging_utils import get_logger
 from ..utils.config import SENTConfig
@@ -269,16 +270,30 @@ def create_grpo_dataloader(
         )
     
     def grpo_collate(batch):
-        input_ids = [item["input_ids"] for item in batch]
-        attention_masks = [item["attention_mask"] for item in batch]
+        # Determine max length in the batch
+        max_len = max(len(item["input_ids"]) for item in batch)
+        batch_size = len(batch)
         
-        padded = tokenizer.pad(
-            {"input_ids": input_ids, "attention_mask": attention_masks},
-            padding="longest",
-            return_tensors="pt"
-        )
-        input_ids_padded = padded["input_ids"]
-        attention_mask_padded = padded["attention_mask"]
+        # Get padding strategy
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        padding_side = getattr(tokenizer, "padding_side", "right")
+        
+        # Pre-allocate tensors
+        input_ids_padded = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
+        attention_mask_padded = torch.zeros((batch_size, max_len), dtype=torch.long)
+        
+        # Fill tensors
+        for i, item in enumerate(batch):
+            input_ids = item["input_ids"]
+            attention_mask = item["attention_mask"]
+            seq_len = len(input_ids)
+            
+            if padding_side == "left":
+                input_ids_padded[i, -seq_len:] = torch.tensor(input_ids, dtype=torch.long)
+                attention_mask_padded[i, -seq_len:] = torch.tensor(attention_mask, dtype=torch.long)
+            else:
+                input_ids_padded[i, :seq_len] = torch.tensor(input_ids, dtype=torch.long)
+                attention_mask_padded[i, :seq_len] = torch.tensor(attention_mask, dtype=torch.long)
         
         return {
             "input_ids": input_ids_padded,
