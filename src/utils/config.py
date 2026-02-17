@@ -216,7 +216,7 @@ def get_8gb_vram_config() -> Config:
     config.training.batch_size = 1
     config.training.gradient_accumulation_steps = 16
     config.training.enable_gradient_checkpointing = True
-    config.training.max_prompt_length = 128
+    config.training.max_prompt_length = 4096
     config.training.max_response_length = 384
     config.training.clear_cache_frequency = 50
     
