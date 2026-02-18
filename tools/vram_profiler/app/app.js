@@ -582,6 +582,12 @@ function renderTimeline() {
 
 
 
+/**
+ * Renders an empty state message in the given container.
+ * Note: Assumes the container has already been cleared.
+ * @param {HTMLElement} container - The container element to append the message to
+ * @param {string} message - The message text to display
+ */
 function showEmptyMessage(container, message) {
     const p = document.createElement('p');
     p.style.color = 'var(--text-dim)';
