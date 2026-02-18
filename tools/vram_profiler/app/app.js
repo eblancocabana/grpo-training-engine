@@ -655,7 +655,7 @@ function reconstructAndRenderFlame(time) {
         row.onclick = selectRow;
 
         row.onkeydown = (e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
                 e.preventDefault();
                 selectRow();
             }
