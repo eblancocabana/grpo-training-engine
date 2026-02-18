@@ -39,7 +39,7 @@ def stop_and_save(output_file, metadata=None):
             
             # Inject Metadata if applicable
             if metadata and isinstance(s, dict):
-                 s['user_metadata'] = metadata
+                s['user_metadata'] = metadata
             
             with open(output_file, 'w') as f:
                 json.dump(s, f)
