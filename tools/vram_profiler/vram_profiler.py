@@ -119,9 +119,9 @@ def main():
                     
                     # Update description with Peak VRAM (more useful for OOMs)
                     if torch.cuda.is_available():
-                         peak = torch.cuda.max_memory_allocated() / 1024**3
-                         curr = torch.cuda.memory_allocated() / 1024**3
-                         pbar.set_postfix(vram=f"{curr:.2f}GB", peak=f"{peak:.2f}GB")
+                        peak = torch.cuda.max_memory_allocated() / 1024**3
+                        curr = torch.cuda.memory_allocated() / 1024**3
+                        pbar.set_postfix(vram=f"{curr:.2f}GB", peak=f"{peak:.2f}GB")
                          
                 except StopIteration:
                     break
