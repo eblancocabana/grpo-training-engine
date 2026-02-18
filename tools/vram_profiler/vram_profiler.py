@@ -10,6 +10,9 @@ import traceback
 import json
 import torch
 
+# Module-level constants
+AUTO_COMPRESS_THRESHOLD_MB = 150  # Threshold in MB for auto-compressing snapshot files
+
 # 1. Early Startup Hook
 def start_profiling(context="all", max_entries=2000000):
     if not torch.cuda.is_available():
@@ -161,7 +164,7 @@ def main():
             file_size_mb = os.path.getsize(args.output) / (1024 * 1024)
             print(f"[Profiler] Snapshot size: {file_size_mb:.2f} MB")
             
-            if file_size_mb > 150:
+            if file_size_mb > AUTO_COMPRESS_THRESHOLD_MB:
                 print("[Profiler] File is large. Auto-compressing...")
                 compressed_path = args.output + ".tmp"
                 try:
