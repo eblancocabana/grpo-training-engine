@@ -579,9 +579,6 @@ function renderTimeline() {
     }
 }
 
-
-
-
 /**
  * Renders an empty state message in the given container.
  * Note: Assumes the container has already been cleared.
