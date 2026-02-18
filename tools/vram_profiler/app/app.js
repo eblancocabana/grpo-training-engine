@@ -63,6 +63,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 processAndRender();
             })
             .catch(error => {
+                console.error('Error fetching snapshot from URL:', error);
                 alert(`Error fetching snapshot from URL: ${error.message}`);
                 loading.classList.add('hidden');
             });
