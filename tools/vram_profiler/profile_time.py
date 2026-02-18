@@ -139,7 +139,8 @@ def main():
                 print("[Error] Trainer has no 'train' method.")
 
         except Exception as e:
-            if "Profiling complete" not in str(e): raise e
+            # Re-raise any exception; outer handler will report profiling failure.
+            raise
 
     except Exception as e:
         print(f"\n[Error] Profiling failed: {e}")
