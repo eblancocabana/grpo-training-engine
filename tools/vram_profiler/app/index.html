@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en" class="dark-theme">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VRAM Profiler | Advanced Analytics</title>
+    <!-- Modern Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --surface: #151b2c;
+            --surface-hover: #1e2638;
+            --accent: #38bdf8;
+            --accent-glow: rgba(56, 189, 248, 0.2);
+            --danger: #f43f5e;
+            --danger-glow: rgba(244, 63, 94, 0.1);
+            --success: #10b981;
+            --text: #f8fafc;
+            --text-dim: #94a3b8;
+            --border: #2d3748;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+            scrollbar-color: var(--border) var(--bg);
+            scrollbar-width: thin;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-dim);
+        }
+
+        /* Layout */
+        header {
+            background: rgba(15, 23, 42, 0.8);
+            backdrop-filter: blur(8px);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            z-index: 100;
+        }
+
+        .title-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .title-group h1 {
+            font-size: 1.25rem;
+            margin: 0;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .badge {
+            background: var(--accent-glow);
+            color: var(--accent);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        main {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            display: grid;
+            grid-template-columns: 1fr 340px;
+            gap: 24px;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.875rem;
+            color: var(--text-dim);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .file-input-wrapper:hover {
+            border-color: var(--accent);
+            background: var(--surface-hover);
+            color: var(--text);
+        }
+
+        .btn {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+
+        .btn:hover {
+            background: var(--surface-hover);
+            border-color: var(--text-dim);
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg);
+            border: none;
+        }
+
+        .btn-primary:hover {
+            filter: brightness(1.1);
+            transform: translateY(-1px);
+        }
+
+        /* Dashboard Cards */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+        }
+
+        .card-title {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-box {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+
+        /* Layout */
+        .container {
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            height: 100vh;
+            overflow: hidden;
+            /* Prevent body scroll */
+        }
+
+        /* Sidebar - Scrollable List */
+        .sidebar {
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            /* Container doesn't scroll, inner elements do */
+        }
+
+        .sidebar h2 {
+            margin-top: 0;
+            font-size: 1.2rem;
+            margin-bottom: 15px;
+            color: var(--text-main);
+            flex-shrink: 0;
+        }
+
+        #bottleneck-list {
+            flex: 1;
+            /* Takes available space */
+            overflow-y: auto;
+            /* Scrolls internally */
+            margin-bottom: 20px;
+            padding-right: 5px;
+            /* Space for scrollbar */
+        }
+
+        #stack-details {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            max-height: 300px;
+            overflow-y: auto;
+            flex-shrink: 0;
+            /* Keep visible */
+        }
+
+        /* Charts */
+        .chart-container {
+            position: relative;
+            height: 300px;
+            /* Fixed height for D3 */
+            min-height: 300px;
+            width: 100%;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            overflow: hidden;
+            /* For zoom/pan safety */
+        }
+
+        #timeline {
+            width: 100%;
+            height: 100%;
+        }
+
+        #flamegraph {
+            min-height: 400px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        /* Components */
+        .bottleneck-item {
+            background: var(--danger-glow);
+            border: 1px solid rgba(244, 63, 94, 0.2);
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-size: 0.8125rem;
+            transition: 0.2s;
+        }
+
+        .bottleneck-item:hover {
+            border-color: var(--danger);
+            transform: scale(1.02);
+        }
+
+        .bottleneck-size {
+            color: var(--danger);
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stack-trace {
+            font-family: 'JetBrains Mono', monospace;
+            background: #000;
+            padding: 16px;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            line-height: 1.5;
+            color: #ccc;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+        }
+
+        .tooltip {
+            position: absolute;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid var(--accent);
+            padding: 8px 12px;
+            border-radius: 6px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            font-size: 0.75rem;
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+        }
+
+        /* Utils */
+        .hidden {
+            display: none !important;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--bg);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            gap: 20px;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        /* Hover Styles */
+        .active-row {
+            outline: 1px solid var(--accent);
+            z-index: 10;
+            transform: scaleX(1.01);
+        }
+    </style>
+    <!-- Use CDN for D3 (local fallback possible if offline, but CDN is standard for standalone HTML) -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+
+<body>
+
+    <header>
+        <div class="title-group">
+            <h1>VRAM Profiler</h1>
+            <span class="badge">Experimental</span>
+        </div>
+        <div class="controls">
+            <div class="file-input-wrapper" id="drop-zone">
+                <span>Drag or select .json</span>
+                <input type="file" id="file-input" accept=".json" style="display: none;">
+            </div>
+            <button class="btn" id="reset-btn">Reset</button>
+            <button class="btn btn-primary" onclick="window.location.reload()">Refresh App</button>
+        </div>
+    </header>
+
+    <div id="loading" class="loading-overlay hidden">
+        <div class="spinner"></div>
+        <div id="loading-text">Analyzing Memory Events...</div>
+    </div>
+
+    <main id="main-content">
+        <section>
+            <div class="stats-grid">
+                <div class="card">
+                    <div class="card-title">Peak VRAM Usage</div>
+                    <div class="stat-value" id="stat-peak">-</div>
+                </div>
+                <div class="card">
+                    <div class="stat-value" id="stat-frag" style="color: #ecc94b">-</div>
+                    <div class="card-title" style="margin-top:5px; margin-bottom:0;">Fragmentation</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Profile Duration</div>
+                    <div class="stat-value" id="stat-duration">-</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Total Events</div>
+                    <div class="stat-value" id="stat-events">-</div>
+                </div>
+            </div>
+
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="card-title">Memory Allocation Timeline <span>Active Usage (MB)</span></div>
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                        <h2>Memory Timeline</h2>
+                        <div style="font-size:0.85rem; display:flex; align-items:center; gap:10px;">
+                            <label for="toggle-reserved" style="display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;">
+                                <input type="checkbox" id="toggle-reserved" style="accent-color: var(--accent);">
+                                <span style="color:var(--text-dim)">Show System Cache (Reserved)</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div id="timeline-host">
+                    <div id="timeline"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Active Allocations at Selection <span>Click timeline to inspect state</span>
+                </div>
+                <div id="flamegraph">
+                    <p style="color: var(--text-dim); text-align: center; padding: 40px;">Select a point on the
+                        timeline
+                        to view active allocations.</p>
+                </div>
+            </div>
+        </section>
+
+        <aside>
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="sidebar">
+                    <h2>Top Unique Bottlenecks</h2>
+                    <!-- Search Filter -->
+                    <input type="text" id="sidebar-search" placeholder="Filter by name..."
+                        style="width:100%; padding:8px; margin-bottom:15px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text-main);">
+
+                    <div id="bottleneck-list">
+                        <p style="font-size: 0.8rem; color: var(--text-dim);">No snapshot loaded.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Selected Stack Trace</div>
+                <div class="stack-trace" id="stack-details">
+                    Select an allocation bar to view details.
+                </div>
+            </div>
+        </aside>
+    </main>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <!-- Scripts -->
+    <!-- Optional: Pre-loaded snapshot data for local viewing without Drag-and-Drop -->
+    <script src="snapshot_data.js"
+        onerror="console.log('No local snapshot_data.js found, defaulting to manual upload.')"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>
