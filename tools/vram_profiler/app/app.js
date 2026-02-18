@@ -582,6 +582,21 @@ function renderTimeline() {
 
 
 
+/**
+ * Renders an empty state message in the given container.
+ * Note: Assumes the container has already been cleared.
+ * @param {HTMLElement} container - The container element to append the message to
+ * @param {string} message - The message text to display
+ */
+function showEmptyMessage(container, message) {
+    const p = document.createElement('p');
+    p.style.color = 'var(--text-dim)';
+    p.style.textAlign = 'center';
+    p.style.padding = '40px';
+    p.textContent = message;
+    container.appendChild(p);
+}
+
 function reconstructAndRenderFlame(time) {
     const active = new Map();
     normalizedEvents.forEach(ev => {
@@ -606,11 +621,16 @@ function reconstructAndRenderFlame(time) {
     container.innerHTML = "";
 
     if (data.length === 0) {
-        container.innerHTML = `<p style="color: var(--text-dim); text-align: center; padding: 40px;">No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).</p>`;
+        showEmptyMessage(container, `No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).`);
         return;
     }
 
     const maxActive = data[0].bytes;
+
+    if (maxActive === 0) {
+        showEmptyMessage(container, `All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).`);
+        return;
+    }
 
     data.forEach(item => {
         const row = document.createElement("div");
