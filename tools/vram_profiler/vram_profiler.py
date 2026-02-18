@@ -77,7 +77,13 @@ def main():
         except ImportError:
             # Try to import from local dir if running from root
             sys.path.append(os.path.dirname(__file__))
-            import compress_snapshot
+            try:
+                import compress_snapshot
+            except ImportError:
+                print("[Error] Could not import 'compress_snapshot'. "
+                      "Ensure compress_snapshot.py is in the same directory as vram_profiler.py "
+                      "or that the module is available on PYTHONPATH.")
+                sys.exit(1)
 
         print("[Profiler] Initializing Trainer...")
         config = get_8gb_vram_config() # Function name kept for compatibility
