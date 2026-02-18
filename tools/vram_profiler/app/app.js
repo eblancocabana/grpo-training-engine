@@ -606,14 +606,26 @@ function reconstructAndRenderFlame(time) {
     container.innerHTML = "";
 
     if (data.length === 0) {
-        container.innerHTML = `<p style="color: var(--text-dim); text-align: center; padding: 40px;">No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).</p>`;
+        const p = document.createElement('p');
+        p.style.color = 'var(--text-dim)';
+        p.style.textAlign = 'center';
+        p.style.padding = '40px';
+        p.textContent = `No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).`;
+        container.innerHTML = "";
+        container.appendChild(p);
         return;
     }
 
     const maxActive = data[0].bytes;
 
     if (maxActive === 0) {
-        container.innerHTML = `<p style="color: var(--text-dim); text-align: center; padding: 40px;">All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).</p>`;
+        const p = document.createElement('p');
+        p.style.color = 'var(--text-dim)';
+        p.style.textAlign = 'center';
+        p.style.padding = '40px';
+        p.textContent = `All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).`;
+        container.innerHTML = "";
+        container.appendChild(p);
         return;
     }
 
