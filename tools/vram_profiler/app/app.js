@@ -621,6 +621,7 @@ function reconstructAndRenderFlame(time) {
         row.style.marginBottom = "2px";
         row.style.borderRadius = "4px";
         row.className = "flame-bar-row";
+        row.tabIndex = 0;
 
         const bar = document.createElement("div");
         bar.style.height = "100%";
@@ -644,11 +645,20 @@ function reconstructAndRenderFlame(time) {
         row.appendChild(bar);
         row.appendChild(label);
 
-        row.onclick = () => {
+        const selectRow = () => {
             document.querySelectorAll('.flame-bar-row').forEach(r => r.classList.remove('active-row'));
             row.classList.add('active-row');
             stats.stack.innerHTML = `<div style="color:var(--accent); margin-bottom:10px; font-weight:700;">Stack Depth: ${item.count > 1 ? item.count + " locations" : "1 location"}</div>` +
                 resolveStack(item.frame, 25).replace(/ < /g, '\n<span style="color:var(--text-dim)">▲</span> ');
+        };
+
+        row.onclick = selectRow;
+
+        row.onkeydown = (e) => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+                e.preventDefault();
+                selectRow();
+            }
         };
 
         container.appendChild(row);
