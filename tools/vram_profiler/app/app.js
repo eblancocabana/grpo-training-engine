@@ -1,4 +1,4 @@
-// VRAM Profiler - Addresses Peak Calculation bugs and improves rendering performance.
+// VRAM Profiler - Web UI for loading and visualizing VRAM usage snapshots.
 
 // DOM Elements
 const dropZone = document.getElementById('drop-zone');
