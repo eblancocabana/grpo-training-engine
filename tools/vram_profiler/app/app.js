@@ -582,6 +582,15 @@ function renderTimeline() {
 
 
 
+function showEmptyMessage(container, message) {
+    const p = document.createElement('p');
+    p.style.color = 'var(--text-dim)';
+    p.style.textAlign = 'center';
+    p.style.padding = '40px';
+    p.textContent = message;
+    container.appendChild(p);
+}
+
 function reconstructAndRenderFlame(time) {
     const active = new Map();
     normalizedEvents.forEach(ev => {
@@ -606,26 +615,14 @@ function reconstructAndRenderFlame(time) {
     container.innerHTML = "";
 
     if (data.length === 0) {
-        const p = document.createElement('p');
-        p.style.color = 'var(--text-dim)';
-        p.style.textAlign = 'center';
-        p.style.padding = '40px';
-        p.textContent = `No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).`;
-        container.innerHTML = "";
-        container.appendChild(p);
+        showEmptyMessage(container, `No memory allocated at this timestamp (${(time / 1e6).toFixed(3)}s).`);
         return;
     }
 
     const maxActive = data[0].bytes;
 
     if (maxActive === 0) {
-        const p = document.createElement('p');
-        p.style.color = 'var(--text-dim)';
-        p.style.textAlign = 'center';
-        p.style.padding = '40px';
-        p.textContent = `All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).`;
-        container.innerHTML = "";
-        container.appendChild(p);
+        showEmptyMessage(container, `All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).`);
         return;
     }
 
