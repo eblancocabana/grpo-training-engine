@@ -612,6 +612,11 @@ function reconstructAndRenderFlame(time) {
 
     const maxActive = data[0].bytes;
 
+    if (maxActive === 0) {
+        container.innerHTML = `<p style="color: var(--text-dim); text-align: center; padding: 40px;">All allocations have zero bytes at this timestamp (${(time / 1e6).toFixed(3)}s).</p>`;
+        return;
+    }
+
     data.forEach(item => {
         const row = document.createElement("div");
         row.style.height = "24px";
