@@ -33,25 +33,46 @@ class EntropyCalculator:
         self.percentile = percentile
         self.min_tokens = min_tokens
     
+    @torch.no_grad()
     def calculate_entropy(
         self,
-        logits: torch.Tensor
+        logits: torch.Tensor,
+        chunk_size: int = 256
     ) -> torch.Tensor:
         """
-        Calculate entropy for each token position.
+        Calculate entropy for each token position using chunked processing to save memory.
         
         Args:
             logits: Model logits [batch, seq_len, vocab_size]
+            chunk_size: Number of tokens to process at once (default: 256)
             
         Returns:
             Entropy values [batch, seq_len]
         """
-        # Convert to probabilities
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = torch.exp(log_probs)
+        batch_size, seq_len, vocab_size = logits.shape
         
-        # H = -sum(p * log(p))
-        entropy = -(probs * log_probs).sum(dim=-1)
+        # Flatten batch and seq dimensions for easier chunking
+        # reshaping to (-1, vocab_size) is usually a view if contiguous
+        flat_logits = logits.reshape(-1, vocab_size)
+        total_tokens = flat_logits.size(0)
+        
+        entropy_list = []
+        
+        # Process in chunks to avoid materializing full probabilities tensor
+        for i in range(0, total_tokens, chunk_size):
+            chunk = flat_logits[i:i + chunk_size]
+            
+            # Standard entropy calculation on small chunk
+            log_probs = F.log_softmax(chunk, dim=-1)
+            probs = torch.exp(log_probs)
+            
+            # H = -sum(p * log(p))
+            chunk_entropy = -(probs * log_probs).sum(dim=-1)
+            
+            entropy_list.append(chunk_entropy)
+            
+        # Concatenate and restore shape
+        entropy = torch.cat(entropy_list).view(batch_size, seq_len)
         
         return entropy
     
