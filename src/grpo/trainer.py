@@ -30,6 +30,7 @@ from src.grpo.algorithm import GRPOTrainer, GroupSampler
 from src.grpo.verifier import RuleBasedVerifier
 
 from src.selective.entropy_mask import EntropyCalculator
+from src.triton_kernels import paged_kv_decode, TRITON_AVAILABLE
 
 from src.data.gsm8k_loader import create_grpo_dataloader
 from src.grpo.benchmark import GSM8KBenchmark
@@ -112,6 +113,8 @@ class GRPOTrainerLoop:
             rank=self.config.lora.rank,
             alpha=self.config.lora.alpha,
             dropout=self.config.lora.dropout,
+            use_triton=self.config.training.use_triton_kernels,
+            prefer_base_layer=self.config.training.triton_lora_prefer_base,
         )
 
         # Print memory usage
@@ -156,6 +159,7 @@ class GRPOTrainerLoop:
             kl_coef=self.config.grpo.kl_coef,
             group_size=self.config.grpo.group_size,
             use_kl=self.config.grpo.use_kl,
+            use_triton_kernels=self.config.training.use_triton_kernels,
         )
 
         # QLoRA: Keep LayerNorms frozen - only LoRA adapters are trainable
@@ -362,31 +366,78 @@ class GRPOTrainerLoop:
                 real_mask = single_mask[:, first_real:]
                 prompt_len = real_ids.shape[1]
 
-                # --- Prefill: compute prompt KV cache once ---
-                prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
+                use_triton_kernels = getattr(
+                    self.config.training, "use_triton_kernels", False
+                )
+
+                if use_triton_kernels:
+                    prefix_cache = None
+                else:
+                    # --- Prefill: compute prompt KV cache once ---
+                    prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
 
                 # Generate group_size responses via micro-batching
                 for g_start in range(0, group_size, micro_batch_size):
                     g_end = min(g_start + micro_batch_size, group_size)
                     current_micro = g_end - g_start
 
-                    # Expand prefix cache to micro-batch size (no deepcopy)
-                    mb_cache = self._expand_prefix_cache(
-                        prefix_cache, current_micro
-                    )
+                    if use_triton_kernels:
+                        if TRITON_AVAILABLE:
+                            try:
+                                outputs = paged_kv_decode(
+                                    self.model,
+                                    input_ids=real_ids.expand(current_micro, -1),
+                                    attention_mask=real_mask.expand(current_micro, -1),
+                                    max_new_tokens=self.config.training.max_response_length,
+                                    do_sample=self.config.training.generation_do_sample,
+                                    temperature=self.config.training.generation_temperature,
+                                    top_p=self.config.training.generation_top_p,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    eos_token_id=self.tokenizer.eos_token_id,
+                                    use_cache=True,
+                                )
+                            except ImportError:
+                                outputs = self.model.generate(
+                                    input_ids=real_ids.expand(current_micro, -1),
+                                    attention_mask=real_mask.expand(current_micro, -1),
+                                    max_new_tokens=self.config.training.max_response_length,
+                                    do_sample=self.config.training.generation_do_sample,
+                                    temperature=self.config.training.generation_temperature,
+                                    top_p=self.config.training.generation_top_p,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    eos_token_id=self.tokenizer.eos_token_id,
+                                    use_cache=True,
+                                )
+                        else:
+                            outputs = self.model.generate(
+                                input_ids=real_ids.expand(current_micro, -1),
+                                attention_mask=real_mask.expand(current_micro, -1),
+                                max_new_tokens=self.config.training.max_response_length,
+                                do_sample=self.config.training.generation_do_sample,
+                                temperature=self.config.training.generation_temperature,
+                                top_p=self.config.training.generation_top_p,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                                eos_token_id=self.tokenizer.eos_token_id,
+                                use_cache=True,
+                            )
+                    else:
+                        # Expand prefix cache to micro-batch size (no deepcopy)
+                        mb_cache = self._expand_prefix_cache(
+                            prefix_cache, current_micro
+                        )
 
-                    outputs = self.model.generate(
-                        input_ids=real_ids.expand(current_micro, -1),
-                        attention_mask=real_mask.expand(current_micro, -1),
-                        past_key_values=mb_cache,
-                        max_new_tokens=self.config.training.max_response_length,
-                        do_sample=self.config.training.generation_do_sample,
-                        temperature=self.config.training.generation_temperature,
-                        top_p=self.config.training.generation_top_p,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        use_cache=True,
-                    )
+                        outputs = self.model.generate(
+                            input_ids=real_ids.expand(current_micro, -1),
+                            attention_mask=real_mask.expand(current_micro, -1),
+                            past_key_values=mb_cache,
+                            max_new_tokens=self.config.training.max_response_length,
+                            do_sample=self.config.training.generation_do_sample,
+                            temperature=self.config.training.generation_temperature,
+                            top_p=self.config.training.generation_top_p,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            use_cache=True,
+                        )
 
                     for j in range(outputs.shape[0]):
                         response_ids = outputs[j, prompt_len:]
@@ -394,12 +445,18 @@ class GRPOTrainerLoop:
                             response_ids, skip_special_tokens=True
                         ))
 
-                    del outputs, mb_cache
+                    if use_triton_kernels:
+                        del outputs
+                    else:
+                        del outputs, mb_cache
 
                     if (g_start // micro_batch_size) % 2 == 0:
                         self.memory_manager.clear_cache()
 
-                del single_ids, single_mask, real_ids, real_mask, prefix_cache
+                if use_triton_kernels:
+                    del single_ids, single_mask, real_ids, real_mask
+                else:
+                    del single_ids, single_mask, real_ids, real_mask, prefix_cache
 
         return generated_texts
 
@@ -683,10 +740,12 @@ class GRPOTrainerLoop:
             log_tensor_meta(logger, "Logits", logits, level=TRACE)
             entropy_mask = None
             if self.config.entropy.use_entropy_mask:
-                entropy = self.entropy_calculator.calculate_entropy(logits)
-                # Combine entropy mask with response_only_mask
-                base_entropy_mask = self.entropy_calculator.create_mask(
-                    entropy, batch_attention_mask
+                entropy, base_entropy_mask = (
+                    self.entropy_calculator.calculate_entropy_and_mask(
+                        logits,
+                        attention_mask=batch_attention_mask,
+                        use_triton_kernels=self.config.training.use_triton_kernels,
+                    )
                 )
                 # Only keep entropy mask where response_only_mask is 1
                 entropy_mask = base_entropy_mask * batch_response_mask
@@ -789,6 +848,18 @@ class GRPOTrainerLoop:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
 
         for batch_idx, batch in enumerate(pbar):
+            if (
+                self.config.training.max_steps is not None
+                and self.global_step >= self.config.training.max_steps
+            ):
+                logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
+                break
+            if (
+                self.config.training.max_steps is not None
+                and self.global_step >= self.config.training.max_steps
+            ):
+                logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
+                break
             try:
                 metrics = self.training_step(batch)
                 epoch_metrics.append(metrics)
@@ -845,6 +916,13 @@ class GRPOTrainerLoop:
                     raise e
 
         # Epoch summary
+        if not epoch_metrics:
+            logger.info(
+                "\n[Epoch %s] No steps completed; skipping summary.",
+                epoch + 1,
+            )
+            return
+
         avg_loss = sum(m["loss"] for m in epoch_metrics) / len(epoch_metrics)
         avg_reward = sum(m["avg_reward"] for m in epoch_metrics) / len(epoch_metrics)
 

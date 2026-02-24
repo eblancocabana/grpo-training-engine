@@ -166,7 +166,7 @@ class TestDrGRPOAlgorithm:
         normalized_loss = token_losses.sum() / group_size
         wrong_normalization = token_losses.sum() / (batch_size * group_size * seq_len)
         assert normalized_loss != wrong_normalization
-        assert normalized_loss > wrong_normalization
+        assert normalized_loss.abs() > wrong_normalization.abs()
 
     def test_full_grpo_loss_computation(self):
         """Integration: Full GRPO loss from logits to final value."""

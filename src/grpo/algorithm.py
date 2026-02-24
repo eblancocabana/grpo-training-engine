@@ -2,9 +2,12 @@
 Dr. GRPO (Group Relative Policy Optimization) Algorithm Implementation.
 Implements Dr. GRPO loss with two-sided clipping, advantage calculation, and KL divergence.
 """
+from __future__ import annotations
+
+import importlib
+from typing import Callable, cast
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Optional, List
 
 
 class GRPOTrainer:
@@ -16,6 +19,14 @@ class GRPOTrainer:
     - Two-sided clipping: asymmetric bounds (epsilon, epsilon_high) for the PPO ratio
     - Hard safety cap (delta): clamps ratio to prevent small-batch explosion
     """
+
+    clip_epsilon: float
+    epsilon_high: float
+    delta: float
+    kl_coef: float
+    group_size: int
+    use_kl: bool
+    use_triton_kernels: bool
     
     def __init__(
         self,
@@ -24,7 +35,8 @@ class GRPOTrainer:
         delta: float = 1.5,
         kl_coef: float = 0.1,
         group_size: int = 4,
-        use_kl: bool = False
+        use_kl: bool = False,
+        use_triton_kernels: bool = False,
     ):
         self.clip_epsilon = clip_epsilon
         self.epsilon_high = epsilon_high
@@ -32,11 +44,12 @@ class GRPOTrainer:
         self.kl_coef = kl_coef
         self.group_size = group_size
         self.use_kl = use_kl
+        self.use_triton_kernels = use_triton_kernels
     
     def calculate_advantages(
         self,
         rewards: torch.Tensor,
-        group_size: Optional[int] = None
+        group_size: int | None = None
     ) -> torch.Tensor:
         """
         Calculate Dr. GRPO group-relative advantages using centered rewards.
@@ -103,13 +116,13 @@ class GRPOTrainer:
         self,
         policy_logits: torch.Tensor,
         advantages: torch.Tensor,
-        old_policy_logits: Optional[torch.Tensor] = None,
-        old_log_probs: Optional[torch.Tensor] = None,
-        reference_logits: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        entropy_mask: Optional[torch.Tensor] = None,
-        target_ids: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, dict]:
+        old_policy_logits: torch.Tensor | None = None,
+        old_log_probs: torch.Tensor | None = None,
+        reference_logits: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        entropy_mask: torch.Tensor | None = None,
+        target_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """
         Compute Dr. GRPO loss with two-sided clipping.
         
@@ -125,20 +138,13 @@ class GRPOTrainer:
         
         if target_ids is None:
             raise ValueError(
-                "target_ids must be provided: GRPO requires the actually generated "
-                "tokens from rollout, not inferred tokens from logits"
+                "target_ids must be provided: GRPO requires the actually generated tokens from rollout, not inferred tokens from logits."
             )
         target_tokens = target_ids
         
         # OPTIMIZED: Use cross_entropy to get log_probs of target tokens
         # This avoids materializing the full [batch, seq, vocab] log_probs tensor
         # -F.cross_entropy = log(p_target)
-        log_probs_target = -F.cross_entropy(
-            policy_logits.reshape(-1, vocab_size),
-            target_tokens.reshape(-1),
-            reduction='none'
-        ).view(batch_size, seq_len)
-        
         if old_log_probs is not None:
             old_log_probs_target = old_log_probs
         elif old_policy_logits is not None:
@@ -150,6 +156,35 @@ class GRPOTrainer:
             ).view(batch_size, seq_len)
         else:
             raise ValueError("Either old_log_probs or old_policy_logits must be provided")
+
+        use_triton_loss = self.use_triton_kernels and not self.use_kl
+        if use_triton_loss:
+            triton_module = importlib.import_module("src.triton_kernels")
+            fused_grpo_loss = cast(
+                Callable[..., object],
+                getattr(triton_module, "fused_grpo_loss"),
+            )
+            return cast(
+                tuple[torch.Tensor, dict[str, float]],
+                fused_grpo_loss(
+                    policy_logits=policy_logits,
+                    target_ids=target_tokens,
+                    old_log_probs=old_log_probs_target,
+                    advantages=advantages,
+                    clip_epsilon=self.clip_epsilon,
+                    epsilon_high=self.epsilon_high,
+                    delta=self.delta,
+                    group_size=self.group_size,
+                    attention_mask=attention_mask,
+                    entropy_mask=entropy_mask,
+                ),
+            )
+
+        log_probs_target = -F.cross_entropy(
+            policy_logits.reshape(-1, vocab_size),
+            target_tokens.reshape(-1),
+            reduction='none'
+        ).view(batch_size, seq_len)
         
         log_ratio = log_probs_target - old_log_probs_target
         ratio = torch.exp(log_ratio)
@@ -222,7 +257,7 @@ class GRPOTrainer:
         self,
         logits: torch.Tensor,
         tokens: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Compute per-sample sum of log probabilities for given tokens."""
         log_probs = F.log_softmax(logits, dim=-1)
@@ -244,6 +279,8 @@ class GroupSampler:
     """
     Samples multiple responses (group) for each prompt.
     """
+
+    group_size: int
     
     def __init__(self, group_size: int = 4):
         """
@@ -254,9 +291,9 @@ class GroupSampler:
 
     def group_responses(
         self,
-        responses: List[str],
-        group_size: Optional[int] = None
-    ) -> List[List[str]]:
+        responses: list[str],
+        group_size: int | None = None
+    ) -> list[list[str]]:
         """
         Group responses by prompt.
         
@@ -271,7 +308,7 @@ class GroupSampler:
             group_size = self.group_size
         
         num_prompts = len(responses) // group_size
-        grouped = []
+        grouped: list[list[str]] = []
         
         for i in range(num_prompts):
             start_idx = i * group_size

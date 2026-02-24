@@ -2,9 +2,11 @@
 Entropy-Aware Selective Backpropagation.
 Calculates token-level entropy and creates gradient masks.
 """
+import importlib
+from typing import Callable, cast
+
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 
 class EntropyCalculator:
@@ -19,7 +21,7 @@ class EntropyCalculator:
     
     def __init__(
         self,
-        threshold: Optional[float] = None,
+        threshold: float | None = None,
         percentile: float = 0.5,
         min_tokens: int = 10
     ):
@@ -29,11 +31,10 @@ class EntropyCalculator:
             percentile: Percentile of tokens to keep (0.0-1.0)
             min_tokens: Minimum number of tokens to keep per sequence
         """
-        self.threshold = threshold
-        self.percentile = percentile
-        self.min_tokens = min_tokens
+        self.threshold: float | None = threshold
+        self.percentile: float = percentile
+        self.min_tokens: int = min_tokens
     
-    @torch.no_grad()
     def calculate_entropy(
         self,
         logits: torch.Tensor,
@@ -56,30 +57,59 @@ class EntropyCalculator:
         flat_logits = logits.reshape(-1, vocab_size)
         total_tokens = flat_logits.size(0)
         
-        entropy_list = []
+        entropy_list: list[torch.Tensor] = []
         
-        # Process in chunks to avoid materializing full probabilities tensor
-        for i in range(0, total_tokens, chunk_size):
-            chunk = flat_logits[i:i + chunk_size]
-            
-            # Standard entropy calculation on small chunk
-            log_probs = F.log_softmax(chunk, dim=-1)
-            probs = torch.exp(log_probs)
-            
-            # H = -sum(p * log(p))
-            chunk_entropy = -(probs * log_probs).sum(dim=-1)
-            
-            entropy_list.append(chunk_entropy)
+        with torch.no_grad():
+            # Process in chunks to avoid materializing full probabilities tensor
+            for i in range(0, total_tokens, chunk_size):
+                chunk = flat_logits[i:i + chunk_size]
+
+                # Standard entropy calculation on small chunk
+                log_probs = F.log_softmax(chunk, dim=-1)
+                probs = torch.exp(log_probs)
+
+                # H = -sum(p * log(p))
+                chunk_entropy = -(probs * log_probs).sum(dim=-1)
+
+                entropy_list.append(chunk_entropy)
             
         # Concatenate and restore shape
         entropy = torch.cat(entropy_list).view(batch_size, seq_len)
         
         return entropy
+
+    def calculate_entropy_and_mask(
+        self,
+        logits: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        use_triton_kernels: bool = False,
+        chunk_size: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            if use_triton_kernels:
+                triton_module = importlib.import_module("src.triton_kernels")
+                fused_entropy_mask = cast(
+                    Callable[..., tuple[torch.Tensor, torch.Tensor]],
+                    getattr(triton_module, "fused_entropy_mask"),
+                )
+                entropy, mask = fused_entropy_mask(
+                    logits,
+                    attention_mask=attention_mask,
+                    threshold=self.threshold,
+                    percentile=self.percentile,
+                    min_tokens=self.min_tokens,
+                )
+                return entropy, mask
+
+            entropy = self.calculate_entropy(logits, chunk_size=chunk_size)
+            mask = self.create_mask(entropy, attention_mask)
+            return entropy, mask
     
     def create_mask_from_threshold(
         self,
         entropy: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Create binary mask from fixed threshold.
@@ -105,7 +135,7 @@ class EntropyCalculator:
     def create_mask_from_percentile(
         self,
         entropy: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Create binary mask keeping top percentile by entropy.
@@ -175,7 +205,7 @@ class EntropyCalculator:
     def create_mask(
         self,
         entropy: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Create gradient mask based on entropy.
@@ -216,8 +246,8 @@ class EntropyCalculator:
     def get_entropy_stats(
         self,
         entropy: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> dict:
+        attention_mask: torch.Tensor | None = None
+    ) -> dict[str, float]:
         """
         Get statistics about entropy distribution.
         
@@ -240,4 +270,3 @@ class EntropyCalculator:
             'entropy_max': valid_entropy.max().item(),
             'entropy_median': valid_entropy.median().item(),
         }
-
