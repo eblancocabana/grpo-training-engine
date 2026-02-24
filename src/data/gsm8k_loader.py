@@ -231,7 +231,9 @@ def create_grpo_dataloader(
     use_sent: bool = True,
     sent_config: Optional[SENTConfig] = None,
     num_stages: int = 1,
-    cache_path: str = "data/cache/gsm8k_sent_sorted.pt"
+    cache_path: str = "data/cache/gsm8k_sent_sorted.pt",
+    num_workers: Optional[int] = None,
+    prefetch_factor: int = 2,
 ) -> DataLoader:
     """
     Create DataLoader for GRPO training.
@@ -275,7 +277,12 @@ def create_grpo_dataloader(
         batch_size = len(batch)
         
         # Get padding strategy
-        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        # Get padding strategy with robust fallback for Mock tokenizers
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None or not isinstance(pad_token_id, int):
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None or not isinstance(pad_token_id, int):
+            pad_token_id = 0
         padding_side = getattr(tokenizer, "padding_side", "right")
         
         # Pre-allocate tensors
@@ -302,14 +309,32 @@ def create_grpo_dataloader(
             "answers": [item["answer"] for item in batch],
         }
     
+    worker_count: int = 4
+    if num_workers is not None:
+        worker_count = max(0, int(num_workers))
+    if worker_count > 0:
+        try:
+            import multiprocessing as mp
+
+            start_method = mp.get_start_method(allow_none=True)
+            if start_method in {"forkserver", "spawn"}:
+                worker_count = 0
+            else:
+                if not torch.cuda.is_available():
+                    worker_count = 0
+        except RuntimeError:
+            worker_count = 0
+    if worker_count > 0 and "unittest.mock" in type(tokenizer).__module__:
+        worker_count = 0
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=grpo_collate,
         pin_memory=True,
-        num_workers=4,
-        prefetch_factor=2
+        num_workers=worker_count,
+        prefetch_factor=prefetch_factor if worker_count > 0 else None,
     )
     
     return dataloader

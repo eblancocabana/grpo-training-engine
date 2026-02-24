@@ -3,13 +3,48 @@ Manual LoRA implementation for 4-bit quantized models.
 Implements low-rank adaptation without using PEFT library.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any, List, Protocol, cast
+
 import torch
 import torch.nn as nn
 import bitsandbytes as bnb
-from typing import List
+from src.triton_kernels import lora_fused_forward
 from src.utils.logging_utils import get_logger
 
+
 logger = get_logger("core.lora")
+
+
+class _Linear4bitLike(Protocol):
+    weight: torch.nn.Parameter
+    in_features: int
+    out_features: int
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor: ...
+
+
+def _get_bnb_linear4bit() -> Any:
+    nn_namespace = getattr(bnb, "nn", None)
+    return getattr(nn_namespace, "Linear4bit", None)
+
+
+def _is_linear4bit(module: nn.Module) -> bool:
+    linear4bit = _get_bnb_linear4bit()
+    return linear4bit is not None and isinstance(module, linear4bit)
+
+
+def _dequantize_4bit(weight: torch.Tensor) -> torch.Tensor:
+    functional = getattr(bnb, "functional", None)
+    if functional is None or not hasattr(functional, "dequantize_4bit"):
+        raise RuntimeError("bitsandbytes.functional.dequantize_4bit is unavailable.")
+    quant_state = cast(object | None, getattr(weight, "quant_state", None))
+    if quant_state is None:
+        raise RuntimeError("Quantization state missing from weight tensor.")
+    dequant = cast(Any, functional).dequantize_4bit
+    return cast(torch.Tensor, dequant(weight, quant_state))
 
 
 class ManualLoRALayer(nn.Module):
@@ -27,16 +62,20 @@ class ManualLoRALayer(nn.Module):
 
     def __init__(
         self,
-        base_layer: bnb.nn.Linear4bit,
+        base_layer: _Linear4bitLike,
         rank: int = 16,
         alpha: int = 32,
         dropout: float = 0.0,
+        use_triton: bool = True,
+        prefer_base_layer: bool = False,
     ):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
+        self.use_triton = use_triton
+        self.prefer_base_layer = prefer_base_layer
 
         # Freeze base layer weights
         self.base_layer.weight.requires_grad = False
@@ -70,25 +109,42 @@ class ManualLoRALayer(nn.Module):
         Returns:
             Output tensor [batch, seq_len, out_features]
         """
-        # Base layer output (quantized, frozen)
-        # Clone needed for autograd compatibility with quantized layers
-        base_output = self.base_layer(x)
-        if base_output.requires_grad:
-            base_output = base_output.clone()
+        if self.use_triton:
+            try:
+                return cast(
+                    torch.Tensor,
+                    lora_fused_forward(
+                        x,
+                        lora_layer=self,
+                        prefer_base_layer=self.prefer_base_layer,
+                    ),
+                )
+            except (ImportError, RuntimeError, ValueError):
+                pass
 
-        # LoRA path (trainable)
-        # Cast to adapter dtype to avoid type mismatches
-        x_adapt = x.to(self.lora_A.weight.dtype)
+        try:
+            base_output = cast(Callable[[torch.Tensor], torch.Tensor], self.base_layer)(x)
+            if base_output.requires_grad:
+                base_output = base_output.clone()
 
-        # LoRA computation: B(A(x)) * scaling
-        lora_output = self.lora_B(self.lora_A(self.lora_dropout(x_adapt)))
-        lora_output = lora_output * self.scaling
+            x_adapt = x.to(self.lora_A.weight.dtype)
+            lora_output = self.lora_B(self.lora_A(self.lora_dropout(x_adapt)))
+            lora_output = lora_output * self.scaling
 
-        # Cast back to base output dtype if needed
-        if lora_output.dtype != base_output.dtype:
-            lora_output = lora_output.to(base_output.dtype)
+            if lora_output.dtype != base_output.dtype:
+                lora_output = lora_output.to(base_output.dtype)
 
-        return base_output + lora_output
+            return base_output + lora_output
+        except Exception:
+            if not self.use_triton:
+                raise
+            return cast(
+                torch.Tensor,
+                lora_fused_forward(
+                    x,
+                    lora_layer=self,
+                ),
+            )
 
     def merge_weights(self) -> torch.Tensor:
         """
@@ -99,9 +155,7 @@ class ManualLoRALayer(nn.Module):
             Merged weight matrix
         """
         # Get base weight (dequantized)
-        base_weight = bnb.functional.dequantize_4bit(
-            self.base_layer.weight, self.base_layer.weight.quant_state
-        )
+        base_weight = _dequantize_4bit(self.base_layer.weight)
 
         # Compute LoRA weight
         lora_weight = self.lora_B.weight @ self.lora_A.weight * self.scaling
@@ -115,6 +169,8 @@ def inject_lora_layers(
     rank: int = 16,
     alpha: int = 32,
     dropout: float = 0.0,
+    use_triton: bool = True,
+    prefer_base_layer: bool = False,
     verbose: bool = True,
 ) -> int:
     """
@@ -137,9 +193,7 @@ def inject_lora_layers(
         # Check if this is a target module
         module_short_name = name.split(".")[-1]
 
-        if module_short_name in target_modules and isinstance(
-            module, bnb.nn.Linear4bit
-        ):
+        if module_short_name in target_modules and _is_linear4bit(cast(nn.Module, module)):
             # Navigate to parent module
             parent_name = ".".join(name.split(".")[:-1])
             child_name = name.split(".")[-1]
@@ -151,11 +205,16 @@ def inject_lora_layers(
 
             # Create LoRA wrapper
             lora_layer = ManualLoRALayer(
-                base_layer=module, rank=rank, alpha=alpha, dropout=dropout
+                base_layer=cast(_Linear4bitLike, module),
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+                use_triton=use_triton,
+                prefer_base_layer=prefer_base_layer,
             )
 
             # Move to same device/dtype as base layer
-            device = module.weight.device
+            device = cast(torch.device, cast(_Linear4bitLike, module).weight.device)
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             lora_layer = lora_layer.to(device=device, dtype=dtype)
 

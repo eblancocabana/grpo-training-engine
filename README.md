@@ -295,6 +295,7 @@ Aggressive VRAM management:
 | `--lora-rank` | 16 | LoRA Rank |
 | `--learning-rate` | 1e-4 | Learning rate |
 | `--use-entropy-mask` | True | Entropy-based filtering |
+| `--use-triton` / `--no-triton` | True | Use Triton kernels (falls back to PyTorch if missing) |
 | `--wandb` | True | Enable Weights & Biases logging |
 
 ### Advanced Configuration
@@ -307,6 +308,20 @@ config.training.max_response_length = 512  # Adjust based on VRAM
 config.entropy.percentile = 0.5  # % tokens to keep
 config.grpo.clip_epsilon = 0.2  # PPO clipping
 ```
+
+### Triton Kernels
+
+The project includes optional Triton kernels for optimized performance. By default, training attempts to use Triton kernels. If Triton is not installed, it falls back to pure PyTorch implementations automatically.
+
+```bash
+# Explicitly disable Triton kernels
+python train.py --no-triton
+
+# Explicitly enable (default)
+python train.py --use-triton
+```
+
+> **Note:** If you encounter issues with Triton, use `--no-triton` to fall back to PyTorch.
 
 ## 🐛 Troubleshooting
 

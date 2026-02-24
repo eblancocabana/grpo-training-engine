@@ -94,6 +94,22 @@ def main():
         help="Use entropy-based selective backpropagation"
     )
     parser.add_argument(
+        "--use-triton",
+        action="store_true",
+        default=True,
+        help="Enable Triton kernels (default: enabled)"
+    )
+    parser.add_argument(
+        "--no-triton",
+        action="store_true",
+        help="Disable Triton kernels"
+    )
+    parser.add_argument(
+        "--triton-lora-prefer-base",
+        action="store_true",
+        help="Prefer base-layer matmul in Triton LoRA forward"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -138,6 +154,12 @@ def main():
         type=int,
         default=None,
         help="Gradient accumulation steps (default: 16)"
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop training after this many steps"
     )
     parser.add_argument(
         "--dry-run",
@@ -219,6 +241,8 @@ def main():
     config.entropy.use_entropy_mask = args.use_entropy_mask
     config.training.max_prompt_length = args.max_prompt_length
     config.training.max_response_length = args.max_response_length
+    config.training.use_triton_kernels = args.use_triton and not args.no_triton
+    config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
     
     if args.epsilon_high is not None:
         config.grpo.epsilon_high = args.epsilon_high
@@ -228,6 +252,9 @@ def main():
         config.grpo.mask_truncated_completions = False
     if args.gradient_accumulation_steps is not None:
         config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
+
+    if args.max_steps is not None:
+        config.training.max_steps = args.max_steps
     
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
@@ -259,6 +286,7 @@ def main():
     logger.info("  Epochs: %s", config.training.num_epochs)
     logger.info("  Gradient Accumulation: %s", config.training.gradient_accumulation_steps)
     logger.info("  Entropy Mask: %s", config.entropy.use_entropy_mask)
+    logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
     logger.info("  Max Prompt Length: %s", config.training.max_prompt_length)
     logger.info("  Max Response Length: %s", config.training.max_response_length)
     logger.info("  Output Directory: %s", config.training.output_dir)
