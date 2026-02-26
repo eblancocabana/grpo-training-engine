@@ -144,13 +144,12 @@ class MemoryManager:
     
     def optimize_for_inference(self):
         """Switch to inference mode with gradients disabled."""
-        self.clear_cache(aggressive=True)
         torch.set_grad_enabled(False)
+        self.clear_cache(aggressive=False)
     
     def optimize_for_training(self):
         """Switch to training mode with gradients enabled."""
         torch.set_grad_enabled(True)
-        self.clear_cache(aggressive=True)
 
 
 def print_model_memory_usage(model: torch.nn.Module, model_name: str = "Model"):
@@ -175,4 +174,3 @@ def print_model_memory_usage(model: torch.nn.Module, model_name: str = "Model"):
     logger.info("  Total parameters: %s", f"{total_params:,}")
     logger.info("  Trainable parameters: %s (%.2f%%)", f"{trainable_params:,}", trainable_params/total_params*100)
     logger.info("  Estimated memory: %.2f GB", param_memory_gb)
-
