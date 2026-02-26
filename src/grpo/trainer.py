@@ -9,7 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import os
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 import gc
 import time
 import math
@@ -264,7 +264,6 @@ class GRPOTrainerLoop:
             log_dict["memory/vram_used_gb"] = vram_stats.get("reserved_gb", 0)
             log_dict["memory/vram_allocated_gb"] = vram_stats.get("allocated_gb", 0)
 
-
         log_dict["train/learning_rate"] = self.scheduler.get_last_lr()[0]
         log_dict["train/gen_micro_batch"] = self._gen_micro_batch
         log_dict["train/train_micro_batch"] = self._train_micro_batch
@@ -321,8 +320,8 @@ class GRPOTrainerLoop:
             attention_mask=real_mask,
             use_cache=True,
         )
-        past_kv = outputs.past_key_values          # DynamicCache, seq_len = prompt_len
-        past_kv.crop(prompt_len - 1)                # keep [0 .. prompt_len-2]
+        past_kv = outputs.past_key_values  # DynamicCache, seq_len = prompt_len
+        past_kv.crop(prompt_len - 1)  # keep [0 .. prompt_len-2]
         del outputs
         return past_kv
 
@@ -359,8 +358,10 @@ class GRPOTrainerLoop:
 
         with torch.no_grad():
             for prompt_idx in range(batch_size):
-                single_ids = input_ids[prompt_idx:prompt_idx + 1].to(self.device)
-                single_mask = attention_mask[prompt_idx:prompt_idx + 1].to(self.device)
+                single_ids = input_ids[prompt_idx : prompt_idx + 1].to(self.device)
+                single_mask = attention_mask[prompt_idx : prompt_idx + 1].to(
+                    self.device
+                )
 
                 # Strip left-padding: only process real tokens
                 first_real = single_mask[0].argmax().item()
@@ -443,9 +444,11 @@ class GRPOTrainerLoop:
 
                     for j in range(outputs.shape[0]):
                         response_ids = outputs[j, prompt_len:]
-                        generated_texts.append(self.tokenizer.decode(
-                            response_ids, skip_special_tokens=True
-                        ))
+                        generated_texts.append(
+                            self.tokenizer.decode(
+                                response_ids, skip_special_tokens=True
+                            )
+                        )
 
                     if use_triton_kernels:
                         del outputs
@@ -520,7 +523,7 @@ class GRPOTrainerLoop:
         )
         response_ids = gen_encodings["input_ids"].to(self.device)
         response_mask = gen_encodings["attention_mask"].to(self.device)
-        
+
         # Calculate lengths for penalty
         response_lengths = response_mask.sum(dim=1).float()
 
@@ -534,14 +537,16 @@ class GRPOTrainerLoop:
         for gt in ground_truths:
             expanded_ground_truths.extend([gt] * group_size)
 
-        for i, (gen_text, gt) in enumerate(zip(generated_texts, expanded_ground_truths)):
+        for i, (gen_text, gt) in enumerate(
+            zip(generated_texts, expanded_ground_truths)
+        ):
             reward, info = self.verifier.verify(gen_text, gt)
-            
+
             # Apply length penalty
             if self.config.grpo.length_penalty_coef > 0:
                 penalty = response_lengths[i] * self.config.grpo.length_penalty_coef
                 reward -= penalty.item()
-                
+
             rewards_list.append(reward)
             debug_infos.append(info)
 
@@ -569,14 +574,18 @@ class GRPOTrainerLoop:
                 batch_infos = debug_infos[start_idx:end_idx]
 
                 # Calculate statistics
-                correct_count = sum(1 for info in batch_infos if info.get("match", False))
-                
+                correct_count = sum(
+                    1 for info in batch_infos if info.get("match", False)
+                )
+
                 total_count = len(batch_rewards)
                 failed_count = total_count - correct_count
 
                 logger.debug(
                     "Responses: %d total | %d correct | %d failed",
-                    total_count, correct_count, failed_count
+                    total_count,
+                    correct_count,
+                    failed_count,
                 )
                 logger.debug("")
 
@@ -815,7 +824,9 @@ class GRPOTrainerLoop:
 
         # Add entropy stats
         if self.config.entropy.use_entropy_mask:
-            avg_metrics["entropy_masked_ratio"] = avg_metrics.get("selected_tokens_ratio", 0.0)
+            avg_metrics["entropy_masked_ratio"] = avg_metrics.get(
+                "selected_tokens_ratio", 0.0
+            )
 
         # Add reward distribution stats
         avg_metrics["reward_std"] = rewards.std().item()
@@ -918,7 +929,9 @@ class GRPOTrainerLoop:
                     try:
                         self.benchmark.run(self.global_step)
                     except Exception as e:
-                        logger.info("[Benchmark] Failed at step %s: %s", self.global_step, e)
+                        logger.info(
+                            "[Benchmark] Failed at step %s: %s", self.global_step, e
+                        )
 
                 # Save checkpoint
                 if self.global_step % self.config.training.save_interval == 0:
@@ -985,7 +998,7 @@ class GRPOTrainerLoop:
         # If SENT is enabled, we MUST NOT shuffle (curriculum depends on order)
         use_sent = self.config.sent.enabled
         do_shuffle = not use_sent
-        
+
         dataloader = create_grpo_dataloader(
             tokenizer=self.tokenizer,
             split="train",
@@ -999,12 +1012,16 @@ class GRPOTrainerLoop:
         )
 
         # Set curriculum stage if SENT is enabled
-        if use_sent and hasattr(dataloader.dataset, 'set_stage'):
+        if use_sent and hasattr(dataloader.dataset, "set_stage"):
             dataloader.dataset.set_stage(sent_stage)
             stage_info = dataloader.dataset.get_stage_info()
-            logger.info("[SENT] Training on stage %d/%d (samples %d-%d)",
-                        sent_stage, stage_info["num_stages"],
-                        stage_info["stage_start_idx"], stage_info["stage_end_idx"])
+            logger.info(
+                "[SENT] Training on stage %d/%d (samples %d-%d)",
+                sent_stage,
+                stage_info["num_stages"],
+                stage_info["stage_start_idx"],
+                stage_info["stage_end_idx"],
+            )
 
         logger.info("[Train] Starting training for %s epochs...", num_epochs)
         logger.info("[Train] Steps per epoch: ~%s", len(dataloader))
@@ -1032,7 +1049,9 @@ class GRPOTrainerLoop:
         )
 
         # Run initial benchmark once per model/config (sentinel)
-        baseline_marker = os.path.join(self.config.training.output_dir, "baseline_benchmark_done.json")
+        baseline_marker = os.path.join(
+            self.config.training.output_dir, "baseline_benchmark_done.json"
+        )
         force = getattr(self.config.training, "force_initial_benchmark", False)
 
         def _has_checkpoints() -> bool:
@@ -1049,24 +1068,32 @@ class GRPOTrainerLoop:
         run_initial = True
         if not force:
             if _has_checkpoints():
-                logger.info("[Benchmark] Checkpoints detected; skipping initial benchmark.")
+                logger.info(
+                    "[Benchmark] Checkpoints detected; skipping initial benchmark."
+                )
                 run_initial = False
             elif os.path.exists(baseline_marker):
                 try:
                     with open(baseline_marker, "r") as fh:
                         meta = json.load(fh)
                     if meta.get("model_id") == self.config.model.model_id:
-                        logger.info("[Benchmark] Baseline benchmark already present for this model; skipping.")
+                        logger.info(
+                            "[Benchmark] Baseline benchmark already present for this model; skipping."
+                        )
                         run_initial = False
                     else:
-                        logger.info("[Benchmark] Baseline marker exists but model_id differs; re-running benchmark.")
+                        logger.info(
+                            "[Benchmark] Baseline marker exists but model_id differs; re-running benchmark."
+                        )
                         run_initial = True
                 except Exception:
                     run_initial = True
 
         if run_initial:
             try:
-                logger.info("[Train] Running initial benchmark before training start...")
+                logger.info(
+                    "[Train] Running initial benchmark before training start..."
+                )
                 metrics = self.benchmark.run(self.global_step)
                 # write marker with minimal metadata
                 try:
@@ -1074,7 +1101,9 @@ class GRPOTrainerLoop:
                 except Exception:
                     model_repr = str(self.config.model.model_id)
 
-                checksum_src = model_repr + "|" + str(getattr(self.tokenizer, "vocab_size", ""))
+                checksum_src = (
+                    model_repr + "|" + str(getattr(self.tokenizer, "vocab_size", ""))
+                )
                 model_checksum = hashlib.sha256(checksum_src.encode()).hexdigest()
 
                 meta = {
@@ -1091,12 +1120,18 @@ class GRPOTrainerLoop:
                 os.makedirs(self.config.training.output_dir, exist_ok=True)
                 with open(baseline_marker, "w") as fh:
                     json.dump(meta, fh)
-                logger.info("[Benchmark] Initial benchmark complete; marker saved at %s.", baseline_marker)
+                logger.info(
+                    "[Benchmark] Initial benchmark complete; marker saved at %s.",
+                    baseline_marker,
+                )
 
                 # Log baseline metrics to WandB if available
                 if self._wandb_run is not None and metrics:
                     try:
-                        wandb.log({f"baseline/{k}": v for k, v in metrics.items()}, step=self.global_step)
+                        wandb.log(
+                            {f"baseline/{k}": v for k, v in metrics.items()},
+                            step=self.global_step,
+                        )
                         logger.info("[WandB] Baseline metrics logged to WandB.")
                     except Exception as e:
                         logger.info("[WandB] Failed to log baseline metrics: %s", e)
@@ -1112,7 +1147,10 @@ class GRPOTrainerLoop:
             if steps_per_epoch > 0:
                 resume_epoch = self._resume_step // steps_per_epoch
                 resume_skip_steps = self._resume_step % steps_per_epoch
-                if self._resume_epoch is not None and self._resume_epoch != resume_epoch:
+                if (
+                    self._resume_epoch is not None
+                    and self._resume_epoch != resume_epoch
+                ):
                     logger.info(
                         "[Resume] Adjusting resume epoch from %d to %d based on global_step.",
                         self._resume_epoch,
@@ -1148,7 +1186,9 @@ class GRPOTrainerLoop:
 
         self._finish_wandb()
 
-    def load_checkpoint(self, checkpoint_path: str, strict: bool = True) -> Dict[str, Any]:
+    def load_checkpoint(
+        self, checkpoint_path: str, strict: bool = True
+    ) -> Dict[str, Any]:
         if self.checkpoint_manager is None:
             raise RuntimeError("CheckpointManager not initialized. Call setup() first.")
 
