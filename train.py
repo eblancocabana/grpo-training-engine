@@ -167,6 +167,17 @@ def main():
         help="Test setup without training"
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from latest checkpoint"
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a specific checkpoint to resume from"
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         default=True,
@@ -303,9 +314,39 @@ def main():
     # Create trainer and start training
     logger.info("Initializing trainer...")
     trainer = GRPOTrainerLoop(config)
-    
+
     try:
         trainer.setup()
+
+        if args.resume or args.resume_checkpoint:
+            checkpoint_manager = trainer.checkpoint_manager
+            if checkpoint_manager is None:
+                raise RuntimeError("Checkpoint manager not initialized after setup.")
+            checkpoint_path = args.resume_checkpoint
+            if checkpoint_path is None:
+                checkpoint_path = checkpoint_manager.get_latest_checkpoint()
+            if checkpoint_path is None:
+                raise FileNotFoundError(
+                    "Resume requested but no checkpoint found in output directory."
+                )
+            if args.resume_checkpoint is not None:
+                logger.info(
+                    "Resume requested: using explicit checkpoint path: %s",
+                    checkpoint_path,
+                )
+            else:
+                logger.info(
+                    "Resume requested: using latest checkpoint from %s: %s",
+                    config.training.checkpoint_dir,
+                    checkpoint_path,
+                )
+            resume_info = trainer.load_checkpoint(checkpoint_path)
+            logger.info(
+                "Resume loaded: step=%s epoch=%s",
+                resume_info.get("step"),
+                resume_info.get("epoch"),
+            )
+
         trainer.train()
         logger.info("Training completed successfully!")
         logger.info("Checkpoints saved to: %s", config.training.checkpoint_dir)
