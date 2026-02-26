@@ -3,6 +3,7 @@ Entropy-Aware Selective Backpropagation.
 Calculates token-level entropy and creates gradient masks.
 """
 import importlib
+import contextlib
 from typing import Callable, cast
 
 import torch
@@ -59,7 +60,12 @@ class EntropyCalculator:
         
         entropy_list: list[torch.Tensor] = []
         
-        with torch.no_grad():
+        grad_context = (
+            contextlib.nullcontext()
+            if logits.requires_grad
+            else torch.no_grad()
+        )
+        with grad_context:
             # Process in chunks to avoid materializing full probabilities tensor
             for i in range(0, total_tokens, chunk_size):
                 chunk = flat_logits[i:i + chunk_size]

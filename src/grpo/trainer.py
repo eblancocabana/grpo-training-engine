@@ -94,6 +94,8 @@ class GRPOTrainerLoop:
         self._oom_backoff_count = 0
         self._wandb_run = None
         self._step_start_time = None
+        self._resume_step = None
+        self._resume_epoch = None
 
     def setup(self):
         """Setup model, tokenizer, and training components."""
@@ -693,20 +695,19 @@ class GRPOTrainerLoop:
                 logits = outputs.logits[:, :-1, :]
                 targets = batch_ids[:, 1:]
 
-                # Compute log probs
-                log_probs = F.log_softmax(logits, dim=-1)
-
-                # Gather log probs for target tokens
-                token_log_probs = torch.gather(
-                    log_probs, dim=-1, index=targets.unsqueeze(-1)
-                ).squeeze(-1)
+                # Compute log probs for target tokens without materializing full vocab
+                token_log_probs = -F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    targets.reshape(-1),
+                    reduction="none",
+                ).view(targets.shape)
                 token_log_probs = (
                     token_log_probs * response_only_mask[start_idx:end_idx, 1:]
                 )
 
                 all_old_log_probs.append(token_log_probs)
 
-                del outputs, logits, log_probs
+                del outputs, logits
                 self.memory_manager.clear_cache()
 
         all_old_log_probs = torch.cat(all_old_log_probs, dim=0)
@@ -740,15 +741,18 @@ class GRPOTrainerLoop:
             log_tensor_meta(logger, "Logits", logits, level=TRACE)
             entropy_mask = None
             if self.config.entropy.use_entropy_mask:
-                entropy, base_entropy_mask = (
+                # Compute entropy on logits[:, :-1, :] — exactly the same slice passed to
+                # compute_grpo_loss — so the mask is always in perfect token alignment.
+                # batch_response_mask[:, 1:] selects response-only positions in that slice.
+                loss_logits = logits[:, :-1, :].contiguous()
+                loss_resp_mask = batch_response_mask[:, 1:].contiguous()
+                entropy, entropy_mask = (
                     self.entropy_calculator.calculate_entropy_and_mask(
-                        logits,
-                        attention_mask=batch_attention_mask,
+                        loss_logits,
+                        attention_mask=loss_resp_mask,
                         use_triton_kernels=self.config.training.use_triton_kernels,
                     )
                 )
-                # Only keep entropy mask where response_only_mask is 1
-                entropy_mask = base_entropy_mask * batch_response_mask
 
             # Compute loss for batch
             # CRITICAL: Use response_only_mask (not attention_mask) so only response tokens
@@ -767,7 +771,7 @@ class GRPOTrainerLoop:
                 old_log_probs=batch_old_log_probs,
                 target_ids=batch_input_ids[:, 1:],
                 attention_mask=batch_response_mask[:, 1:],
-                entropy_mask=entropy_mask[:, 1:] if entropy_mask is not None else None,
+                entropy_mask=entropy_mask if entropy_mask is not None else None,
             )
 
             # Scale loss for gradient accumulation
@@ -842,12 +846,32 @@ class GRPOTrainerLoop:
             dataloader: Training data loader
             epoch: Current epoch number
         """
+        return self.train_epoch_with_skip(dataloader, epoch, skip_steps=0)
+
+    def train_epoch_with_skip(self, dataloader, epoch: int, skip_steps: int = 0):
         self.model.train()
         epoch_metrics = []
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
 
+        if skip_steps >= len(dataloader):
+            logger.info(
+                "[Resume] Skip steps (%d) >= steps per epoch (%d); skipping epoch %d.",
+                skip_steps,
+                len(dataloader),
+                epoch + 1,
+            )
+            return
+
         for batch_idx, batch in enumerate(pbar):
+            if skip_steps > 0 and batch_idx < skip_steps:
+                if batch_idx == 0:
+                    logger.info(
+                        "[Resume] Skipping first %d steps of epoch %d...",
+                        skip_steps,
+                        epoch + 1,
+                    )
+                continue
             if (
                 self.config.training.max_steps is not None
                 and self.global_step >= self.config.training.max_steps
@@ -991,6 +1015,16 @@ class GRPOTrainerLoop:
             f"[Train] Effective batch size: {self.config.training.batch_size * self.config.training.gradient_accumulation_steps}"
         )
 
+        if (
+            self.config.training.max_steps is not None
+            and self.global_step >= self.config.training.max_steps
+        ):
+            logger.info(
+                "[Resume] Max steps (%d) already reached at resume; stopping.",
+                self.config.training.max_steps,
+            )
+            return
+
         # Save initial config
         os.makedirs(self.config.training.output_dir, exist_ok=True)
         save_training_config(
@@ -1071,9 +1105,37 @@ class GRPOTrainerLoop:
                 logger.info("[Benchmark] Initial benchmark failed: %s", e)
 
         # Training loop
-        for epoch in range(num_epochs):
+        resume_epoch = 0
+        resume_skip_steps = 0
+        if self._resume_step is not None:
+            steps_per_epoch = len(dataloader)
+            if steps_per_epoch > 0:
+                resume_epoch = self._resume_step // steps_per_epoch
+                resume_skip_steps = self._resume_step % steps_per_epoch
+                if self._resume_epoch is not None and self._resume_epoch != resume_epoch:
+                    logger.info(
+                        "[Resume] Adjusting resume epoch from %d to %d based on global_step.",
+                        self._resume_epoch,
+                        resume_epoch,
+                    )
+                logger.info(
+                    "[Resume] Resuming at global_step=%d (epoch=%d, skip=%d).",
+                    self._resume_step,
+                    resume_epoch,
+                    resume_skip_steps,
+                )
+            else:
+                resume_epoch = self._resume_epoch or 0
+                logger.info(
+                    "[Resume] Resuming at epoch=%d (global_step=%d).",
+                    resume_epoch,
+                    self._resume_step,
+                )
+
+        for epoch in range(resume_epoch, num_epochs):
             self.current_epoch = epoch
-            self.train_epoch(dataloader, epoch)
+            epoch_skip = resume_skip_steps if epoch == resume_epoch else 0
+            self.train_epoch_with_skip(dataloader, epoch, skip_steps=epoch_skip)
 
             # Save epoch checkpoint
             self.save_checkpoint(suffix=f"_epoch_{epoch + 1}")
@@ -1085,6 +1147,31 @@ class GRPOTrainerLoop:
         self.save_lora_weights(suffix="_final")
 
         self._finish_wandb()
+
+    def load_checkpoint(self, checkpoint_path: str, strict: bool = True) -> Dict[str, Any]:
+        if self.checkpoint_manager is None:
+            raise RuntimeError("CheckpointManager not initialized. Call setup() first.")
+
+        info = self.checkpoint_manager.load_checkpoint(
+            checkpoint_path,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            strict=strict,
+        )
+
+        self.global_step = info.get("step", 0)
+        self.current_step = self.global_step
+        self.current_epoch = info.get("epoch", 0)
+        self._resume_step = self.global_step
+        self._resume_epoch = self.current_epoch
+
+        logger.info(
+            "[Resume] Loaded checkpoint at step %d, epoch %d.",
+            self.global_step,
+            self.current_epoch,
+        )
+        return info
 
     def save_checkpoint(self, suffix: str = ""):
         """Save training checkpoint."""
