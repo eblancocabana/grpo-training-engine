@@ -36,6 +36,7 @@ from src.data.gsm8k_loader import create_grpo_dataloader
 from src.grpo.benchmark import GSM8KBenchmark
 from src.utils.checkpoint import CheckpointManager, save_training_config
 from src.utils.config import Config, get_8gb_vram_config
+from tools.vram_profiler.profiler_hooks import ProfilerHooks, ProfilerState
 
 try:
     import wandb
@@ -96,6 +97,7 @@ class GRPOTrainerLoop:
         self._step_start_time = None
         self._resume_step = None
         self._resume_epoch = None
+        self._profiler_hooks: ProfilerHooks | None = None
 
     def setup(self):
         """Setup model, tokenizer, and training components."""
@@ -152,6 +154,13 @@ class GRPOTrainerLoop:
             clear_cache_frequency=self.config.training.clear_cache_frequency,
         )
         self.memory_manager.enable_checkpointing(self.model)
+
+        if getattr(self.config.training, "profile_enabled", False):
+            state = ProfilerState.get_instance()
+            state.set_config_snapshot(self.config.to_dict())
+            self._profiler_hooks = ProfilerHooks(
+                state=state, memory_manager=self.memory_manager
+            )
 
         # Setup GRPO components
         self.grpo_trainer = GRPOTrainer(
@@ -499,6 +508,9 @@ class GRPOTrainerLoop:
         self._step_start_time = time.time()
         self.model.train()
 
+        if self._profiler_hooks:
+            self._profiler_hooks.on_step_start(self.global_step, self.current_epoch)
+
         if self.global_step % self.config.training.gradient_accumulation_steps == 0:
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -510,7 +522,13 @@ class GRPOTrainerLoop:
         # Phase 1: Generation (no gradients)
         self.memory_manager.optimize_for_inference()
 
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_start("generation", step=self.global_step)
+
         generated_texts = self.generate_responses(input_ids, attention_mask)
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_end("generation", step=self.global_step)
 
         # Tokenize responses (without prompt) early for length penalty
         gen_encodings = self.tokenizer(
@@ -686,6 +704,9 @@ class GRPOTrainerLoop:
 
         self.memory_manager.optimize_for_inference()
 
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_start("old_log_probs", step=self.global_step)
+
         with torch.no_grad():
             gen_micro_batch = self._gen_micro_batch
             for start_idx in range(0, num_samples, gen_micro_batch):
@@ -721,10 +742,16 @@ class GRPOTrainerLoop:
 
         all_old_log_probs = torch.cat(all_old_log_probs, dim=0)
 
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_end("old_log_probs", step=self.global_step)
+
         # Re-enable gradients for training phase
         self.memory_manager.optimize_for_training()
 
         training_micro_batch = self._train_micro_batch
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_start("training", step=self.global_step)
 
         for start_idx in range(0, num_samples, training_micro_batch):
             end_idx = min(start_idx + training_micro_batch, num_samples)
@@ -842,10 +869,37 @@ class GRPOTrainerLoop:
                 1.0 - truncation_mask.mean().item()
             )
 
+        step_time_s = None
+        if self._step_start_time:
+            step_time_s = time.time() - self._step_start_time
+            avg_metrics["step_time_s"] = step_time_s
+        total_tokens = response_lengths.sum().item()
+        avg_metrics["tokens_per_sec"] = (
+            total_tokens / step_time_s if step_time_s and step_time_s > 0 else 0.0
+        )
+
+        vram_stats = self.memory_manager.get_memory_stats()
+        if "error" not in vram_stats:
+            avg_metrics["vram_allocated"] = vram_stats.get("allocated_gb", 0.0)
+            avg_metrics["vram_reserved"] = vram_stats.get("reserved_gb", 0.0)
+            avg_metrics["vram_max_allocated"] = vram_stats.get("max_allocated_gb", 0.0)
+            avg_metrics["vram_free"] = vram_stats.get("free_gb", 0.0)
+            avg_metrics["vram_usage_fraction"] = vram_stats.get("usage_fraction", 0.0)
+
+        avg_metrics["gen_micro_batch"] = float(self._gen_micro_batch)
+        avg_metrics["train_micro_batch"] = float(self._train_micro_batch)
+        avg_metrics["oom_backoff_count"] = float(self._oom_backoff_count)
+
         self.global_step += 1
         self.memory_manager.step()
 
         self._log_wandb_metrics(avg_metrics)
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_phase_end("training", step=self.global_step - 1)
+            self._profiler_hooks.on_step_end(
+                self.global_step - 1, avg_metrics, self.current_epoch
+            )
 
         return avg_metrics
 
@@ -863,7 +917,9 @@ class GRPOTrainerLoop:
         self.model.train()
         epoch_metrics = []
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
+        dataloader_iter = iter(dataloader)
+        total_steps = len(dataloader)
+        pbar = tqdm(range(total_steps), desc=f"Epoch {epoch + 1}")
 
         if skip_steps >= len(dataloader):
             logger.info(
@@ -874,7 +930,17 @@ class GRPOTrainerLoop:
             )
             return
 
-        for batch_idx, batch in enumerate(pbar):
+        for batch_idx in pbar:
+            if self._profiler_hooks:
+                self._profiler_hooks.on_data_start(step=self.global_step)
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                if self._profiler_hooks:
+                    self._profiler_hooks.on_data_end(step=self.global_step)
+                break
+            if self._profiler_hooks:
+                self._profiler_hooks.on_data_end(step=self.global_step)
             if skip_steps > 0 and batch_idx < skip_steps:
                 if batch_idx == 0:
                     logger.info(
@@ -927,6 +993,10 @@ class GRPOTrainerLoop:
                 # Benchmark evaluation every 100 steps
                 if self.global_step % 100 == 0:
                     try:
+                        if self._profiler_hooks:
+                            self._profiler_hooks.annotate_step(
+                                self.global_step, "benchmark"
+                            )
                         self.benchmark.run(self.global_step)
                     except Exception as e:
                         logger.info(
@@ -935,10 +1005,25 @@ class GRPOTrainerLoop:
 
                 # Save checkpoint
                 if self.global_step % self.config.training.save_interval == 0:
+                    if self._profiler_hooks:
+                        self._profiler_hooks.annotate_step(
+                            self.global_step,
+                            "checkpoint",
+                            {"suffix": ""},
+                        )
                     self.save_checkpoint()
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
+                    if self._profiler_hooks:
+                        self._profiler_hooks.on_oom(
+                            self.global_step,
+                            {
+                                "gen_micro_batch": self._gen_micro_batch,
+                                "train_micro_batch": self._train_micro_batch,
+                                "epoch": epoch,
+                            },
+                        )
                     self._oom_backoff_count += 1
                     self._gen_micro_batch = max(1, self._gen_micro_batch // 2)
                     self._train_micro_batch = max(1, self._train_micro_batch // 2)
@@ -1170,9 +1255,22 @@ class GRPOTrainerLoop:
                     self._resume_step,
                 )
 
+        if self._profiler_hooks:
+            self._profiler_hooks.on_training_start(self.global_step, self.current_epoch)
+
         for epoch in range(resume_epoch, num_epochs):
             self.current_epoch = epoch
             epoch_skip = resume_skip_steps if epoch == resume_epoch else 0
+            if self._profiler_hooks:
+                self._profiler_hooks.annotate_step(
+                    self.global_step,
+                    "sent_stage",
+                    {
+                        "stage": sent_stage,
+                        "epoch": epoch,
+                        "num_stages": self.config.sent.curriculum_stages,
+                    },
+                )
             self.train_epoch_with_skip(dataloader, epoch, skip_steps=epoch_skip)
 
             # Save epoch checkpoint
@@ -1185,6 +1283,9 @@ class GRPOTrainerLoop:
         self.save_lora_weights(suffix="_final")
 
         self._finish_wandb()
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_training_end(self.global_step, self.current_epoch)
 
     def load_checkpoint(
         self, checkpoint_path: str, strict: bool = True

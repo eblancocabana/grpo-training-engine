@@ -7,6 +7,13 @@ const loading = document.getElementById('loading');
 const loadingText = document.getElementById('loading-text');
 const tooltip = document.getElementById('tooltip');
 const resetBtn = document.getElementById('reset-btn');
+const liveModeBtn = document.getElementById('live-mode-btn');
+const fileModeBtn = document.getElementById('file-mode-btn');
+const deepProfileBtn = document.getElementById('deep-profile-btn');
+const traceDownloadBtn = document.getElementById('trace-download-btn');
+const liveSection = document.getElementById('live-section');
+const fileSection = document.getElementById('file-section');
+const fileSidebar = document.getElementById('file-sidebar');
 
 const stats = {
     peak: document.getElementById('stat-peak'),
@@ -27,6 +34,35 @@ let durationUs = 0;
 
 // D3 Margins globals
 const margin = { top: 20, right: 30, bottom: 30, left: 60 };
+
+const liveState = {
+    enabled: false,
+    pollIntervalMs: 500,
+    slowIntervalMs: 5000,
+    maxTimelinePoints: 2000,
+    timeline: [],
+    metrics: {}
+};
+
+const liveElements = {
+    step: document.getElementById('live-step'),
+    epoch: document.getElementById('live-epoch'),
+    vram: document.getElementById('live-vram'),
+    loss: document.getElementById('live-loss'),
+    reward: document.getElementById('live-reward'),
+    stepTime: document.getElementById('live-step-time'),
+    phaseBars: document.getElementById('phase-bars'),
+    phaseLegend: document.getElementById('phase-legend'),
+    overlap: document.getElementById('overlap-stats'),
+    overlapCpu: document.getElementById('overlap-cpu'),
+    overlapGpu: document.getElementById('overlap-gpu'),
+    overlapIdle: document.getElementById('overlap-idle'),
+    kernelTable: document.getElementById('kernel-table'),
+    kernelPhaseFilter: document.getElementById('kernel-phase-filter'),
+    regressionList: document.getElementById('regression-list'),
+    deepProgress: document.getElementById('deep-profile-progress'),
+    deepStatus: document.getElementById('deep-profile-status')
+};
 
 // --- Interaction Init ---
 
@@ -83,6 +119,22 @@ fileInput.addEventListener('change', (e) => { handleFiles(e.target.files); });
 resetBtn.addEventListener('click', () => {
     if (normalizedEvents.length > 0) processAndRender();
 });
+
+if (liveModeBtn && fileModeBtn) {
+    liveModeBtn.addEventListener('click', () => setMode('live'));
+    fileModeBtn.addEventListener('click', () => setMode('file'));
+}
+
+if (deepProfileBtn) {
+    deepProfileBtn.addEventListener('click', () => triggerDeepProfile());
+}
+
+if (traceDownloadBtn) {
+    traceDownloadBtn.addEventListener('click', () => downloadTrace());
+}
+if (liveElements.kernelPhaseFilter) {
+    liveElements.kernelPhaseFilter.addEventListener('change', () => fetchLiveData());
+}
 
 function handleFiles(files) {
     if (files.length === 0) return;
@@ -243,23 +295,29 @@ function processAndRender() {
         const relTime = ev.t - globalStartTime;
 
         switch (ev.action) {
-            case 0: // ALLOC
+            case 0: {
                 activeAllocMap.set(ev.addr, ev.size);
                 currentActive += ev.size;
                 break;
-            case 1: // FREE
+            }
+            case 1: {
                 const sz = activeAllocMap.get(ev.addr) || 0;
                 currentActive -= sz;
                 activeAllocMap.delete(ev.addr);
                 break;
-            case 2: // SEGMENT ALLOC
+            }
+            case 2: {
                 cachedSegmentMap.set(ev.addr, ev.size);
                 currentReserved += ev.size;
                 break;
-            case 3: // SEGMENT FREE
+            }
+            case 3: {
                 const segSz = cachedSegmentMap.get(ev.addr) || 0;
                 currentReserved -= segSz;
                 cachedSegmentMap.delete(ev.addr);
+                break;
+            }
+            default:
                 break;
         }
 
@@ -313,6 +371,261 @@ function processAndRender() {
     }
 
     loading.classList.add('hidden');
+}
+
+function setMode(mode) {
+    liveState.enabled = mode === 'live';
+    if (liveState.enabled) {
+        liveSection.classList.remove('hidden');
+        fileSection.classList.add('hidden');
+        fileSidebar.classList.add('hidden');
+        liveModeBtn.classList.add('btn-primary');
+        fileModeBtn.classList.remove('btn-primary');
+        startLiveLoop();
+    } else {
+        liveSection.classList.add('hidden');
+        fileSection.classList.remove('hidden');
+        fileSidebar.classList.remove('hidden');
+        liveModeBtn.classList.remove('btn-primary');
+        fileModeBtn.classList.add('btn-primary');
+        liveState.enabled = false;
+    }
+}
+
+function startLiveLoop() {
+    if (!liveState.enabled) return;
+    scheduleLivePoll();
+}
+
+function scheduleLivePoll() {
+    const delay = document.hidden ? liveState.slowIntervalMs : liveState.pollIntervalMs;
+    setTimeout(async () => {
+        if (!liveState.enabled) return;
+        await fetchLiveData();
+        scheduleLivePoll();
+    }, delay);
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (liveState.enabled) {
+        liveState.pollIntervalMs = document.hidden ? liveState.slowIntervalMs : 500;
+    }
+});
+
+async function fetchLiveData() {
+    try {
+        const kernelPhase = liveElements.kernelPhaseFilter ? liveElements.kernelPhaseFilter.value : '';
+        const kernelQuery = kernelPhase ? `&phase=${encodeURIComponent(kernelPhase)}` : '';
+        const [statusRes, metricsRes, phasesRes, overlapRes, kernelsRes, regressionsRes, profileStatusRes, timelineRes, rewardRes, stepTimeRes] = await Promise.all([
+            fetch('/api/status'),
+            fetch('/api/metrics/latest?name=loss'),
+            fetch('/api/phases/summary?window=last_200'),
+            fetch('/api/phases/overlap?window=last_200'),
+            fetch(`/api/bottlenecks/by_kernel?sort=total_us${kernelQuery}`),
+            fetch('/api/regressions?metric=step_time_s&baseline=200&current=50'),
+            fetch('/api/profile/status'),
+            fetch('/api/timeline/downsample?every=10'),
+            fetch('/api/metrics/latest?name=avg_reward'),
+            fetch('/api/metrics/latest?name=step_time_s')
+        ]);
+
+        const status = await statusRes.json();
+        const metrics = await metricsRes.json();
+        const phases = await phasesRes.json();
+        const overlap = await overlapRes.json();
+        const kernels = await kernelsRes.json();
+        const regressions = await regressionsRes.json();
+        const profileStatus = await profileStatusRes.json();
+        const timeline = await timelineRes.json();
+        const rewardMetric = await rewardRes.json();
+        const stepMetric = await stepTimeRes.json();
+
+        updateLiveStatus(status);
+        updateMetricFromPayload(metrics.metric);
+        updateMetricFromPayload(rewardMetric.metric);
+        updateMetricFromPayload(stepMetric.metric);
+        updatePhaseBars(phases);
+        updateOverlap(overlap);
+        updateKernelTable(kernels);
+        updateRegressionList(regressions);
+        updateDeepProfileStatus(profileStatus);
+        updateLiveTimeline(timeline);
+    } catch (err) {
+        console.error('Live polling failed:', err);
+    }
+}
+
+function updateLiveStatus(status) {
+    const lastStep = status.global_step ?? '-';
+    liveElements.step.textContent = lastStep;
+    liveElements.epoch.textContent = status.epoch ?? '-';
+    const vram = status.vram || {};
+    liveElements.vram.textContent = vram.reserved_gb !== undefined ? `${vram.reserved_gb} GB` : '-';
+    liveElements.loss.textContent = liveState.metrics.loss !== undefined ? liveState.metrics.loss.toFixed(4) : '-';
+    liveElements.reward.textContent = liveState.metrics.reward !== undefined ? liveState.metrics.reward.toFixed(3) : '-';
+    liveElements.stepTime.textContent = liveState.metrics.stepTime !== undefined ? `${liveState.metrics.stepTime.toFixed(2)}s` : '-';
+}
+
+function updateMetricFromPayload(metric) {
+    if (!metric || !metric.name) return;
+    if (metric.name === 'loss') {
+        liveState.metrics.loss = metric.value;
+    }
+    if (metric.name === 'avg_reward') {
+        liveState.metrics.reward = metric.value;
+    }
+    if (metric.name === 'step_time_s') {
+        liveState.metrics.stepTime = metric.value;
+    }
+    liveElements.loss.textContent = liveState.metrics.loss !== undefined ? liveState.metrics.loss.toFixed(4) : '-';
+    liveElements.reward.textContent = liveState.metrics.reward !== undefined ? liveState.metrics.reward.toFixed(3) : '-';
+    liveElements.stepTime.textContent = liveState.metrics.stepTime !== undefined ? `${liveState.metrics.stepTime.toFixed(2)}s` : '-';
+}
+
+function updatePhaseBars(phases) {
+    const durations = phases.durations || {};
+    liveElements.phaseBars.innerHTML = '';
+    liveElements.phaseLegend.innerHTML = '';
+    const total = Object.values(durations).reduce((sum, value) => {
+        return sum + ((value && value.total) || 0);
+    }, 0);
+    Object.entries(durations).forEach(([name, stats]) => {
+        if (!stats || typeof stats.total !== 'number') {
+            return;
+        }
+        const share = total > 0 ? (stats.total / total) : 0;
+        const bar = document.createElement('div');
+        bar.style.flex = `${share}`;
+        bar.style.background = hashColor(name);
+        liveElements.phaseBars.appendChild(bar);
+        const legend = document.createElement('div');
+        legend.textContent = `${name}: ${(share * 100).toFixed(1)}%`;
+        liveElements.phaseLegend.appendChild(legend);
+    });
+}
+
+function updateOverlap(overlap) {
+    const cpu = overlap.cpu_ms !== null && overlap.cpu_ms !== undefined
+        ? `${overlap.cpu_ms.toFixed(1)} ms`
+        : '-';
+    const gpu = overlap.gpu_ms !== null && overlap.gpu_ms !== undefined
+        ? `${overlap.gpu_ms.toFixed(1)} ms`
+        : '-';
+    const idle = overlap.idle_ms !== null && overlap.idle_ms !== undefined
+        ? `${overlap.idle_ms.toFixed(1)} ms`
+        : '-';
+    liveElements.overlap.textContent = `CPU ${cpu} | GPU ${gpu} | Idle ${idle}`;
+    const total = (overlap.cpu_ms || 0) + (overlap.gpu_ms || 0) + (overlap.idle_ms || 0);
+    if (total > 0) {
+        liveElements.overlapCpu.style.width = `${((overlap.cpu_ms || 0) / total) * 100}%`;
+        liveElements.overlapGpu.style.width = `${((overlap.gpu_ms || 0) / total) * 100}%`;
+        liveElements.overlapIdle.style.width = `${((overlap.idle_ms || 0) / total) * 100}%`;
+    } else {
+        liveElements.overlapCpu.style.width = '0%';
+        liveElements.overlapGpu.style.width = '0%';
+        liveElements.overlapIdle.style.width = '0%';
+    }
+}
+
+function updateKernelTable(kernels) {
+    const rows = kernels.kernels || [];
+    liveElements.kernelTable.innerHTML = '';
+    rows.slice(0, 20).forEach(row => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${row.name}</td>
+            <td>${row.phase || '-'}</td>
+            <td>${(row.total_us || 0).toFixed(1)}</td>
+            <td>${row.count || 0}</td>
+        `;
+        liveElements.kernelTable.appendChild(tr);
+    });
+}
+
+function updateRegressionList(regressions) {
+    const items = regressions.data || regressions.regressions || [];
+    if (!items.length) {
+        liveElements.regressionList.textContent = 'No regressions detected.';
+        return;
+    }
+    liveElements.regressionList.innerHTML = items.map(item => {
+        const z = item.z_score !== undefined && item.z_score !== null
+            ? item.z_score.toFixed(2)
+            : '-';
+        return `<div>Step ${item.step ?? '-'} | z=${z} | ${item.metric ?? 'metric'}</div>`;
+    }).join('');
+}
+
+function updateDeepProfileStatus(profileStatus) {
+    const active = profileStatus.active;
+    const remaining = profileStatus.remaining_steps ?? 0;
+    const total = profileStatus.total_steps ?? 0;
+    liveElements.deepStatus.textContent = active ? `Profiling (${remaining} steps remaining)` : 'Idle';
+    const pct = total ? (100 - (remaining / total) * 100) : 0;
+    liveElements.deepProgress.style.width = `${pct}%`;
+}
+
+function updateLiveTimeline(timeline) {
+    const data = timeline.data || [];
+    liveState.timeline = data.slice(-liveState.maxTimelinePoints);
+    const container = document.getElementById('live-timeline');
+    if (!container) return;
+    container.innerHTML = '';
+    if (liveState.timeline.length === 0) {
+        return;
+    }
+    const width = container.offsetWidth || 600;
+    const height = 240;
+    const svg = d3.select('#live-timeline').append('svg').attr('width', width).attr('height', height);
+    const x = d3.scaleLinear()
+        .domain([liveState.timeline[0].t, liveState.timeline[liveState.timeline.length - 1].t])
+        .range([40, width - 20]);
+    const y = d3.scaleLinear()
+        .domain([0, d3.max(liveState.timeline, d => d.active || 0) || 1])
+        .range([height - 30, 20]);
+    const line = d3.line()
+        .x(d => x(d.t))
+        .y(d => y(d.active || 0));
+    svg.append('path')
+        .datum(liveState.timeline)
+        .attr('fill', 'none')
+        .attr('stroke', varProp('--accent'))
+        .attr('stroke-width', 1.5)
+        .attr('d', line);
+}
+
+async function triggerDeepProfile() {
+    try {
+        const response = await fetch('/api/profile/start?steps=2&warmup=1&wait=1', { method: 'POST' });
+        const payload = await response.json();
+        if (payload.status !== 'ok') {
+            alert(payload.error || 'Failed to start deep profile');
+        }
+    } catch (err) {
+        console.error('Deep profile failed', err);
+    }
+}
+
+async function downloadTrace() {
+    try {
+        const response = await fetch('/api/profile/trace?force=true');
+        const payload = await response.json();
+        if (!payload.trace) {
+            alert('Trace not available yet');
+            return;
+        }
+        const blob = new Blob([JSON.stringify(payload.trace)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'deep_profile_trace.json';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        console.error('Trace download failed', err);
+    }
 }
 
 // Search Binding
@@ -663,7 +976,9 @@ function reconstructAndRenderFlame(time) {
         row.appendChild(label);
 
         const selectRow = () => {
-            document.querySelectorAll('.flame-bar-row').forEach(r => r.classList.remove('active-row'));
+            document.querySelectorAll('.flame-bar-row').forEach(rowEl => {
+                rowEl.classList.remove('active-row');
+            });
             row.classList.add('active-row');
             stats.stack.innerHTML = `<div style="color:var(--accent); margin-bottom:10px; font-weight:700;">Stack Depth: ${item.count > 1 ? item.count + " locations" : "1 location"}</div>` +
                 resolveStack(item.frame, 25).replace(/ < /g, '\n<span style="color:var(--text-dim)">▲</span> ');

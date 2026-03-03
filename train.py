@@ -3,6 +3,7 @@
 Main training script for GRPO on RTX 3060 Ti (8GB VRAM).
 Optimized for your specific hardware setup.
 """
+
 import os
 import sys
 import torch
@@ -10,7 +11,7 @@ import argparse
 import logging
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.grpo.trainer import GRPOTrainerLoop
 from src.utils.config import get_8gb_vram_config, VerbosityLevel
@@ -25,30 +26,30 @@ def check_system():
     logger.info("=" * 60)
     logger.info("System Check for RTX 3060 Ti")
     logger.info("=" * 60)
-    
+
     # Check CUDA
     if not torch.cuda.is_available():
         logger.error("CUDA not available!")
         return False
-    
+
     # Check GPU
     gpu_name = torch.cuda.get_device_name(0)
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    
+
     logger.info("GPU: %s", gpu_name)
     logger.info("VRAM: %.1f GB", vram_gb)
     logger.info("CUDA Version: %s", torch.version.cuda)
     logger.info("PyTorch Version: %s", torch.__version__)
-    
+
     # Verify RTX 3060 Ti
     if "3060 Ti" not in gpu_name:
         logger.warning("Expected RTX 3060 Ti, found %s", gpu_name)
         logger.warning("Config will still work but may need adjustment.")
-    
+
     # Check VRAM
     if vram_gb < 7.5:
         logger.warning("Less than 8GB VRAM detected (%.1fGB)", vram_gb)
-    
+
     logger.info("=" * 60)
     return True
 
@@ -61,186 +62,164 @@ def main():
         "--output-dir",
         type=str,
         default="./outputs",
-        help="Output directory for checkpoints and logs"
+        help="Output directory for checkpoints and logs",
     )
     parser.add_argument(
-        "--epochs",
-        type=int,
-        default=3,
-        help="Number of training epochs"
+        "--epochs", type=int, default=3, help="Number of training epochs"
     )
     parser.add_argument(
         "--group-size",
         type=int,
         default=4,
-        help="Group size for GRPO (responses per prompt)"
+        help="Group size for GRPO (responses per prompt)",
     )
     parser.add_argument(
-        "--lora-rank",
-        type=int,
-        default=16,
-        help="LoRA rank (higher = more parameters)"
+        "--lora-rank", type=int, default=16, help="LoRA rank (higher = more parameters)"
     )
     parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-4,
-        help="Learning rate"
+        "--learning-rate", type=float, default=1e-4, help="Learning rate"
     )
     parser.add_argument(
         "--use-entropy-mask",
         action="store_true",
         default=True,
-        help="Use entropy-based selective backpropagation"
+        help="Use entropy-based selective backpropagation",
     )
     parser.add_argument(
         "--use-triton",
         action="store_true",
         default=True,
-        help="Enable Triton kernels (default: enabled)"
+        help="Enable Triton kernels (default: enabled)",
     )
     parser.add_argument(
-        "--no-triton",
-        action="store_true",
-        help="Disable Triton kernels"
+        "--no-triton", action="store_true", help="Disable Triton kernels"
     )
     parser.add_argument(
         "--triton-lora-prefer-base",
         action="store_true",
-        help="Prefer base-layer matmul in Triton LoRA forward"
+        help="Prefer base-layer matmul in Triton LoRA forward",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="count",
         default=0,
-        help="Increase verbosity level: -v (DEBUG), -vv (VERBOSE), -vvv (TRACE)"
+        help="Increase verbosity level: -v (DEBUG), -vv (VERBOSE), -vvv (TRACE)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="[DEPRECATED] Use -v instead. Enable debug mode to print generations"
+        help="[DEPRECATED] Use -v instead. Enable debug mode to print generations",
     )
     parser.add_argument(
-        "--max-prompt-length",
-        type=int,
-        default=128,
-        help="Maximum tokens for prompt"
+        "--max-prompt-length", type=int, default=128, help="Maximum tokens for prompt"
     )
     parser.add_argument(
         "--max-response-length",
         type=int,
         default=1024,
-        help="Maximum tokens for response"
+        help="Maximum tokens for response",
     )
     parser.add_argument(
         "--epsilon-high",
         type=float,
         default=None,
-        help="Upper clip bound for two-sided clipping (default: 0.3)"
+        help="Upper clip bound for two-sided clipping (default: 0.3)",
     )
     parser.add_argument(
         "--delta",
         type=float,
         default=None,
-        help="Hard safety cap on ratio (default: 1.5)"
+        help="Hard safety cap on ratio (default: 1.5)",
     )
     parser.add_argument(
         "--no-mask-truncated",
         action="store_true",
-        help="Disable masking of truncated completions"
+        help="Disable masking of truncated completions",
     )
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
         default=None,
-        help="Gradient accumulation steps (default: 16)"
+        help="Gradient accumulation steps (default: 16)",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
-        help="Stop training after this many steps"
+        help="Stop training after this many steps",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Test setup without training"
+        "--dry-run", action="store_true", help="Test setup without training"
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from latest checkpoint"
+        "--resume", action="store_true", help="Resume training from latest checkpoint"
     )
     parser.add_argument(
         "--resume-checkpoint",
         type=str,
         default=None,
-        help="Path to a specific checkpoint to resume from"
+        help="Path to a specific checkpoint to resume from",
     )
     parser.add_argument(
         "--wandb",
         action="store_true",
         default=True,
-        help="Enable WandB logging (default: enabled)"
+        help="Enable WandB logging (default: enabled)",
+    )
+    parser.add_argument("--no-wandb", action="store_true", help="Disable WandB logging")
+    parser.add_argument(
+        "--wandb-project", type=str, default="grpo-training", help="WandB project name"
     )
     parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable WandB logging"
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default="grpo-training",
-        help="WandB project name"
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default=None,
-        help="WandB entity (username or team)"
+        "--wandb-entity", type=str, default=None, help="WandB entity (username or team)"
     )
     parser.add_argument(
         "--wandb-run-name",
         type=str,
         default=None,
-        help="WandB run name (auto-generated if not specified)"
+        help="WandB run name (auto-generated if not specified)",
     )
     parser.add_argument(
         "--wandb-tags",
         type=str,
         nargs="+",
         default=None,
-        help="WandB tags (space-separated)"
+        help="WandB tags (space-separated)",
     )
-    
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable live profiler server + Tier 1 hooks",
+    )
+
     args = parser.parse_args()
-    
+
     # Handle backward compatibility: --debug is alias for -v
     if args.debug:
         args.verbose = max(args.verbose, 1)
-    
+
     # Create output directories early so logs can be written
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "logs"), exist_ok=True)
-    
+
     # Setup logging EARLY (before config loading)
     setup_logging(args.verbose, os.path.join(args.output_dir, "logs"))
-    
+
     # Log startup
     if args.verbose > 0:
         logger.debug("Verbose mode enabled (level=%d)", args.verbose)
     if args.debug:
         logger.debug("Debug flag used (deprecated, use -v instead)")
-    
+
     # System check
     if not check_system():
         sys.exit(1)
-    
+
     # Get optimized config for 8GB VRAM
     logger.info("Loading 8GB VRAM optimized configuration...")
     config = get_8gb_vram_config()
-    
+
     # Override with command line args
     config.training.output_dir = args.output_dir
     config.training.num_epochs = args.epochs
@@ -254,7 +233,8 @@ def main():
     config.training.max_response_length = args.max_response_length
     config.training.use_triton_kernels = args.use_triton and not args.no_triton
     config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
-    
+    config.training.profile_enabled = args.profile
+
     if args.epsilon_high is not None:
         config.grpo.epsilon_high = args.epsilon_high
     if args.delta is not None:
@@ -266,7 +246,7 @@ def main():
 
     if args.max_steps is not None:
         config.training.max_steps = args.max_steps
-    
+
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
     config.wandb.project = args.wandb_project
@@ -279,10 +259,10 @@ def main():
     else:
         config.wandb.tags = ["grpo", "deepseek-r1", "8gb-vram", "python"]
     config.wandb.implementation = "python"
-    
+
     # Create checkpoint directory
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
-    
+
     # Print configuration
     logger.info("Training Configuration:")
     logger.info("  Model: %s", config.model.model_id)
@@ -295,25 +275,33 @@ def main():
     logger.info("  Mask Truncated: %s", config.grpo.mask_truncated_completions)
     logger.info("  Learning Rate: %s", config.training.learning_rate)
     logger.info("  Epochs: %s", config.training.num_epochs)
-    logger.info("  Gradient Accumulation: %s", config.training.gradient_accumulation_steps)
+    logger.info(
+        "  Gradient Accumulation: %s", config.training.gradient_accumulation_steps
+    )
     logger.info("  Entropy Mask: %s", config.entropy.use_entropy_mask)
     logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
     logger.info("  Max Prompt Length: %s", config.training.max_prompt_length)
     logger.info("  Max Response Length: %s", config.training.max_response_length)
     logger.info("  Output Directory: %s", config.training.output_dir)
     logger.info("  WandB Enabled: %s", config.wandb.enabled)
+    logger.info("  Profiler Enabled: %s", config.training.profile_enabled)
     if config.wandb.enabled:
         logger.info("  WandB Project: %s", config.wandb.project)
         logger.info("  WandB Implementation: %s", config.wandb.implementation)
-    
+
     if args.dry_run:
         logger.info("Setup complete! Exiting without training.")
         logger.info("Run without --dry-run to start training.")
         return
-    
+
     # Create trainer and start training
     logger.info("Initializing trainer...")
     trainer = GRPOTrainerLoop(config)
+
+    if config.training.profile_enabled:
+        from tools.vram_profiler.profiler_server import start_server
+
+        start_server(port=8550)
 
     try:
         trainer.setup()
@@ -358,6 +346,7 @@ def main():
     except Exception as e:
         logger.error("Training failed with error: %s", e)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

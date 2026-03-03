@@ -388,12 +388,16 @@
             <span class="badge">Experimental</span>
         </div>
         <div class="controls">
+            <button class="btn btn-primary" id="live-mode-btn" type="button">Live Mode</button>
+            <button class="btn" id="file-mode-btn" type="button">File Mode</button>
             <div class="file-input-wrapper" id="drop-zone">
                 <span>Drag or select .json</span>
                 <input type="file" id="file-input" accept=".json" style="display: none;">
             </div>
-            <button class="btn" id="reset-btn">Reset</button>
-            <button class="btn btn-primary" onclick="window.location.reload()">Refresh App</button>
+            <button class="btn" id="reset-btn" type="button">Reset</button>
+            <button class="btn" id="deep-profile-btn" type="button">🔥 Deep Profile</button>
+            <button class="btn" id="trace-download-btn" type="button">Download Trace</button>
+            <button class="btn btn-primary" onclick="window.location.reload()" type="button">Refresh App</button>
         </div>
     </header>
 
@@ -403,7 +407,98 @@
     </div>
 
     <main id="main-content">
-        <section>
+        <section id="live-section" class="hidden">
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="card-title">Live Status</div>
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-step">-</div>
+                        <div class="stat-label">Step</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-epoch">-</div>
+                        <div class="stat-label">Epoch</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-vram">-</div>
+                        <div class="stat-label">VRAM Used</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-loss">-</div>
+                        <div class="stat-label">Loss</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-reward">-</div>
+                        <div class="stat-label">Avg Reward</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="live-step-time">-</div>
+                        <div class="stat-label">Step Time</div>
+                    </div>
+                </div>
+                <div style="display:flex; gap:16px; align-items:center;">
+                    <div style="flex:1; background:#0b1220; border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div class="card-title">Phase Breakdown</div>
+                        <div id="phase-bars" style="display:flex; gap:6px; height:16px; border-radius:6px; overflow:hidden;"></div>
+                        <div id="phase-legend" style="font-size:0.75rem; color:var(--text-dim); margin-top:8px;"></div>
+                    </div>
+                    <div style="width:240px; background:#0b1220; border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div class="card-title">CPU/GPU/Idle</div>
+                        <div id="overlap-stats" style="font-size:0.8rem; color:var(--text-dim);">-</div>
+                        <div id="overlap-bars" style="display:flex; gap:4px; height:10px; margin-top:8px; border-radius:6px; overflow:hidden; background:#121826;">
+                            <div id="overlap-cpu" style="background:#f59e0b; width:0%;"></div>
+                            <div id="overlap-gpu" style="background:#38bdf8; width:0%;"></div>
+                            <div id="overlap-idle" style="background:#64748b; width:0%;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="card-title">Live Timeline</div>
+                <div class="chart-container">
+                    <div id="live-timeline"></div>
+                </div>
+            </div>
+            <div class="card" style="margin-bottom: 24px;">
+                <div class="card-title">Deep Profile Progress</div>
+                <div style="display:flex; gap:12px; align-items:center;">
+                    <div style="flex:1; height:10px; background:var(--surface); border-radius:6px; overflow:hidden;">
+                        <div id="deep-profile-progress" style="height:100%; width:0%; background:var(--accent);"></div>
+                    </div>
+                    <div id="deep-profile-status" style="font-size:0.8rem; color:var(--text-dim);">Idle</div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-title">CUDA Kernels</div>
+                <div style="display:flex; justify-content:flex-end; margin-bottom:8px;">
+                    <select id="kernel-phase-filter" style="background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px;">
+                        <option value="">All phases</option>
+                        <option value="generation">generation</option>
+                        <option value="old_log_probs">old_log_probs</option>
+                        <option value="training">training</option>
+                        <option value="data">data</option>
+                    </select>
+                </div>
+                <div style="max-height: 260px; overflow:auto;">
+                    <table style="width:100%; border-collapse: collapse; font-size:0.8rem;">
+                        <thead>
+                            <tr style="text-align:left; color:var(--text-dim);">
+                                <th>Name</th>
+                                <th>Phase</th>
+                                <th>Total μs</th>
+                                <th>Count</th>
+                            </tr>
+                        </thead>
+                        <tbody id="kernel-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card" style="margin-top:24px;">
+                <div class="card-title">Regressions</div>
+                <div id="regression-list" style="font-size:0.8rem; color:var(--text-dim);">-</div>
+            </div>
+        </section>
+        <section id="file-section">
             <div class="stats-grid">
                 <div class="card">
                     <div class="card-title">Peak VRAM Usage</div>
@@ -452,7 +547,7 @@
             </div>
         </section>
 
-        <aside>
+        <aside id="file-sidebar">
             <div class="card" style="margin-bottom: 24px;">
                 <div class="sidebar">
                     <h2>Top Unique Bottlenecks</h2>
