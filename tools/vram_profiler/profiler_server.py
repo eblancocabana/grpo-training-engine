@@ -29,6 +29,22 @@ from src.utils.config import get_8gb_vram_config
 logger = get_logger(__name__)
 _TRACE_MAX_BYTES = 100 * 1024 * 1024
 _MIN_FREE_VRAM_GB = 0.8
+_SAFE_MIN_FREE_VRAM_GB = 1.5
+_SAFE_MAX_TRACE_BYTES = 20 * 1024 * 1024
+_SAFE_DEFAULTS = {
+    "steps": 1,
+    "wait": 0,
+    "warmup": 0,
+    "profile_memory": False,
+    "record_shapes": False,
+    "with_stack": False,
+    "sync": False,
+    "estimated_events_per_step": 1000,
+    "bytes_per_event": 120,
+}
+_SAFE_MAX_STEPS = 1
+_SAFE_MAX_WARMUP = 0
+_SAFE_MAX_WAIT = 0
 
 
 class NonStreamingGZipMiddleware(BaseHTTPMiddleware):
@@ -539,6 +555,7 @@ def _deep_profile_config(state: ProfilerState) -> dict[str, object]:
         "force_export": config_obj.force_export,
         "estimated_events_per_step": config_obj.estimated_events_per_step,
         "bytes_per_event": config_obj.bytes_per_event,
+        "trace_phase": config_obj.trace_phase,
     }
 
 
@@ -2151,9 +2168,14 @@ def start_profile(request: Request) -> JSONResponse:
             return _error_response(
                 state, "Deep profiling already active", status_code=409
             )
+        safe_mode = _parse_bool(params.get("safe"))
+        if safe_mode is None:
+            safe_mode = True
+        warnings: list[str] = []
         memory_manager = MemoryManager()
         free_gb = memory_manager.get_available_memory_gb()
-        if free_gb < _MIN_FREE_VRAM_GB:
+        min_free_gb = _SAFE_MIN_FREE_VRAM_GB if safe_mode else _MIN_FREE_VRAM_GB
+        if free_gb < min_free_gb:
             return _error_response(
                 state,
                 "Insufficient free VRAM",
@@ -2161,18 +2183,22 @@ def start_profile(request: Request) -> JSONResponse:
                 extra={
                     "reason": "insufficient_vram",
                     "free_gb": free_gb,
-                    "min_free_gb": _MIN_FREE_VRAM_GB,
+                    "min_free_gb": min_free_gb,
+                    "safe_mode": safe_mode,
                 },
             )
-        steps = _parse_int(params.get("steps") or params.get("active")) or 1
-        wait = _parse_int(params.get("wait")) or 0
-        warmup = _parse_int(params.get("warmup")) or 0
+        steps = _parse_int(params.get("steps") or params.get("active"))
+        wait = _parse_int(params.get("wait"))
+        warmup = _parse_int(params.get("warmup"))
         profile_memory = _parse_bool(params.get("profile_memory"))
         record_shapes = _parse_bool(params.get("record_shapes"))
         with_stack = _parse_bool(params.get("with_stack"))
         sync = _parse_bool(params.get("sync"))
         output_dir = params.get("output_dir") or params.get("output")
-        trace_name = params.get("trace_name") or "deep_profile"
+        trace_name = params.get("trace_name") or f"deep_profile_{int(time.time())}"
+        trace_phase = params.get("trace_phase") or params.get("phase")
+        if safe_mode and trace_phase is None:
+            trace_phase = "generation"
         trace_path = None
         if isinstance(trace_name, str):
             candidate = trace_name
@@ -2183,10 +2209,67 @@ def start_profile(request: Request) -> JSONResponse:
             else:
                 trace_path = candidate
         force_export = _parse_bool(params.get("force")) or False
-        estimated_events_per_step = (
-            _parse_int(params.get("estimated_events_per_step")) or 5000
-        )
-        bytes_per_event = _parse_int(params.get("bytes_per_event")) or 200
+        if safe_mode:
+            steps = steps if steps is not None else _SAFE_DEFAULTS["steps"]
+            wait = wait if wait is not None else _SAFE_DEFAULTS["wait"]
+            warmup = warmup if warmup is not None else _SAFE_DEFAULTS["warmup"]
+            steps = min(steps, _SAFE_MAX_STEPS)
+            wait = min(wait, _SAFE_MAX_WAIT)
+            warmup = min(warmup, _SAFE_MAX_WARMUP)
+            requested_steps = _parse_int(params.get("steps") or params.get("active"))
+            requested_wait = _parse_int(params.get("wait"))
+            requested_warmup = _parse_int(params.get("warmup"))
+            if requested_steps is not None and steps < requested_steps:
+                warnings.append("steps_clamped")
+            if requested_wait is not None and wait < requested_wait:
+                warnings.append("wait_clamped")
+            if requested_warmup is not None and warmup < requested_warmup:
+                warnings.append("warmup_clamped")
+            if profile_memory is None:
+                profile_memory = _SAFE_DEFAULTS["profile_memory"]
+            elif profile_memory:
+                profile_memory = _SAFE_DEFAULTS["profile_memory"]
+                warnings.append("profile_memory_disabled")
+            if record_shapes is None:
+                record_shapes = _SAFE_DEFAULTS["record_shapes"]
+            elif record_shapes:
+                record_shapes = _SAFE_DEFAULTS["record_shapes"]
+                warnings.append("record_shapes_disabled")
+            if with_stack is None:
+                with_stack = _SAFE_DEFAULTS["with_stack"]
+            elif with_stack:
+                with_stack = _SAFE_DEFAULTS["with_stack"]
+                warnings.append("with_stack_disabled")
+            if sync is None:
+                sync = _SAFE_DEFAULTS["sync"]
+            elif sync:
+                sync = _SAFE_DEFAULTS["sync"]
+                warnings.append("sync_disabled")
+            if force_export:
+                force_export = False
+                warnings.append("force_export_disabled")
+            estimated_events_per_step = (
+                _parse_int(params.get("estimated_events_per_step"))
+                or _SAFE_DEFAULTS["estimated_events_per_step"]
+            )
+            bytes_per_event = (
+                _parse_int(params.get("bytes_per_event"))
+                or _SAFE_DEFAULTS["bytes_per_event"]
+            )
+        else:
+            steps = steps or 1
+            wait = wait or 0
+            warmup = warmup or 0
+            profile_memory = (
+                bool(profile_memory) if profile_memory is not None else True
+            )
+            record_shapes = bool(record_shapes) if record_shapes is not None else False
+            with_stack = bool(with_stack) if with_stack is not None else False
+            sync = bool(sync) if sync is not None else False
+            estimated_events_per_step = (
+                _parse_int(params.get("estimated_events_per_step")) or 5000
+            )
+            bytes_per_event = _parse_int(params.get("bytes_per_event")) or 200
         estimated_size = _estimate_trace_size_bytes(
             active_steps=steps,
             estimated_events_per_step=estimated_events_per_step,
@@ -2195,7 +2278,8 @@ def start_profile(request: Request) -> JSONResponse:
             with_stack=bool(with_stack) if with_stack is not None else False,
             profile_memory=bool(profile_memory) if profile_memory is not None else True,
         )
-        if estimated_size > _TRACE_MAX_BYTES and not force_export:
+        max_bytes = _SAFE_MAX_TRACE_BYTES if safe_mode else _TRACE_MAX_BYTES
+        if estimated_size > max_bytes and not force_export:
             return _error_response(
                 state,
                 "Estimated trace too large",
@@ -2203,22 +2287,24 @@ def start_profile(request: Request) -> JSONResponse:
                 extra={
                     "reason": "trace_too_large",
                     "estimated_size_bytes": estimated_size,
-                    "max_bytes": _TRACE_MAX_BYTES,
+                    "max_bytes": max_bytes,
+                    "safe_mode": safe_mode,
                 },
             )
         state.request_deep_profile(
             steps=steps,
             wait=wait,
             warmup=warmup,
-            profile_memory=bool(profile_memory) if profile_memory is not None else True,
-            record_shapes=bool(record_shapes) if record_shapes is not None else False,
-            with_stack=bool(with_stack) if with_stack is not None else False,
-            sync=bool(sync) if sync is not None else False,
+            profile_memory=bool(profile_memory),
+            record_shapes=bool(record_shapes),
+            with_stack=bool(with_stack),
+            sync=bool(sync),
             output_dir=output_dir,
             trace_name=trace_name,
             force_export=force_export,
             estimated_events_per_step=estimated_events_per_step,
             bytes_per_event=bytes_per_event,
+            trace_phase=trace_phase,
         )
         if trace_path:
             state.set_last_trace_path(trace_path)
@@ -2227,6 +2313,8 @@ def start_profile(request: Request) -> JSONResponse:
             "active": state.deep_profile_active,
             "config": _deep_profile_config(state),
             "estimated_size_bytes": estimated_size,
+            "safe_mode": safe_mode,
+            "warnings": warnings,
         }
         return JSONResponse(content=_with_schema(payload, state))
     except Exception as exc:

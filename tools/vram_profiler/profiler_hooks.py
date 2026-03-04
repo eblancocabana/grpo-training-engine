@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import defaultdict, deque
@@ -16,6 +17,8 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger("profiler.hooks")
 
+_SAFE_MAX_TRACE_BYTES = 20 * 1024 * 1024
+
 
 @dataclass
 class DeepProfileConfig:
@@ -31,6 +34,7 @@ class DeepProfileConfig:
     force_export: bool
     estimated_events_per_step: int
     bytes_per_event: int
+    trace_phase: str | None
 
     @property
     def total_steps(self) -> int:
@@ -290,6 +294,7 @@ class ProfilerState:
         force_export: bool,
         estimated_events_per_step: int,
         bytes_per_event: int,
+        trace_phase: str | None,
     ) -> None:
         with self._lock:
             self._deep_profile_config = DeepProfileConfig(
@@ -305,6 +310,7 @@ class ProfilerState:
                 force_export=force_export,
                 estimated_events_per_step=estimated_events_per_step,
                 bytes_per_event=bytes_per_event,
+                trace_phase=trace_phase,
             )
             self.deep_profile_active = True
             self._deep_profile_step_index = 0
@@ -559,17 +565,35 @@ class ProfilerHooks:
             profiler.__exit__(None, None, None)
             summary = self._build_profiler_summary(profiler)
             trace_path = self._export_trace(profiler)
-            if trace_path:
-                self._state.set_last_trace_path(trace_path)
+            filtered_path, filtered_size, raw_size = self._postprocess_trace(trace_path)
+            if filtered_path:
+                self._state.set_last_trace_path(filtered_path)
             summary.update(
                 {
-                    "trace_path": trace_path,
+                    "trace_path": filtered_path or trace_path,
+                    "trace_size_bytes": raw_size,
+                    "trace_filtered_size_bytes": filtered_size,
                     "step": step,
                     "started_ts": self._profiler_started_ts,
                     "ended_ts": time.time(),
                 }
             )
             self._state.record_trace_summary({"summary": summary, "ts": time.time()})
+            if step is not None:
+                if raw_size is not None:
+                    self._state.record_metric(
+                        "trace_size_bytes",
+                        float(raw_size),
+                        step=step,
+                        ts=time.time(),
+                    )
+                if filtered_size is not None:
+                    self._state.record_metric(
+                        "trace_filtered_size_bytes",
+                        float(filtered_size),
+                        step=step,
+                        ts=time.time(),
+                    )
         except Exception as exc:
             logger.exception("Failed to export deep profile trace")
             self._state.record_anomaly(
@@ -587,7 +611,7 @@ class ProfilerHooks:
         config = self._state.get_deep_profile_config()
         if config is None:
             return ""
-        trace_name = config.trace_name or "deep_profile"
+        trace_name = config.trace_name or f"deep_profile_{int(time.time())}"
         if not Path(trace_name).suffix:
             trace_name = f"{trace_name}.json"
         output_dir = Path(config.output_dir) if config.output_dir else Path.cwd()
@@ -595,6 +619,118 @@ class ProfilerHooks:
         trace_path = output_dir / trace_name
         profiler.export_chrome_trace(str(trace_path))
         return str(trace_path)
+
+    def _trace_size_bytes(self, trace_path: str | None) -> int | None:
+        if not trace_path:
+            return None
+        try:
+            return Path(trace_path).stat().st_size
+        except OSError:
+            return None
+
+    def _postprocess_trace(
+        self, trace_path: str | None
+    ) -> tuple[str | None, int | None, int | None]:
+        if not trace_path:
+            return None, None, None
+        raw_size = self._trace_size_bytes(trace_path)
+        config = self._state.get_deep_profile_config()
+        if config is None or not config.trace_phase:
+            return trace_path, raw_size, raw_size
+        try:
+            raw = json.loads(Path(trace_path).read_text(encoding="utf-8"))
+        except Exception:
+            return trace_path, raw_size, raw_size
+        if not isinstance(raw, Mapping):
+            return trace_path, raw_size, raw_size
+        trace_dict: dict[str, Any] = dict(raw)
+        events = trace_dict.get("traceEvents")
+        if not isinstance(events, list):
+            return trace_path, raw_size, raw_size
+
+        phase_intervals = self._trace_phase_intervals_from_events(events)
+        if not phase_intervals:
+            return trace_path, raw_size, raw_size
+
+        filtered: list[dict[str, Any]] = []
+        for event_raw in events:
+            if not isinstance(event_raw, Mapping):
+                continue
+            name = event_raw.get("name")
+            if isinstance(name, str) and name.startswith("phase:"):
+                filtered.append(dict(event_raw))
+                continue
+            ts = event_raw.get("ts")
+            if ts is None:
+                filtered.append(dict(event_raw))
+                continue
+            if isinstance(ts, (int, float)) and self._ts_in_intervals(
+                float(ts), phase_intervals
+            ):
+                filtered.append(dict(event_raw))
+
+        max_events = int(_SAFE_MAX_TRACE_BYTES // max(config.bytes_per_event, 1))
+        truncated = False
+        if len(filtered) > max_events:
+            filtered = filtered[:max_events]
+            truncated = True
+
+        trace_dict["traceEvents"] = filtered
+        if truncated:
+            trace_dict["truncated"] = True
+            trace_dict["truncation_reason"] = "safe_mode_cap"
+        filtered_path = Path(trace_path).with_suffix(".filtered.json")
+        try:
+            filtered_path.write_text(json.dumps(trace_dict), encoding="utf-8")
+        except Exception:
+            return trace_path, raw_size, raw_size
+        filtered_size = self._trace_size_bytes(str(filtered_path))
+        return str(filtered_path), filtered_size, raw_size
+
+    def _trace_phase_intervals_from_events(
+        self, events: list[object]
+    ) -> list[tuple[float, float]]:
+        intervals: list[tuple[float, float]] = []
+        config = self._state.get_deep_profile_config()
+        phase = config.trace_phase if config else None
+        if not phase:
+            return intervals
+        start_by_key: dict[tuple[int | None, int | None], float] = {}
+        for event_raw in events:
+            if not isinstance(event_raw, Mapping):
+                continue
+            name = event_raw.get("name")
+            if not isinstance(name, str) or name != f"phase:{phase}":
+                continue
+            ts = event_raw.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            tid = (
+                event_raw.get("tid") if isinstance(event_raw.get("tid"), int) else None
+            )
+            pid = (
+                event_raw.get("pid") if isinstance(event_raw.get("pid"), int) else None
+            )
+            ph = event_raw.get("ph")
+            if ph == "X":
+                dur = event_raw.get("dur")
+                if isinstance(dur, (int, float)):
+                    intervals.append((float(ts), float(ts) + float(dur)))
+            elif ph == "B":
+                start_by_key[(pid, tid)] = float(ts)
+            elif ph == "E":
+                key = (pid, tid)
+                start = start_by_key.pop(key, None)
+                if start is not None:
+                    intervals.append((start, float(ts)))
+        return intervals
+
+    @staticmethod
+    def _ts_in_intervals(ts: float, intervals: list[tuple[float, float]]) -> bool:
+        for start, end in intervals:
+            if start <= ts <= end:
+                return True
+        return False
 
     def _build_profiler_summary(
         self, profiler: torch.profiler.profile
