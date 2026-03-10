@@ -63,12 +63,15 @@ def _is_supported_base_layer(module: nn.Module) -> bool:
     return False
 
 
-def _get_lora_compute_dtype() -> torch.dtype:
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+def _get_lora_compute_dtype(device: torch.device | None = None) -> torch.dtype:
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
         return torch.bfloat16
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         return torch.float16
-    return torch.bfloat16
+    return torch.float32
 
 
 def _create_lora_linear(
@@ -155,7 +158,8 @@ class ManualLoRALayer(nn.Module):
         # Create LoRA matrices A and B
         # A: input_dim -> rank
         # B: rank -> output_dim
-        self.lora_compute_dtype = _get_lora_compute_dtype()
+        base_device = cast(torch.Tensor, self.base_layer.weight).device
+        self.lora_compute_dtype = _get_lora_compute_dtype(base_device)
         lora_a, _ = _create_lora_linear(
             in_features, rank, adapter_quantization, self.lora_compute_dtype
         )

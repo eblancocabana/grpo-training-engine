@@ -119,6 +119,7 @@ class GRPOTrainerLoop:
             dropout=self.config.lora.dropout,
             use_triton=self.config.training.use_triton_kernels,
             prefer_base_layer=self.config.training.triton_lora_prefer_base,
+            adapter_quantization=self.config.lora.adapter_quantization,
         )
 
         # Print memory usage
@@ -152,6 +153,20 @@ class GRPOTrainerLoop:
             device=self.device,
             enable_gradient_checkpointing=self.config.training.enable_gradient_checkpointing,
             clear_cache_frequency=self.config.training.clear_cache_frequency,
+            checkpointing_strategy=self.config.training.checkpointing_strategy,
+            checkpointing_layer_name_patterns=(
+                self.config.training.checkpointing_layer_name_patterns
+            ),
+            checkpointing_layer_types=self.config.training.checkpointing_layer_types,
+            checkpointing_vram_enable_threshold=(
+                self.config.training.checkpointing_vram_enable_threshold
+            ),
+            checkpointing_vram_disable_threshold=(
+                self.config.training.checkpointing_vram_disable_threshold
+            ),
+            checkpointing_update_interval_steps=(
+                self.config.training.checkpointing_update_interval_steps
+            ),
         )
         self.memory_manager.enable_checkpointing(self.model)
 
@@ -507,6 +522,10 @@ class GRPOTrainerLoop:
         """
         self._step_start_time = time.time()
         self.model.train()
+
+        self.memory_manager.maybe_update_checkpointing(
+            self.model, step=self.global_step
+        )
 
         if self._profiler_hooks:
             self._profiler_hooks.on_step_start(self.global_step, self.current_epoch)
