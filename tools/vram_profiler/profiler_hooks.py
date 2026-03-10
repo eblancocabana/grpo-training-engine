@@ -1,16 +1,21 @@
+# pyright: reportMissingImports=false, reportMissingModuleSource=false
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
+# pyright: reportUnknownParameterType=false, reportMissingParameterType=false
+# pyright: reportUnusedCallResult=false, reportUnnecessaryIsInstance=false
 from __future__ import annotations
 
 import json
 import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, cast
 
-import torch
-from torch.autograd.profiler import record_function
-from torch.profiler import ProfilerActivity
+import torch  # type: ignore[reportMissingImports]
+from torch.autograd.profiler import record_function  # type: ignore[reportMissingImports]
+from torch.profiler import ProfilerActivity  # type: ignore[reportMissingImports]
 
 from src.core.memory_manager import MemoryManager
 from src.utils.logging_utils import get_logger
@@ -18,6 +23,33 @@ from src.utils.logging_utils import get_logger
 logger = get_logger("profiler.hooks")
 
 _SAFE_MAX_TRACE_BYTES = 20 * 1024 * 1024
+
+_experimental_config_warning_emitted = False
+
+
+def _warn_missing_experimental_config() -> None:
+    global _experimental_config_warning_emitted
+    if _experimental_config_warning_emitted:
+        return
+    _experimental_config_warning_emitted = True
+    logger.warning(
+        "torch.profiler ExperimentalConfig is unavailable; continuing without experimental_config"
+    )
+
+
+def _resolve_experimental_config_class() -> type[object] | None:
+    experimental_config = cast(
+        type[object] | None, getattr(torch.profiler, "ExperimentalConfig", None)
+    )
+    if experimental_config is not None:
+        return experimental_config
+    experimental_config = cast(
+        type[object] | None, getattr(torch.profiler, "_ExperimentalConfig", None)
+    )
+    if experimental_config is not None:
+        return experimental_config
+    _warn_missing_experimental_config()
+    return None
 
 
 @dataclass
@@ -35,6 +67,7 @@ class DeepProfileConfig:
     estimated_events_per_step: int
     bytes_per_event: int
     trace_phase: str | None
+    max_duration_s: float | None
 
     @property
     def total_steps(self) -> int:
@@ -43,27 +76,27 @@ class DeepProfileConfig:
 
 class ProfilerState:
     _instance: "ProfilerState | None" = None
-    _instance_lock = threading.Lock()
+    _instance_lock: threading.Lock = threading.Lock()
 
     def __init__(self, maxlen: int = 10000, schema_version: str = "1.0") -> None:
-        self.maxlen = maxlen
-        self.schema_version = schema_version
-        self.metrics: deque[dict[str, Any]] = deque(maxlen=maxlen)
-        self.phases: deque[dict[str, Any]] = deque(maxlen=maxlen)
-        self.memory: deque[dict[str, Any]] = deque(maxlen=maxlen)
-        self.anomalies: deque[dict[str, Any]] = deque(maxlen=maxlen)
-        self.trace_summaries: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self.maxlen: int = maxlen
+        self.schema_version: str = schema_version
+        self.metrics: deque[dict[str, object]] = deque(maxlen=maxlen)
+        self.phases: deque[dict[str, object]] = deque(maxlen=maxlen)
+        self.memory: deque[dict[str, object]] = deque(maxlen=maxlen)
+        self.anomalies: deque[dict[str, object]] = deque(maxlen=maxlen)
+        self.trace_summaries: deque[dict[str, object]] = deque(maxlen=maxlen)
         self.drop_counts: dict[str, int] = defaultdict(int)
-        self.deep_profile_active = False
+        self.deep_profile_active: bool = False
         self._deep_profile_config: DeepProfileConfig | None = None
-        self._deep_profile_step_index = 0
-        self._deep_profile_total_steps = 0
-        self._deep_profile_stop_requested = False
+        self._deep_profile_step_index: int = 0
+        self._deep_profile_total_steps: int = 0
+        self._deep_profile_stop_requested: bool = False
         self._last_trace_path: str | None = None
-        self._training_active = False
-        self._config_snapshot: dict[str, Any] | None = None
-        self._last_step_info: dict[str, Any] = {}
-        self._lock = threading.Lock()
+        self._training_active: bool = False
+        self._config_snapshot: dict[str, object] | None = None
+        self._last_step_info: dict[str, object] = {}
+        self._lock: threading.Lock = threading.Lock()
 
     @classmethod
     def get_instance(cls, maxlen: int = 10000) -> "ProfilerState":
@@ -102,17 +135,17 @@ class ProfilerState:
         with self._lock:
             return self._training_active
 
-    def set_config_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+    def set_config_snapshot(self, snapshot: Mapping[str, object]) -> None:
         with self._lock:
             self._config_snapshot = dict(snapshot)
 
-    def get_config_snapshot(self) -> dict[str, Any] | None:
+    def get_config_snapshot(self) -> dict[str, object] | None:
         with self._lock:
             if self._config_snapshot is None:
                 return None
             return dict(self._config_snapshot)
 
-    def get_last_step_info(self) -> dict[str, Any]:
+    def get_last_step_info(self) -> dict[str, object]:
         with self._lock:
             return dict(self._last_step_info)
 
@@ -129,15 +162,15 @@ class ProfilerState:
             }
         return sorted({str(name) for name in names if name is not None})
 
-    def get_buffer_meta(self) -> dict[str, dict[str, Any]]:
-        buffers: dict[str, deque[dict[str, Any]]] = {
+    def get_buffer_meta(self) -> dict[str, dict[str, object]]:
+        buffers: dict[str, deque[dict[str, object]]] = {
             "metrics": self.metrics,
             "phases": self.phases,
             "memory": self.memory,
             "anomalies": self.anomalies,
             "trace_summaries": self.trace_summaries,
         }
-        meta: dict[str, dict[str, Any]] = {}
+        meta: dict[str, dict[str, object]] = {}
         with self._lock:
             for name, buffer in buffers.items():
                 oldest = buffer[0] if buffer else None
@@ -159,7 +192,10 @@ class ProfilerState:
         return meta
 
     def _append(
-        self, buffer: deque[dict[str, Any]], buffer_name: str, entry: dict[str, Any]
+        self,
+        buffer: deque[dict[str, object]],
+        buffer_name: str,
+        entry: dict[str, object],
     ) -> None:
         with self._lock:
             if buffer.maxlen is not None and len(buffer) >= buffer.maxlen:
@@ -173,10 +209,10 @@ class ProfilerState:
         *,
         step: int,
         ts: float,
-        meta: Mapping[str, Any] | None = None,
+        meta: Mapping[str, object] | None = None,
         tags: list[str] | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "name": name,
             "value": float(value),
             "step": step,
@@ -196,10 +232,10 @@ class ProfilerState:
         step: int,
         ts: float,
         duration_ms: float | None = None,
-        meta: Mapping[str, Any] | None = None,
+        meta: Mapping[str, object] | None = None,
         tags: list[str] | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "name": name,
             "status": status,
             "step": step,
@@ -218,10 +254,10 @@ class ProfilerState:
         *,
         step: int,
         ts: float,
-        stats: Mapping[str, Any] | None,
+        stats: Mapping[str, object] | None,
         context: str | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "step": step,
             "ts": ts,
             "stats": dict(stats) if stats else None,
@@ -236,11 +272,11 @@ class ProfilerState:
         step: int,
         ts: float,
         message: str | None = None,
-        context: Mapping[str, Any] | None = None,
+        context: Mapping[str, object] | None = None,
         tags: list[str] | None = None,
-        meta: Mapping[str, Any] | None = None,
+        meta: Mapping[str, object] | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "kind": kind,
             "step": step,
             "ts": ts,
@@ -255,7 +291,7 @@ class ProfilerState:
             payload["meta"] = dict(meta)
         self._append(self.anomalies, "anomalies", payload)
 
-    def record_trace_summary(self, summary: Mapping[str, Any]) -> None:
+    def record_trace_summary(self, summary: Mapping[str, object]) -> None:
         payload = dict(summary)
         if "ts" not in payload:
             payload["ts"] = time.time()
@@ -267,9 +303,9 @@ class ProfilerState:
         *,
         tag: str,
         ts: float | None = None,
-        meta: Mapping[str, Any] | None = None,
+        meta: Mapping[str, object] | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "kind": "annotation",
             "step": step,
             "ts": ts or time.time(),
@@ -295,6 +331,7 @@ class ProfilerState:
         estimated_events_per_step: int,
         bytes_per_event: int,
         trace_phase: str | None,
+        max_duration_s: float | None,
     ) -> None:
         with self._lock:
             self._deep_profile_config = DeepProfileConfig(
@@ -311,6 +348,7 @@ class ProfilerState:
                 estimated_events_per_step=estimated_events_per_step,
                 bytes_per_event=bytes_per_event,
                 trace_phase=trace_phase,
+                max_duration_s=max_duration_s,
             )
             self.deep_profile_active = True
             self._deep_profile_step_index = 0
@@ -379,18 +417,21 @@ class ProfilerHooks:
         memory_manager: MemoryManager,
         use_nvtx: bool = True,
     ) -> None:
-        self._state = state
-        self._memory_manager = memory_manager
-        self._use_nvtx = use_nvtx and torch.cuda.is_available()
+        self._state: ProfilerState = state
+        self._memory_manager: MemoryManager = memory_manager
+        self._use_nvtx: bool = use_nvtx and torch.cuda.is_available()
         self._step_start_perf: float | None = None
         self._step_start_ts: float | None = None
         self._phase_start_perf: dict[str, float] = {}
         self._phase_start_ts: dict[str, float] = {}
-        self._phase_recorders: dict[str, list[Any]] = defaultdict(list)
+        self._phase_recorders: dict[str, list[object]] = defaultdict(list)
         self._profiler: torch.profiler.profile | None = None
         self._profiler_started_ts: float | None = None
-        self._deep_profile_total_steps = 0
-        self._deep_profile_step_index = 0
+        self._profiler_max_duration_s: float | None = None
+        self._profiler_timer: threading.Timer | None = None
+        self._profiler_lock = threading.Lock()
+        self._deep_profile_total_steps: int = 0
+        self._deep_profile_step_index: int = 0
 
     def on_training_start(self, step: int, epoch: int | None) -> None:
         self._state.set_training_active(True)
@@ -472,7 +513,7 @@ class ProfilerHooks:
             recorders = self._phase_recorders.get(name)
             if recorders:
                 ctx = recorders.pop()
-                ctx.__exit__(None, None, None)
+                ctx.__exit__(None, None, None)  # pyright: ignore[reportAttributeAccessIssue]
         if step is not None:
             self._state.record_phase(
                 name,
@@ -488,21 +529,32 @@ class ProfilerHooks:
     def on_data_end(self, step: int | None = None) -> None:
         self.on_phase_end("data", step=step)
 
-    def on_oom(self, step: int, context: Mapping[str, Any]) -> None:
+    def on_oom(self, step: int, context: Mapping[str, object]) -> None:
         if self._use_nvtx and self._step_start_perf is not None:
             torch.cuda.nvtx.range_pop()
             self._step_start_perf = None
+        oom_context = dict(context)
+        oom_context.update(
+            {
+                "deep_profile_active": self._state.deep_profile_active,
+                "profiling_aborted": self._state.deep_profile_active,
+            }
+        )
         self._state.record_anomaly(
             kind="oom",
             step=step,
             ts=time.time(),
             message="CUDA OOM",
-            context=context,
+            context=oom_context,
             tags=["oom"],
         )
+        if self._state.deep_profile_active:
+            self._finalize_profiler_if_needed(step=step, force=True)
+            if self._profiler is None:
+                self._state.stop_deep_profile()
 
     def annotate_step(
-        self, step: int, tag: str, meta: Mapping[str, Any] | None = None
+        self, step: int, tag: str, meta: Mapping[str, object] | None = None
     ) -> None:
         self._state.annotate_step(step, tag=tag, ts=time.time(), meta=meta)
 
@@ -510,33 +562,55 @@ class ProfilerHooks:
         config = self._state.get_deep_profile_config()
         if config is None:
             return
-        if self._profiler is not None:
-            return
-        activities = [ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(ProfilerActivity.CUDA)
-        schedule = torch.profiler.schedule(
-            wait=config.wait,
-            warmup=config.warmup,
-            active=config.steps,
-            repeat=1,
-        )
-        profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            record_shapes=config.record_shapes,
-            profile_memory=config.profile_memory,
-            with_stack=config.with_stack,
-        )
-        if profiler is not None:
-            profiler.__enter__()
-            self._profiler = profiler
-        else:
-            self._profiler = None
-        self._profiler_started_ts = time.time()
-        self._deep_profile_total_steps = config.total_steps
-        self._deep_profile_step_index = 0
-        self._state.set_deep_profile_progress(0, self._deep_profile_total_steps)
+        with self._profiler_lock:
+            if self._profiler is not None:
+                return
+            activities = [ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(ProfilerActivity.CUDA)
+            schedule = torch.profiler.schedule(
+                wait=config.wait,
+                warmup=config.warmup,
+                active=config.steps,
+                repeat=1,
+            )
+            profile_kwargs: dict[str, object] = {
+                "activities": activities,
+                "schedule": schedule,
+                "record_shapes": config.record_shapes,
+                "profile_memory": config.profile_memory,
+                "with_stack": config.with_stack,
+            }
+            experimental_config: Any | None = None
+            experimental_config_class = (
+                _resolve_experimental_config_class() if config.sync else None
+            )
+            if experimental_config_class is not None:
+                experimental_config = cast(Any, experimental_config_class())
+                profile_kwargs["experimental_config"] = experimental_config
+            profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                record_shapes=config.record_shapes,
+                profile_memory=config.profile_memory,
+                with_stack=config.with_stack,
+                **(
+                    {"experimental_config": experimental_config}
+                    if experimental_config is not None
+                    else {}
+                ),
+            )
+            if profiler is not None:
+                profiler.__enter__()
+                self._profiler = profiler
+            else:
+                self._profiler = None
+            self._profiler_started_ts = time.time()
+            self._profiler_max_duration_s = config.max_duration_s
+            self._start_profiler_timer(config.max_duration_s)
+            self._deep_profile_total_steps = config.total_steps
+            self._deep_profile_step_index = 0
+            self._state.set_deep_profile_progress(0, self._deep_profile_total_steps)
 
     def _advance_profiler(self, step: int) -> None:
         if self._profiler is None:
@@ -555,14 +629,24 @@ class ProfilerHooks:
     def _finalize_profiler_if_needed(
         self, step: int | None = None, force: bool = False
     ) -> None:
-        if self._profiler is None and not force:
-            return
-        profiler = self._profiler
-        self._profiler = None
+        with self._profiler_lock:
+            if self._profiler is None and not force:
+                return
+            profiler = self._profiler
+            self._profiler = None
+        self._cancel_profiler_timer()
         if profiler is None:
             return
         try:
-            profiler.__exit__(None, None, None)
+            try:
+                profiler.__exit__(None, None, None)
+            except RuntimeError as exc:
+                if "Can't disable Kineto profiler when it's not running" in str(exc):
+                    logger.warning(
+                        "Profiler already stopped; continuing to export trace."
+                    )
+                else:
+                    raise
             summary = self._build_profiler_summary(profiler)
             trace_path = self._export_trace(profiler)
             filtered_path, filtered_size, raw_size = self._postprocess_trace(trace_path)
@@ -606,6 +690,45 @@ class ProfilerHooks:
             )
         finally:
             self._state.stop_deep_profile()
+            self._profiler_started_ts = None
+            self._profiler_max_duration_s = None
+
+    def _start_profiler_timer(self, max_duration_s: float | None) -> None:
+        self._cancel_profiler_timer()
+        if max_duration_s is None or max_duration_s <= 0:
+            return
+        timer = threading.Timer(max_duration_s, self._handle_profiler_timeout)
+        timer.daemon = True
+        self._profiler_timer = timer
+        timer.start()
+
+    def _cancel_profiler_timer(self) -> None:
+        timer = self._profiler_timer
+        if timer is None:
+            return
+        timer.cancel()
+        self._profiler_timer = None
+
+    def _handle_profiler_timeout(self) -> None:
+        with self._profiler_lock:
+            if self._profiler is None:
+                return
+        step_info = self._state.get_last_step_info()
+        step_value = step_info.get("step")
+        step = int(step_value) if isinstance(step_value, int) else 0
+        estimated_size_bytes = self.estimate_trace_size_bytes()
+        self._state.record_anomaly(
+            kind="profile_error",
+            step=step,
+            ts=time.time(),
+            message="Profiler max_duration_s exceeded",
+            context={
+                "max_duration_s": self._profiler_max_duration_s,
+                "estimated_size_bytes": estimated_size_bytes,
+            },
+            tags=["profile", "timeout"],
+        )
+        self._finalize_profiler_if_needed(step=step, force=True)
 
     def _export_trace(self, profiler: torch.profiler.profile) -> str:
         config = self._state.get_deep_profile_config()
@@ -638,12 +761,12 @@ class ProfilerHooks:
         if config is None or not config.trace_phase:
             return trace_path, raw_size, raw_size
         try:
-            raw = json.loads(Path(trace_path).read_text(encoding="utf-8"))
+            raw = cast(object, json.loads(Path(trace_path).read_text(encoding="utf-8")))
         except Exception:
             return trace_path, raw_size, raw_size
         if not isinstance(raw, Mapping):
             return trace_path, raw_size, raw_size
-        trace_dict: dict[str, Any] = dict(raw)
+        trace_dict: dict[str, object] = dict(raw)
         events = trace_dict.get("traceEvents")
         if not isinstance(events, list):
             return trace_path, raw_size, raw_size
@@ -652,7 +775,7 @@ class ProfilerHooks:
         if not phase_intervals:
             return trace_path, raw_size, raw_size
 
-        filtered: list[dict[str, Any]] = []
+        filtered: list[dict[str, object]] = []
         for event_raw in events:
             if not isinstance(event_raw, Mapping):
                 continue
@@ -687,6 +810,24 @@ class ProfilerHooks:
         filtered_size = self._trace_size_bytes(str(filtered_path))
         return str(filtered_path), filtered_size, raw_size
 
+    def estimate_trace_size_bytes(self) -> int:
+        config = self._state.get_deep_profile_config()
+        if config is None:
+            return 0
+        multiplier = 1.0
+        if config.record_shapes:
+            multiplier += 0.5
+        if config.with_stack:
+            multiplier += 1.0
+        if config.profile_memory:
+            multiplier += 0.3
+        return int(
+            config.steps
+            * config.estimated_events_per_step
+            * config.bytes_per_event
+            * multiplier
+        )
+
     def _trace_phase_intervals_from_events(
         self, events: list[object]
     ) -> list[tuple[float, float]]:
@@ -705,22 +846,23 @@ class ProfilerHooks:
             ts = event_raw.get("ts")
             if not isinstance(ts, (int, float)):
                 continue
-            tid = (
-                event_raw.get("tid") if isinstance(event_raw.get("tid"), int) else None
-            )
-            pid = (
-                event_raw.get("pid") if isinstance(event_raw.get("pid"), int) else None
-            )
+            tid_raw = event_raw.get("tid")
+            tid = tid_raw if isinstance(tid_raw, int) else None
+            pid_raw = event_raw.get("pid")
+            pid = pid_raw if isinstance(pid_raw, int) else None
             ph = event_raw.get("ph")
             if ph == "X":
                 dur = event_raw.get("dur")
                 if isinstance(dur, (int, float)):
                     intervals.append((float(ts), float(ts) + float(dur)))
             elif ph == "B":
+                if pid is None or tid is None:
+                    continue
                 start_by_key[(pid, tid)] = float(ts)
             elif ph == "E":
-                key = (pid, tid)
-                start = start_by_key.pop(key, None)
+                if pid is None or tid is None:
+                    continue
+                start = start_by_key.pop((pid, tid), None)
                 if start is not None:
                     intervals.append((start, float(ts)))
         return intervals
@@ -734,7 +876,7 @@ class ProfilerHooks:
 
     def _build_profiler_summary(
         self, profiler: torch.profiler.profile
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         rows = []
         for entry in profiler.key_averages():
             rows.append(

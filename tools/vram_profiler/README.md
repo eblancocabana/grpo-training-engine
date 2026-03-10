@@ -29,5 +29,56 @@ python tools/vram_profiler/vram_profiler.py --context all --steps 3 --output vra
 3.  **Timeline**: Hover to see memory usage over time. Click to freeze the "Active Allocations" view at that specific point.
 4.  **Bottleneck Detector**: Check the sidebar for suspicious large accumulations.
 
+## Safe Deep Profiling (API)
+
+When profiling during live training, start in **safe mode** to prevent OS hard locks.
+
+```bash
+# Start training with profiler server
+python train.py --profile --max-steps 2
+
+# Safe deep trace (defaults: steps=1, warmup=1, wait=1,
+# with_stack=false, record_shapes=false, profile_memory=false,
+# sync=true, max_duration_s<=20)
+curl -X POST "http://127.0.0.1:8550/api/profile/start?safe=1"
+
+# Force finalize if you want results immediately
+curl -X POST "http://127.0.0.1:8550/api/profile/force"
+
+# Summaries and trace metadata
+curl "http://127.0.0.1:8550/api/profile/summary?summary_only=true"
+```
+
+**Why safe defaults?** PyTorch warns that `record_shapes`, `profile_memory`, and
+`with_stack` can dramatically increase overhead and memory usage. Keep them off
+unless you are diagnosing a specific issue.
+
+## Alternatives (Lower Overhead)
+
+- **Snapshot-only**: Collect allocator history without torch.profiler.
+  ```bash
+  python tools/vram_profiler/vram_profiler.py --context state --steps 3 --output vram_snapshot.json
+  ```
+- **Tier-1 only**: Use training with `--profile` but skip deep traces.
+  ```bash
+  python train.py --profile --max-steps 2
+  ```
+
+## Triton ON/OFF Validation (minimal changes)
+
+```bash
+# Triton ON (default)
+python train.py --profile --max-steps 2
+curl -X POST "http://127.0.0.1:8550/api/profile/start?safe=1"
+curl -X POST "http://127.0.0.1:8550/api/profile/force"
+curl "http://127.0.0.1:8550/api/profile/summary?summary_only=true"
+
+# Triton OFF
+python train.py --profile --no-triton --max-steps 2
+curl -X POST "http://127.0.0.1:8550/api/profile/start?safe=1"
+curl -X POST "http://127.0.0.1:8550/api/profile/force"
+curl "http://127.0.0.1:8550/api/profile/summary?summary_only=true"
+```
+
 ## Troubleshooting
 - **AttributeError**: If you see errors related to `cProfile` or `module profile`, Ensure the script is named `vram_profiler.py` and NOT `profile.py` (which causes a name collision).

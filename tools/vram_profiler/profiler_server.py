@@ -1,4 +1,5 @@
 from __future__ import annotations
+# pyright: reportMissingImports=false, reportMissingModuleSource=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnnecessaryIsInstance=false, reportUnnecessaryComparison=false, reportUnusedFunction=false, reportImplicitOverride=false
 
 import gzip
 import importlib
@@ -12,14 +13,12 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Protocol, cast
 
-import torch
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response, StreamingResponse
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
-from typing_extensions import override
 
 from src.core.memory_manager import MemoryManager
 from src.utils.logging_utils import get_logger
@@ -33,18 +32,20 @@ _SAFE_MIN_FREE_VRAM_GB = 1.5
 _SAFE_MAX_TRACE_BYTES = 20 * 1024 * 1024
 _SAFE_DEFAULTS = {
     "steps": 1,
-    "wait": 0,
-    "warmup": 0,
+    "wait": 1,
+    "warmup": 1,
     "profile_memory": False,
     "record_shapes": False,
     "with_stack": False,
-    "sync": False,
+    "sync": True,
+    "max_duration_s": 20.0,
     "estimated_events_per_step": 1000,
     "bytes_per_event": 120,
 }
 _SAFE_MAX_STEPS = 1
-_SAFE_MAX_WARMUP = 0
-_SAFE_MAX_WAIT = 0
+_SAFE_MAX_WARMUP = 1
+_SAFE_MAX_WAIT = 1
+_GUARDRAIL_ALTERNATIVES = ["snapshot", "nvtx", "tier1"]
 
 
 class NonStreamingGZipMiddleware(BaseHTTPMiddleware):
@@ -61,7 +62,6 @@ class NonStreamingGZipMiddleware(BaseHTTPMiddleware):
         self._minimum_size = minimum_size
         self._compresslevel = compresslevel
 
-    @override
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
@@ -128,6 +128,23 @@ def _schema_metadata(
             "pid": os.getpid(),
         },
     }
+
+
+class _TorchCuda(Protocol):
+    def is_available(self) -> bool: ...
+
+    def get_device_name(self, device: int) -> str: ...
+
+
+class _TorchModule(Protocol):
+    cuda: _TorchCuda
+
+
+def _get_torch_module() -> _TorchModule | None:
+    try:
+        return cast(_TorchModule, cast(object, importlib.import_module("torch")))
+    except Exception:
+        return None
 
 
 def _with_schema(
@@ -223,7 +240,7 @@ def _summary_stats(values: list[float]) -> dict[str, float] | None:
 
     mean = sum(values_sorted) / count
     variance = sum((v - mean) ** 2 for v in values_sorted) / count
-    std = variance**0.5
+    std = (variance**0.5) if isinstance(variance, (int, float)) else 0.0
     return {
         "count": float(count),
         "mean": mean,
@@ -249,6 +266,41 @@ def _metric_values(
         if isinstance(value, (int, float)):
             values.append(float(value))
     return values
+
+
+def _latest_metric_entry(
+    state: ProfilerState, metric: str
+) -> Mapping[str, object] | None:
+    for entry in reversed(list(state.metrics)):
+        if entry.get("name") == metric:
+            return entry
+    return None
+
+
+def _latest_oom_backoff(state: ProfilerState) -> dict[str, object] | None:
+    entry = _latest_metric_entry(state, "oom_backoff_count")
+    if entry is not None:
+        value = entry.get("value")
+        if isinstance(value, (int, float)) and value > 0:
+            return {
+                "oom_backoff_count": int(value),
+                "step": entry.get("step"),
+                "ts": entry.get("ts"),
+            }
+    for phase in reversed(list(state.phases)):
+        if phase.get("name") != "micro_batching":
+            continue
+        meta = phase.get("meta")
+        if not isinstance(meta, Mapping):
+            continue
+        backoff = meta.get("oom_backoff_count")
+        if isinstance(backoff, (int, float)) and backoff > 0:
+            return {
+                "oom_backoff_count": int(backoff),
+                "step": phase.get("step"),
+                "ts": phase.get("ts"),
+            }
+    return None
 
 
 def _window_metrics_summary(
@@ -519,6 +571,24 @@ def _error_response(
     )
 
 
+def _guardrail_payload(
+    *,
+    reason: str,
+    alternatives: list[str] | None = None,
+    force_export: bool | None = None,
+    details: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "reason": reason,
+        "alternatives": alternatives or list(_GUARDRAIL_ALTERNATIVES),
+    }
+    if force_export is not None:
+        payload["force_export"] = force_export
+    if details:
+        payload.update(details)
+    return payload
+
+
 def _estimate_trace_size_bytes(
     *,
     active_steps: int,
@@ -556,6 +626,7 @@ def _deep_profile_config(state: ProfilerState) -> dict[str, object]:
         "estimated_events_per_step": config_obj.estimated_events_per_step,
         "bytes_per_event": config_obj.bytes_per_event,
         "trace_phase": config_obj.trace_phase,
+        "max_duration_s": config_obj.max_duration_s,
     }
 
 
@@ -899,12 +970,12 @@ def _detect_anomalies(
         return []
     mean = sum(series) / len(series)
     variance = sum((val - mean) ** 2 for val in series) / len(series)
-    std = variance**0.5
+    std = (variance**0.5) if isinstance(variance, (int, float)) else 0.0
     if std == 0:
         return []
     anomalies: list[dict[str, object]] = []
     for value, entry in values:
-        z = (value - mean) / std
+        z = float((value - mean) / std)
         if abs(z) < z_threshold:
             continue
         anomalies.append(
@@ -1124,11 +1195,13 @@ def get_status() -> JSONResponse:
         memory_manager = MemoryManager()
         last_step = state.get_last_step_info()
         gpu_name = None
-        if torch.cuda.is_available():
-            try:
-                gpu_name = torch.cuda.get_device_name(0)
-            except Exception:
-                gpu_name = None
+        torch_module = _get_torch_module()
+        if torch_module is not None:
+            if torch_module.cuda.is_available():
+                try:
+                    gpu_name = torch_module.cuda.get_device_name(0)
+                except Exception:
+                    gpu_name = None
         vram_stats = memory_manager.get_memory_stats()
         buffers = {
             "metrics": state.metrics,
@@ -1272,12 +1345,24 @@ def get_config() -> JSONResponse:
 def get_capabilities() -> JSONResponse:
     state = ProfilerState.get_instance()
     try:
+        experimental_config_available = False
+        torch_module = _get_torch_module()
+        if torch_module is not None:
+            profiler_module = getattr(torch_module, "profiler", None)
+            experimental_config_available = bool(
+                profiler_module
+                and (
+                    getattr(profiler_module, "ExperimentalConfig", None)
+                    or getattr(profiler_module, "_ExperimentalConfig", None)
+                )
+            )
         payload = {
             "status": "ok",
             "features": {
                 "streaming": True,
                 "sse": False,
                 "deep_profile": True,
+                "experimental_config": experimental_config_available,
                 "static_gui": True,
                 "tiers": ["tier1", "tier2"],
             },
@@ -2172,6 +2257,7 @@ def start_profile(request: Request) -> JSONResponse:
         if safe_mode is None:
             safe_mode = True
         warnings: list[str] = []
+        max_duration_s: float | None = None
         memory_manager = MemoryManager()
         free_gb = memory_manager.get_available_memory_gb()
         min_free_gb = _SAFE_MIN_FREE_VRAM_GB if safe_mode else _MIN_FREE_VRAM_GB
@@ -2181,10 +2267,27 @@ def start_profile(request: Request) -> JSONResponse:
                 "Insufficient free VRAM",
                 status_code=409,
                 extra={
-                    "reason": "insufficient_vram",
-                    "free_gb": free_gb,
-                    "min_free_gb": min_free_gb,
-                    "safe_mode": safe_mode,
+                    "guardrail": _guardrail_payload(
+                        reason="insufficient_vram",
+                        details={
+                            "free_gb": free_gb,
+                            "min_free_gb": min_free_gb,
+                            "safe_mode": safe_mode,
+                        },
+                    ),
+                },
+            )
+        oom_backoff = _latest_oom_backoff(state)
+        if oom_backoff is not None:
+            return _error_response(
+                state,
+                "Recent OOM backoff detected",
+                status_code=409,
+                extra={
+                    "guardrail": _guardrail_payload(
+                        reason="recent_oom_backoff",
+                        details={"oom_backoff": oom_backoff},
+                    ),
                 },
             )
         steps = _parse_int(params.get("steps") or params.get("active"))
@@ -2213,9 +2316,9 @@ def start_profile(request: Request) -> JSONResponse:
             steps = steps if steps is not None else _SAFE_DEFAULTS["steps"]
             wait = wait if wait is not None else _SAFE_DEFAULTS["wait"]
             warmup = warmup if warmup is not None else _SAFE_DEFAULTS["warmup"]
-            steps = min(steps, _SAFE_MAX_STEPS)
-            wait = min(wait, _SAFE_MAX_WAIT)
-            warmup = min(warmup, _SAFE_MAX_WARMUP)
+            steps = max(min(steps, _SAFE_MAX_STEPS), _SAFE_DEFAULTS["steps"])
+            wait = max(min(wait, _SAFE_MAX_WAIT), _SAFE_DEFAULTS["wait"])
+            warmup = max(min(warmup, _SAFE_MAX_WARMUP), _SAFE_DEFAULTS["warmup"])
             requested_steps = _parse_int(params.get("steps") or params.get("active"))
             requested_wait = _parse_int(params.get("wait"))
             requested_warmup = _parse_int(params.get("warmup"))
@@ -2242,12 +2345,21 @@ def start_profile(request: Request) -> JSONResponse:
                 warnings.append("with_stack_disabled")
             if sync is None:
                 sync = _SAFE_DEFAULTS["sync"]
-            elif sync:
+            elif not sync:
                 sync = _SAFE_DEFAULTS["sync"]
-                warnings.append("sync_disabled")
+                warnings.append("sync_enabled")
             if force_export:
                 force_export = False
                 warnings.append("force_export_disabled")
+            max_duration_s = _parse_float(params.get("max_duration_s"))
+            if max_duration_s is None:
+                max_duration_s = _SAFE_DEFAULTS["max_duration_s"]
+            elif max_duration_s > _SAFE_DEFAULTS["max_duration_s"]:
+                max_duration_s = _SAFE_DEFAULTS["max_duration_s"]
+                warnings.append("max_duration_clamped")
+            elif max_duration_s <= 0:
+                max_duration_s = _SAFE_DEFAULTS["max_duration_s"]
+                warnings.append("max_duration_reset")
             estimated_events_per_step = (
                 _parse_int(params.get("estimated_events_per_step"))
                 or _SAFE_DEFAULTS["estimated_events_per_step"]
@@ -2270,10 +2382,15 @@ def start_profile(request: Request) -> JSONResponse:
                 _parse_int(params.get("estimated_events_per_step")) or 5000
             )
             bytes_per_event = _parse_int(params.get("bytes_per_event")) or 200
+        steps_int = int(steps)
+        wait_int = int(wait)
+        warmup_int = int(warmup)
+        estimated_events_int = int(estimated_events_per_step)
+        bytes_per_event_int = int(bytes_per_event)
         estimated_size = _estimate_trace_size_bytes(
-            active_steps=steps,
-            estimated_events_per_step=estimated_events_per_step,
-            bytes_per_event=bytes_per_event,
+            active_steps=steps_int,
+            estimated_events_per_step=estimated_events_int,
+            bytes_per_event=bytes_per_event_int,
             record_shapes=bool(record_shapes) if record_shapes is not None else False,
             with_stack=bool(with_stack) if with_stack is not None else False,
             profile_memory=bool(profile_memory) if profile_memory is not None else True,
@@ -2285,16 +2402,25 @@ def start_profile(request: Request) -> JSONResponse:
                 "Estimated trace too large",
                 status_code=413,
                 extra={
-                    "reason": "trace_too_large",
-                    "estimated_size_bytes": estimated_size,
-                    "max_bytes": max_bytes,
-                    "safe_mode": safe_mode,
+                    "guardrail": _guardrail_payload(
+                        reason="trace_too_large",
+                        alternatives=[
+                            *_GUARDRAIL_ALTERNATIVES,
+                            "force_export",
+                        ],
+                        force_export=True,
+                        details={
+                            "estimated_size_bytes": estimated_size,
+                            "max_bytes": max_bytes,
+                            "safe_mode": safe_mode,
+                        },
+                    ),
                 },
             )
         state.request_deep_profile(
-            steps=steps,
-            wait=wait,
-            warmup=warmup,
+            steps=steps_int,
+            wait=wait_int,
+            warmup=warmup_int,
             profile_memory=bool(profile_memory),
             record_shapes=bool(record_shapes),
             with_stack=bool(with_stack),
@@ -2302,19 +2428,23 @@ def start_profile(request: Request) -> JSONResponse:
             output_dir=output_dir,
             trace_name=trace_name,
             force_export=force_export,
-            estimated_events_per_step=estimated_events_per_step,
-            bytes_per_event=bytes_per_event,
+            estimated_events_per_step=estimated_events_int,
+            bytes_per_event=bytes_per_event_int,
             trace_phase=trace_phase,
+            max_duration_s=max_duration_s,
         )
         if trace_path:
             state.set_last_trace_path(trace_path)
+        config_payload = _deep_profile_config(state)
+        config_payload["max_duration_s"] = max_duration_s
         payload = {
             "status": "ok",
             "active": state.deep_profile_active,
-            "config": _deep_profile_config(state),
+            "config": config_payload,
             "estimated_size_bytes": estimated_size,
             "safe_mode": safe_mode,
             "warnings": warnings,
+            "max_duration_s": max_duration_s,
         }
         return JSONResponse(content=_with_schema(payload, state))
     except Exception as exc:
