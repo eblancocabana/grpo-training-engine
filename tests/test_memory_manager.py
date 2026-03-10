@@ -70,3 +70,96 @@ class TestMemoryManager:
             "free_gb": 5.5,
         }
         assert mm.check_memory_warning() is False
+
+    def test_selective_checkpointing_by_name(self, monkeypatch):
+        from src.core.memory_manager import MemoryManager
+
+        class DummyModule:
+            def __init__(self):
+                self.gradient_checkpointing = False
+
+        class DummyModel:
+            def __init__(self):
+                self.layers = {
+                    "block.0": DummyModule(),
+                    "block.1": DummyModule(),
+                    "other": DummyModule(),
+                }
+
+            def named_modules(self):
+                for name, module in self.layers.items():
+                    yield name, module
+
+            def gradient_checkpointing_enable(self):
+                pass
+
+            def gradient_checkpointing_disable(self):
+                pass
+
+            def get_input_embeddings(self):
+                class DummyEmb:
+                    def register_forward_hook(self, hook):
+                        return None
+
+                return DummyEmb()
+
+        mm = MemoryManager(
+            checkpointing_strategy="subset",
+            checkpointing_layer_name_patterns=["block"],
+        )
+        model = DummyModel()
+
+        mm.enable_checkpointing(model)
+
+        assert model.layers["block.0"].gradient_checkpointing is True
+        assert model.layers["block.1"].gradient_checkpointing is True
+        assert model.layers["other"].gradient_checkpointing is False
+
+    def test_vram_auto_checkpointing_toggle(self):
+        from src.core.memory_manager import MemoryManager
+
+        class DummyModule:
+            def __init__(self):
+                self.gradient_checkpointing = False
+
+        class DummyModel:
+            def __init__(self):
+                self.layers = {
+                    "block.0": DummyModule(),
+                    "block.1": DummyModule(),
+                }
+
+            def named_modules(self):
+                for name, module in self.layers.items():
+                    yield name, module
+
+            def gradient_checkpointing_enable(self):
+                pass
+
+            def gradient_checkpointing_disable(self):
+                pass
+
+            def get_input_embeddings(self):
+                class DummyEmb:
+                    def register_forward_hook(self, hook):
+                        return None
+
+                return DummyEmb()
+
+        mm = MemoryManager(
+            checkpointing_strategy="vram_auto",
+            checkpointing_vram_enable_threshold=0.8,
+            checkpointing_vram_disable_threshold=0.6,
+            checkpointing_update_interval_steps=1,
+        )
+        model = DummyModel()
+
+        mm.get_memory_stats = lambda: {"usage_fraction": 0.85}
+        mm.enable_checkpointing(model)
+        assert model.layers["block.0"].gradient_checkpointing is True
+        assert model.layers["block.1"].gradient_checkpointing is True
+
+        mm.get_memory_stats = lambda: {"usage_fraction": 0.55}
+        mm.maybe_update_checkpointing(model, step=2)
+        assert model.layers["block.0"].gradient_checkpointing is False
+        assert model.layers["block.1"].gradient_checkpointing is False
