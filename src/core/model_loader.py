@@ -1,5 +1,10 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:
+    BitsAndBytesConfig = None
 from src.utils.logging_utils import get_logger
 
 logger = get_logger("core.model_loader")
@@ -12,12 +17,18 @@ def load_4bit_engine(model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
+    bnb_config = None
+    if BitsAndBytesConfig is not None:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        logger.warning(
+            "bitsandbytes unavailable; loading model in BF16 without quantization."
+        )
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -25,13 +36,15 @@ def load_4bit_engine(model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            quantization_config=bnb_config,
-            device_map="auto",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        )
+        model_kwargs = {
+            "device_map": "auto",
+            "dtype": torch.bfloat16,
+            "attn_implementation": "sdpa",
+        }
+        if bnb_config is not None:
+            model_kwargs["quantization_config"] = bnb_config
+
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
 
         for param in model.parameters():
             param.requires_grad = False

@@ -35,6 +35,7 @@ class LoRAConfig:
     rank: int = 16
     alpha: int = 32
     dropout: float = 0.0
+    adapter_quantization: str = "8bit"
     target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
@@ -137,6 +138,12 @@ class TrainingConfig:
 
     # Memory
     enable_gradient_checkpointing: bool = True
+    checkpointing_strategy: str = "all"
+    checkpointing_layer_name_patterns: List[str] = field(default_factory=list)
+    checkpointing_layer_types: List[str] = field(default_factory=list)
+    checkpointing_vram_enable_threshold: float = 0.82
+    checkpointing_vram_disable_threshold: float = 0.72
+    checkpointing_update_interval_steps: int = 10
     use_triton_kernels: bool = True
     triton_lora_prefer_base: bool = False
     clear_cache_frequency: int = 10
@@ -226,6 +233,7 @@ def get_8gb_vram_config() -> Config:
 
     config.lora.rank = 16
     config.lora.alpha = 32
+    config.lora.adapter_quantization = "8bit"
     config.lora.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
     config.grpo.group_size = 4
@@ -238,6 +246,10 @@ def get_8gb_vram_config() -> Config:
     config.training.batch_size = 1
     config.training.gradient_accumulation_steps = 16
     config.training.enable_gradient_checkpointing = True
+    config.training.checkpointing_strategy = "vram_auto"
+    config.training.checkpointing_vram_enable_threshold = 0.82
+    config.training.checkpointing_vram_disable_threshold = 0.72
+    config.training.checkpointing_update_interval_steps = 10
     config.training.use_triton_kernels = True
     config.training.max_prompt_length = 4096
     config.training.max_response_length = 384

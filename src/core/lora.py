@@ -10,7 +10,11 @@ from typing import Any, List, Protocol, cast
 
 import torch
 import torch.nn as nn
-import bitsandbytes as bnb
+
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
 from src.triton_kernels import lora_fused_forward
 from src.utils.logging_utils import get_logger
 
@@ -26,14 +30,77 @@ class _Linear4bitLike(Protocol):
     def __call__(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
+class _LoRALinearLike(Protocol):
+    weight: torch.nn.Parameter
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor: ...
+
+
 def _get_bnb_linear4bit() -> Any:
+    if bnb is None:
+        return None
     nn_namespace = getattr(bnb, "nn", None)
     return getattr(nn_namespace, "Linear4bit", None)
 
 
-def _is_linear4bit(module: nn.Module) -> bool:
+def _get_bnb_linear8bit() -> Any:
+    if bnb is None:
+        return None
+    nn_namespace = getattr(bnb, "nn", None)
+    return getattr(nn_namespace, "Linear8bitLt", None)
+
+
+def _is_linear4bit(module: object) -> bool:
     linear4bit = _get_bnb_linear4bit()
     return linear4bit is not None and isinstance(module, linear4bit)
+
+
+def _is_supported_base_layer(module: nn.Module) -> bool:
+    if _is_linear4bit(module):
+        return True
+    if isinstance(module, nn.Linear):
+        return True
+    return False
+
+
+def _get_lora_compute_dtype() -> torch.dtype:
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.bfloat16
+
+
+def _create_lora_linear(
+    in_features: int,
+    out_features: int,
+    adapter_quantization: str,
+    compute_dtype: torch.dtype,
+) -> tuple[nn.Module, bool]:
+    quantization = adapter_quantization.lower()
+    if quantization == "8bit":
+        linear8bit = _get_bnb_linear8bit()
+        if linear8bit is not None:
+            return linear8bit(in_features, out_features, bias=False), True
+        logger.warning(
+            "bitsandbytes unavailable for 8-bit LoRA adapters; falling back to BF16."
+        )
+    elif quantization == "4bit":
+        linear4bit = _get_bnb_linear4bit()
+        if linear4bit is not None:
+            return linear4bit(in_features, out_features, bias=False), True
+        logger.warning(
+            "bitsandbytes unavailable for 4-bit LoRA adapters; falling back to BF16."
+        )
+    elif quantization != "none":
+        message = (
+            f"Unsupported LoRA adapter quantization: {adapter_quantization}. "
+            "Expected '8bit', '4bit', or 'none'."
+        )
+        raise ValueError(message)
+
+    linear = nn.Linear(in_features, out_features, bias=False)
+    return linear.to(dtype=compute_dtype), False
 
 
 def _dequantize_4bit(weight: torch.Tensor) -> torch.Tensor:
@@ -68,6 +135,7 @@ class ManualLoRALayer(nn.Module):
         dropout: float = 0.0,
         use_triton: bool = True,
         prefer_base_layer: bool = False,
+        adapter_quantization: str = "8bit",
     ):
         super().__init__()
         self.base_layer = base_layer
@@ -87,8 +155,15 @@ class ManualLoRALayer(nn.Module):
         # Create LoRA matrices A and B
         # A: input_dim -> rank
         # B: rank -> output_dim
-        self.lora_A = nn.Linear(in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.lora_compute_dtype = _get_lora_compute_dtype()
+        lora_a, _ = _create_lora_linear(
+            in_features, rank, adapter_quantization, self.lora_compute_dtype
+        )
+        lora_b, _ = _create_lora_linear(
+            rank, out_features, adapter_quantization, self.lora_compute_dtype
+        )
+        self.lora_A = cast(_LoRALinearLike, cast(object, lora_a))
+        self.lora_B = cast(_LoRALinearLike, cast(object, lora_b))
 
         # Dropout for regularization
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
@@ -123,11 +198,13 @@ class ManualLoRALayer(nn.Module):
                 pass
 
         try:
-            base_output = cast(Callable[[torch.Tensor], torch.Tensor], self.base_layer)(x)
+            base_output = cast(Callable[[torch.Tensor], torch.Tensor], self.base_layer)(
+                x
+            )
             if base_output.requires_grad:
                 base_output = base_output.clone()
 
-            x_adapt = x.to(self.lora_A.weight.dtype)
+            x_adapt = x.to(self.lora_compute_dtype)
             lora_output = self.lora_B(self.lora_A(self.lora_dropout(x_adapt)))
             lora_output = lora_output * self.scaling
 
@@ -154,11 +231,15 @@ class ManualLoRALayer(nn.Module):
         Returns:
             Merged weight matrix
         """
-        # Get base weight (dequantized)
-        base_weight = _dequantize_4bit(self.base_layer.weight)
+        if _is_linear4bit(self.base_layer):
+            base_weight = _dequantize_4bit(self.base_layer.weight)
+        else:
+            base_weight = self.base_layer.weight
 
         # Compute LoRA weight
         lora_weight = self.lora_B.weight @ self.lora_A.weight * self.scaling
+        if lora_weight.dtype != base_weight.dtype:
+            lora_weight = lora_weight.to(base_weight.dtype)
 
         return base_weight + lora_weight
 
@@ -171,6 +252,7 @@ def inject_lora_layers(
     dropout: float = 0.0,
     use_triton: bool = True,
     prefer_base_layer: bool = False,
+    adapter_quantization: str = "8bit",
     verbose: bool = True,
 ) -> int:
     """
@@ -193,7 +275,9 @@ def inject_lora_layers(
         # Check if this is a target module
         module_short_name = name.split(".")[-1]
 
-        if module_short_name in target_modules and _is_linear4bit(cast(nn.Module, module)):
+        if module_short_name in target_modules and _is_supported_base_layer(
+            cast(nn.Module, module)
+        ):
             # Navigate to parent module
             parent_name = ".".join(name.split(".")[:-1])
             child_name = name.split(".")[-1]
@@ -211,6 +295,7 @@ def inject_lora_layers(
                 dropout=dropout,
                 use_triton=use_triton,
                 prefer_base_layer=prefer_base_layer,
+                adapter_quantization=adapter_quantization,
             )
 
             # Move to same device/dtype as base layer

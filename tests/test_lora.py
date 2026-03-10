@@ -34,7 +34,9 @@ class FakeLinear4bit(nn.Module):
 
 
 class _ManualLoRALayerLike(nn.Module):
-    def __init__(self, base_layer, rank: int = 16, alpha: int = 32, dropout: float = 0.0):
+    def __init__(
+        self, base_layer, rank: int = 16, alpha: int = 32, dropout: float = 0.0
+    ):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
@@ -64,6 +66,7 @@ class TestLoRA:
         fake_bnb = types.ModuleType("bitsandbytes")
         fake_bnb.nn = types.SimpleNamespace()  # pyright: ignore[reportAttributeAccessIssue]
         fake_bnb.nn.Linear4bit = FakeLinear4bit
+        fake_bnb.nn.Linear8bitLt = FakeLinear4bit
         monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bnb)
 
     def test_lora_forward_equation(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,12 +112,18 @@ class TestLoRA:
         rank = 4
         alpha = 8
 
-        base = FakeLinear4bit(in_features, out_features).to(device, dtype=torch.bfloat16)
-        lora = ManualLoRALayer(base, rank=rank, alpha=alpha, use_triton=False).to(device, dtype=torch.bfloat16)  # pyright: ignore[reportCallIssue]
+        base = FakeLinear4bit(in_features, out_features).to(
+            device, dtype=torch.bfloat16
+        )
+        lora = ManualLoRALayer(base, rank=rank, alpha=alpha, use_triton=False).to(
+            device, dtype=torch.bfloat16
+        )  # pyright: ignore[reportCallIssue]
 
         x = torch.randn(2, 3, in_features, device=device, dtype=torch.bfloat16)
         expected = lora(x)
-        lora_fused = _ManualLoRALayerLike(base, rank=rank, alpha=alpha).to(device, dtype=torch.bfloat16)
+        lora_fused = _ManualLoRALayerLike(base, rank=rank, alpha=alpha).to(
+            device, dtype=torch.bfloat16
+        )
         lora_fused.lora_A.weight.data.copy_(lora.lora_A.weight.data)
         lora_fused.lora_B.weight.data.copy_(lora.lora_B.weight.data)
         actual = lora_fused_forward(x, lora_layer=lora_fused)
@@ -241,3 +250,73 @@ class TestLoRA:
         assert isinstance(model.v_proj, ManualLoRALayer)
         assert isinstance(model.k_proj, FakeLinear4bit)
         assert isinstance(model.other, FakeLinear4bit)
+
+    def test_lora_adapter_quantization_defaults_to_8bit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.setup_fake_bnb(monkeypatch)
+        from src.core import lora as lora_module
+
+        importlib.reload(lora_module)
+        ManualLoRALayer = lora_module.ManualLoRALayer
+
+        base = FakeLinear4bit(8, 8)
+        layer = ManualLoRALayer(base, use_triton=False)
+        assert isinstance(layer.lora_A, FakeLinear4bit)
+        assert isinstance(layer.lora_B, FakeLinear4bit)
+
+    def test_lora_adapter_quantization_4bit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.setup_fake_bnb(monkeypatch)
+        from src.core import lora as lora_module
+
+        importlib.reload(lora_module)
+        ManualLoRALayer = lora_module.ManualLoRALayer
+
+        base = FakeLinear4bit(8, 8)
+        layer = ManualLoRALayer(base, adapter_quantization="4bit", use_triton=False)
+        assert isinstance(layer.lora_A, FakeLinear4bit)
+        assert isinstance(layer.lora_B, FakeLinear4bit)
+
+    def test_lora_adapter_quantization_none_falls_back_to_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.setup_fake_bnb(monkeypatch)
+        from src.core import lora as lora_module
+
+        importlib.reload(lora_module)
+        ManualLoRALayer = lora_module.ManualLoRALayer
+
+        base = FakeLinear4bit(8, 8)
+        layer = ManualLoRALayer(base, adapter_quantization="none", use_triton=False)
+        assert isinstance(layer.lora_A, nn.Linear)
+        assert isinstance(layer.lora_B, nn.Linear)
+
+    def test_lora_adapter_quantization_invalid_value_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.setup_fake_bnb(monkeypatch)
+        from src.core import lora as lora_module
+
+        importlib.reload(lora_module)
+        ManualLoRALayer = lora_module.ManualLoRALayer
+
+        base = FakeLinear4bit(8, 8)
+        with pytest.raises(ValueError, match="Unsupported LoRA adapter quantization"):
+            ManualLoRALayer(base, adapter_quantization="2bit", use_triton=False)
+
+    def test_lora_adapter_quantization_falls_back_without_bitsandbytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if "bitsandbytes" in sys.modules:
+            monkeypatch.delitem(sys.modules, "bitsandbytes")
+        from src.core import lora as lora_module
+
+        importlib.reload(lora_module)
+        ManualLoRALayer = lora_module.ManualLoRALayer
+
+        base = FakeLinear4bit(8, 8)
+        layer = ManualLoRALayer(base, adapter_quantization="8bit", use_triton=False)
+        assert isinstance(layer.lora_A, nn.Linear)
+        assert isinstance(layer.lora_B, nn.Linear)
