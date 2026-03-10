@@ -77,6 +77,13 @@ def main():
         "--lora-rank", type=int, default=16, help="LoRA rank (higher = more parameters)"
     )
     parser.add_argument(
+        "--lora-adapter-quant",
+        type=str,
+        choices=["8bit", "4bit", "none"],
+        default="8bit",
+        help="Quantization for LoRA adapters (default: 8bit)",
+    )
+    parser.add_argument(
         "--learning-rate", type=float, default=1e-4, help="Learning rate"
     )
     parser.add_argument(
@@ -227,6 +234,7 @@ def main():
     config.training.log_dir = os.path.join(args.output_dir, "logs")
     config.grpo.group_size = args.group_size
     config.lora.rank = args.lora_rank
+    config.lora.adapter_quantization = args.lora_adapter_quant
     config.training.learning_rate = args.learning_rate
     config.entropy.use_entropy_mask = args.use_entropy_mask
     config.training.max_prompt_length = args.max_prompt_length
