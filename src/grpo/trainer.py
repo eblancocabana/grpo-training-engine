@@ -1157,6 +1157,11 @@ class GRPOTrainerLoop:
             self.config.training.output_dir, "baseline_benchmark_done.json"
         )
         force = getattr(self.config.training, "force_initial_benchmark", False)
+        skip_initial = getattr(self.config.training, "skip_initial_benchmark", False)
+
+        if skip_initial:
+            logger.info("[Benchmark] Initial benchmark skipped by configuration.")
+            run_initial = False
 
         def _has_checkpoints() -> bool:
             ckpt_dir = getattr(self.config.training, "checkpoint_dir", None)

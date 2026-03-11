@@ -199,6 +199,11 @@ def main():
         action="store_true",
         help="Enable live profiler server + Tier 1 hooks",
     )
+    parser.add_argument(
+        "--no-initial-benchmark",
+        action="store_true",
+        help="Skip the initial GSM8K benchmark before training",
+    )
 
     args = parser.parse_args()
 
@@ -254,6 +259,9 @@ def main():
 
     if args.max_steps is not None:
         config.training.max_steps = args.max_steps
+
+    # Initial benchmark configuration
+    config.training.skip_initial_benchmark = args.no_initial_benchmark
 
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
