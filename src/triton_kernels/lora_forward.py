@@ -22,6 +22,7 @@ from typing import Optional, Tuple, cast, TYPE_CHECKING, Protocol, Callable, Seq
 
 import torch
 
+
 class _QuantStateLike(Protocol):
     absmax: torch.Tensor
     code: torch.Tensor
@@ -48,8 +49,7 @@ class _LoRALayerLike(Protocol):
 
 
 class _TritonKernel(Protocol):
-    def __getitem__(self, grid: Tuple[int, ...]) -> Callable[..., None]:
-        ...
+    def __getitem__(self, grid: Tuple[int, ...]) -> Callable[..., None]: ...
 
 
 class _LoRAContext(Protocol):
@@ -59,9 +59,7 @@ class _LoRAContext(Protocol):
     output_shape: Tuple[int, ...]
     has_bias: bool
 
-    def save_for_backward(self, *tensors: torch.Tensor) -> None:
-        ...
-
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
 
 
 try:
@@ -80,7 +78,6 @@ if TYPE_CHECKING:
 
 
 if TRITON_AVAILABLE:
-
     LORA_FORWARD_CONFIGS = [
         triton.Config(
             {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 32, "BLOCK_R": 16},
@@ -164,9 +161,7 @@ if TRITON_AVAILABLE:
             mask_k = offs_k < K
 
             x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-            x_block = tl.load(
-                x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0
-            )
+            x_block = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
 
             element_idx = offs_n[None, :] * K + offs_k[:, None]
             mask_w = mask_n[None, :] & mask_k[:, None]
@@ -235,10 +230,10 @@ if TRITON_AVAILABLE:
                 a_block = tl.cast(a_block, LORA_DTYPE)
                 lora_acc += tl.dot(x_lora_block, a_block, out_dtype=LORA_DOT_DTYPE)
 
-            b_ptrs = lora_B_ptr + offs_n[None, :] * stride_bn + offs_r[:, None] * stride_br
-            b_block = tl.load(
-                b_ptrs, mask=mask_n[None, :] & mask_r[:, None], other=0.0
+            b_ptrs = (
+                lora_B_ptr + offs_n[None, :] * stride_bn + offs_r[:, None] * stride_br
             )
+            b_block = tl.load(b_ptrs, mask=mask_n[None, :] & mask_r[:, None], other=0.0)
             b_block = tl.cast(b_block, LORA_DTYPE)
             lora_acc = tl.cast(lora_acc, LORA_DTYPE)
             lora_out += tl.dot(lora_acc, b_block, out_dtype=LORA_DOT_DTYPE)
@@ -300,7 +295,9 @@ if TRITON_AVAILABLE:
             tl.multiple_of(offs_n, BLOCK_N)
             mask_n = offs_n < N
 
-            grad_ptrs = grad_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
+            grad_ptrs = (
+                grad_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
+            )
             grad_block = tl.load(
                 grad_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0
             )
@@ -382,12 +379,8 @@ if TRITON_AVAILABLE:
             a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
             b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-            a_block = tl.load(
-                a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0
-            )
-            b_block = tl.load(
-                b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0
-            )
+            a_block = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+            b_block = tl.load(b_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
             acc += tl.dot(a_block, b_block)
 
@@ -518,9 +511,7 @@ def _validate_adapter_inputs(
             f"lora_A input features mismatch: {in_features_a} vs {in_features}."
         )
     if rank_b != rank:
-        raise ValueError(
-            f"lora_B rank mismatch: {rank_b} vs {rank}."
-        )
+        raise ValueError(f"lora_B rank mismatch: {rank_b} vs {rank}.")
     return batch * seq_len, out_features_b, in_features, rank
 
 
@@ -962,6 +953,16 @@ def lora_fused_forward(
     weight_4bit = cast(Optional[torch.Tensor], getattr(base_layer, "weight", None))
     lora_A_weight = getattr(lora_A, "weight", lora_A)
     lora_B_weight = getattr(lora_B, "weight", lora_B)
+
+    target_lora_dtype = (
+        x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    )
+    lora_A_tensor = cast(torch.Tensor, lora_A_weight)
+    lora_B_tensor = cast(torch.Tensor, lora_B_weight)
+    if lora_A_tensor.dtype != target_lora_dtype:
+        lora_A_weight = lora_A_tensor.to(dtype=target_lora_dtype)
+    if lora_B_tensor.dtype != target_lora_dtype:
+        lora_B_weight = lora_B_tensor.to(dtype=target_lora_dtype)
 
     if (
         not prefer_base_layer

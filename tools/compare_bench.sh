@@ -222,6 +222,10 @@ run_training() {
   rm -f "$vram_samples_path" "$exit_code_path"
   current_exit_code_path="$exit_code_path"
 
+  # Create baseline benchmark marker to skip initial benchmark
+  mkdir -p "$run_output_dir"
+  echo '{"model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "skipped": true}' > "$run_output_dir/baseline_benchmark_done.json"
+
   (
     cd "$workdir"
     WANDB_DISABLED=true \
