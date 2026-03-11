@@ -13,17 +13,23 @@ Arguments can be:
 
 Options:
   --steps N   Number of training steps (default: 5)
+  --triton MODE  Triton mode: auto, on, off (default: auto)
   -h, --help  Show this help
 USAGE
 }
 
 steps=5
+triton_mode="auto"
 targets=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --steps)
       steps="$2"
+      shift 2
+      ;;
+    --triton)
+      triton_mode="$2"
       shift 2
       ;;
     -h|--help)
@@ -39,6 +45,11 @@ done
 
 if [[ ${#targets[@]} -lt 1 ]]; then
   usage
+  exit 1
+fi
+
+if [[ "$triton_mode" != "auto" && "$triton_mode" != "on" && "$triton_mode" != "off" ]]; then
+  echo "[ERROR] --triton must be one of: auto, on, off" >&2
   exit 1
 fi
 
@@ -179,6 +190,7 @@ run_training() {
 
   local no_checkpoint_arg=""
   local no_initial_benchmark_arg=""
+  local triton_arg=""
   local help_output
   help_output="$(run_python "$workdir/train.py" --help 2>&1 || true)"
   if [[ "$help_output" == *"--no-checkpoints"* ]]; then
@@ -186,6 +198,16 @@ run_training() {
   fi
   if [[ "$help_output" == *"--no-initial-benchmark"* ]]; then
     no_initial_benchmark_arg="--no-initial-benchmark"
+  fi
+  if [[ "$help_output" == *"--use-triton"* && "$help_output" == *"--no-triton"* ]]; then
+    case "$triton_mode" in
+      on)
+        triton_arg="--use-triton"
+        ;;
+      off)
+        triton_arg="--no-triton"
+        ;;
+    esac
   fi
 
   local run_id="${label}-${timestamp}"
@@ -207,6 +229,7 @@ run_training() {
       --no-wandb \
       $no_checkpoint_arg \
       $no_initial_benchmark_arg \
+      $triton_arg \
       --epochs 1 \
       --max-steps "$steps" \
       --output-dir "$run_output_dir" \
@@ -259,7 +282,7 @@ run_training() {
   fi
 
   cat <<EOF >>"$run_meta_path"
-{"input":"$target","label":"$label","commit":"$commit","log_path":"$log_path","exit_code":$exit_code,"start_ts":$start_ts,"end_ts":$end_ts,"steps_requested":$steps,"timestamp":"$timestamp","vram_samples_path":"$vram_samples_path","run_origin":"isolated_worktree"}
+{"input":"$target","label":"$label","commit":"$commit","log_path":"$log_path","exit_code":$exit_code,"start_ts":$start_ts,"end_ts":$end_ts,"steps_requested":$steps,"timestamp":"$timestamp","vram_samples_path":"$vram_samples_path","run_origin":"isolated_worktree","triton_mode":"$triton_mode","triton_arg":"$triton_arg"}
 EOF
 }
 
@@ -431,6 +454,8 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
         "input": meta["input"],
         "label": meta["label"],
         "commit": meta["commit"],
+        "triton_mode": meta.get("triton_mode", "auto"),
+        "triton_arg": meta.get("triton_arg") or None,
         "status": status,
         "valid": valid,
         "steps_requested": meta["steps_requested"],
@@ -464,6 +489,8 @@ columns = [
     "label",
     "input",
     "commit",
+    "triton_mode",
+    "triton_arg",
     "status",
     "valid",
     "failure_phase",
