@@ -79,3 +79,6 @@ tools/vram_profiler/app/snapshot_data.js
 tools/vram_profiler/app/snapshot_data.orig.js
 *.gz
 log_profiler_tb/
+
+# Benchmark outputs
+benchmarks/output/
