@@ -82,3 +82,9 @@ log_profiler_tb/
 
 # Benchmark outputs
 benchmarks/output/
+
+# Optimizer runtime artifacts
+optimizer/artifacts/records/
+
+# Materialized optimizer candidate worktrees
+optimizer_worktrees/
