@@ -1,0 +1,19 @@
+{
+  "baseline": "main",
+  "iteration_budget": 1,
+  "open_ended": false,
+  "trace_summary_path": null,
+  "candidates": [
+    "feat/example-candidate"
+  ],
+  "benchmark": {
+    "steps": 5,
+    "triton": "auto"
+  },
+  "policy": {
+    "allow_recovered_oom_promotion": true
+  },
+  "output": {
+    "artifacts_dir": "optimizer/artifacts/records"
+  }
+}
