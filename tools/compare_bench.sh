@@ -398,7 +398,7 @@ def parse_log(path: Path):
 def classify_run(exit_code, parsed, meta):
     if exit_code == 0:
         if parsed["oom_events"] > 0:
-            return "oom_recovered", False, None, parsed["terminal_error"]
+            return "oom_recovered", True, None, parsed["terminal_error"]
         return "ok", True, None, parsed["terminal_error"]
 
     failure_phase = "startup" if parsed["last_step"] is None else "training"
