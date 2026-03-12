@@ -1,0 +1,75 @@
+from optimizer.evaluation.acceptance import decide_acceptance
+from optimizer.frontier import Frontier, FrontierEntry
+from optimizer.records import BenchmarkRunRecord, JsonValue
+
+
+def _run(name: str, **overrides: JsonValue) -> BenchmarkRunRecord:
+    payload: dict[str, JsonValue] = {
+        "input": name,
+        "label": name,
+        "commit": "abc123",
+        "status": "ok",
+        "valid": True,
+        "steps_requested": 5,
+        "steps_observed": 5,
+        "reward_avg": 0.4,
+        "loss_avg": 0.9,
+        "effective_batch": 16,
+        "oom_events": 0,
+    }
+    payload.update(overrides)
+    return BenchmarkRunRecord.from_dict(payload)
+
+
+def test_frontier_promotes_on_acceptance() -> None:
+    frontier = Frontier()
+    _ = frontier.seed(
+        FrontierEntry.from_run(
+            candidate_id="baseline",
+            target="main",
+            benchmark=_run("main", reward_avg=0.4),
+        )
+    )
+    current = frontier.current
+    assert current is not None
+
+    candidate_run = _run("candidate", reward_avg=0.5)
+    decision = decide_acceptance(candidate_run, current.benchmark)
+    transition = frontier.apply_decision(
+        candidate_id="candidate-1",
+        target="feat/candidate",
+        benchmark=candidate_run,
+        decision=decision,
+    )
+
+    assert transition.accepted is True
+    assert frontier.current is not None
+    assert frontier.current.candidate_id == "candidate-1"
+    assert frontier.history[-1].reason == "reward_improved"
+
+
+def test_frontier_holds_incumbent_on_rejection() -> None:
+    frontier = Frontier()
+    _ = frontier.seed(
+        FrontierEntry.from_run(
+            candidate_id="baseline",
+            target="main",
+            benchmark=_run("main", reward_avg=0.4),
+        )
+    )
+    current = frontier.current
+    assert current is not None
+
+    candidate_run = _run("candidate", reward_avg=0.35)
+    decision = decide_acceptance(candidate_run, current.benchmark)
+    transition = frontier.apply_decision(
+        candidate_id="candidate-2",
+        target="feat/weaker",
+        benchmark=candidate_run,
+        decision=decision,
+    )
+
+    assert transition.accepted is False
+    assert frontier.current is not None
+    assert frontier.current.candidate_id == "baseline"
+    assert transition.current_candidate_id == "baseline"
