@@ -11,7 +11,11 @@ from optimizer.records import (
     BenchmarkComparisonRecord,
     BenchmarkRunRecord,
     DecisionRecord,
+    ExperimentLedgerRecord,
+    ExperimentSnapshotRecord,
     JsonValue,
+    append_jsonl_record,
+    load_last_jsonl_record,
     utc_timestamp,
     write_json_record,
 )
@@ -21,6 +25,7 @@ from optimizer.records import (
 class CandidateSpec:
     candidate_id: str
     target: str
+    change_summary: str
 
 
 class BenchmarkCampaign(Protocol):
@@ -52,7 +57,7 @@ class SequentialOptimizerOrchestrator:
         )
         self.frontier: Frontier = frontier or Frontier()
         self._evaluation_active: bool = False
-        self.allow_recovered_oom_promotion = allow_recovered_oom_promotion
+        self.allow_recovered_oom_promotion: bool = allow_recovered_oom_promotion
 
     def seed_frontier(
         self,
@@ -121,6 +126,7 @@ class SequentialOptimizerOrchestrator:
                 candidate_target=candidate.target,
                 frontier_id=frontier_entry.candidate_id,
                 frontier_target=frontier_entry.target,
+                change_summary=candidate.change_summary,
                 accepted=acceptance.accepted,
                 reason=acceptance.reason,
                 candidate_status=candidate_run.status,
@@ -137,15 +143,117 @@ class SequentialOptimizerOrchestrator:
                     "sequential_only": True,
                 },
             )
-            _ = write_json_record(
+            decision_path = write_json_record(
                 self.artifacts_dir
                 / "decisions"
                 / f"{decision_id}_{candidate.candidate_id}.json",
                 decision,
             )
+            experiment_ledger = self._build_experiment_ledger(
+                decision=decision,
+                decision_path=decision_path,
+                frontier_entry=frontier_entry,
+                frontier_run=frontier_run,
+                candidate_run=candidate_run,
+            )
+            _ = append_jsonl_record(
+                self.artifacts_dir / "experiments" / "experiment_ledger.jsonl",
+                experiment_ledger,
+            )
             return decision
         finally:
             self._evaluation_active = False
+
+    def _build_experiment_ledger(
+        self,
+        *,
+        decision: DecisionRecord,
+        decision_path: Path,
+        frontier_entry: FrontierEntry,
+        frontier_run: BenchmarkRunRecord,
+        candidate_run: BenchmarkRunRecord,
+    ) -> ExperimentLedgerRecord:
+        ledger_path = self.artifacts_dir / "experiments" / "experiment_ledger.jsonl"
+        last_record = load_last_jsonl_record(ledger_path)
+        previous_experiment_number = 0
+        running_best_tokens_per_sec = None
+        running_best_experiment_number = None
+        if last_record is not None:
+            previous_experiment_number = (
+                _maybe_int(last_record.get("experiment_number")) or 0
+            )
+            running_best_tokens_per_sec = _maybe_float(
+                last_record.get("running_best_tokens_per_sec")
+            )
+            running_best_experiment_number = _maybe_int(
+                last_record.get("running_best_experiment_number")
+            )
+
+        experiment_number = previous_experiment_number + 1
+        outcome = "kept" if decision.accepted else "discarded"
+        baseline_snapshot = self._build_snapshot(
+            target=frontier_entry.target,
+            benchmark=frontier_run,
+            comparability=decision.frontier_comparability,
+        )
+        candidate_snapshot = self._build_snapshot(
+            target=decision.candidate_target,
+            benchmark=candidate_run,
+            comparability=decision.candidate_comparability,
+        )
+        incumbent_tokens_per_sec_after_decision = (
+            candidate_run.tokens_per_sec
+            if decision.accepted
+            else frontier_run.tokens_per_sec
+        )
+        if incumbent_tokens_per_sec_after_decision is not None and (
+            running_best_tokens_per_sec is None
+            or incumbent_tokens_per_sec_after_decision > running_best_tokens_per_sec
+        ):
+            running_best_tokens_per_sec = incumbent_tokens_per_sec_after_decision
+            running_best_experiment_number = experiment_number
+
+        return ExperimentLedgerRecord(
+            experiment_number=experiment_number,
+            decision_id=decision.decision_id,
+            campaign=decision.campaign,
+            change_summary=decision.change_summary,
+            candidate_id=decision.candidate_id,
+            candidate_target=decision.candidate_target,
+            frontier_id=decision.frontier_id,
+            frontier_target=decision.frontier_target,
+            outcome=outcome,
+            reason=decision.reason,
+            primary_metric="tokens_per_sec",
+            baseline_snapshot=baseline_snapshot,
+            candidate_snapshot=candidate_snapshot,
+            incumbent_tokens_per_sec_after_decision=incumbent_tokens_per_sec_after_decision,
+            running_best_tokens_per_sec=running_best_tokens_per_sec,
+            running_best_experiment_number=running_best_experiment_number,
+            benchmark_report_path=decision.benchmark_report_path,
+            frontier_state_path=decision.frontier_state_path,
+            decision_path=str(decision_path),
+            sequential_only=True,
+        )
+
+    def _build_snapshot(
+        self,
+        *,
+        target: str,
+        benchmark: BenchmarkRunRecord,
+        comparability: str,
+    ) -> ExperimentSnapshotRecord:
+        return ExperimentSnapshotRecord(
+            target=target,
+            status=benchmark.status,
+            comparability=comparability,
+            tokens_per_sec=benchmark.tokens_per_sec,
+            reward_avg=benchmark.reward_avg,
+            loss_avg=benchmark.loss_avg,
+            vram_peak_gb=benchmark.vram_peak_gb,
+            oom_events=benchmark.oom_events,
+            effective_batch=benchmark.effective_batch,
+        )
 
     def _enforce_sequential_report(
         self,
@@ -185,3 +293,25 @@ class SequentialOptimizerOrchestrator:
                 for transition in self.frontier.history
             ],
         }
+
+
+def _maybe_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise ValueError(f"Expected float-compatible value, got {type(value)!r}.")
+
+
+def _maybe_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        return int(value)
+    raise ValueError(f"Expected int-compatible value, got {type(value)!r}.")

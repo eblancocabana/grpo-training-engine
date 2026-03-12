@@ -24,6 +24,7 @@ class BenchmarkRunRecord:
     valid: bool
     steps_requested: int | None = None
     steps_observed: int | None = None
+    tokens_per_sec: float | None = None
     time_avg_s: float | None = None
     time_min_s: float | None = None
     time_max_s: float | None = None
@@ -50,6 +51,7 @@ class BenchmarkRunRecord:
             valid=bool(data.get("valid", False)),
             steps_requested=_maybe_int(data.get("steps_requested")),
             steps_observed=_maybe_int(data.get("steps_observed")),
+            tokens_per_sec=_maybe_float(data.get("tokens_per_sec")),
             time_avg_s=_maybe_float(data.get("time_avg_s")),
             time_min_s=_maybe_float(data.get("time_min_s")),
             time_max_s=_maybe_float(data.get("time_max_s")),
@@ -115,6 +117,7 @@ class DecisionRecord:
     candidate_target: str
     frontier_id: str
     frontier_target: str
+    change_summary: str
     accepted: bool
     reason: str
     candidate_status: str
@@ -126,6 +129,98 @@ class DecisionRecord:
     benchmark_report_path: str
     frontier_state_path: str
     diagnostics: dict[str, JsonValue] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExperimentSnapshotRecord:
+    target: str
+    status: str
+    comparability: str
+    tokens_per_sec: float | None
+    reward_avg: float | None
+    loss_avg: float | None
+    vram_peak_gb: float | None
+    oom_events: int
+    effective_batch: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ExperimentSnapshotRecord":
+        return cls(
+            target=_require_str(data, "target"),
+            status=_require_str(data, "status"),
+            comparability=_require_str(data, "comparability"),
+            tokens_per_sec=_maybe_float(data.get("tokens_per_sec")),
+            reward_avg=_maybe_float(data.get("reward_avg")),
+            loss_avg=_maybe_float(data.get("loss_avg")),
+            vram_peak_gb=_maybe_float(data.get("vram_peak_gb")),
+            oom_events=_maybe_int(data.get("oom_events")) or 0,
+            effective_batch=_maybe_int(data.get("effective_batch")),
+        )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExperimentLedgerRecord:
+    experiment_number: int
+    decision_id: str
+    campaign: str
+    change_summary: str
+    candidate_id: str
+    candidate_target: str
+    frontier_id: str
+    frontier_target: str
+    outcome: str
+    reason: str
+    primary_metric: str
+    baseline_snapshot: ExperimentSnapshotRecord
+    candidate_snapshot: ExperimentSnapshotRecord
+    incumbent_tokens_per_sec_after_decision: float | None
+    running_best_tokens_per_sec: float | None
+    running_best_experiment_number: int | None
+    benchmark_report_path: str
+    frontier_state_path: str
+    decision_path: str
+    sequential_only: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ExperimentLedgerRecord":
+        return cls(
+            experiment_number=_maybe_int(data.get("experiment_number")) or 0,
+            decision_id=_require_str(data, "decision_id"),
+            campaign=_require_str(data, "campaign"),
+            change_summary=_require_str(data, "change_summary"),
+            candidate_id=_require_str(data, "candidate_id"),
+            candidate_target=_require_str(data, "candidate_target"),
+            frontier_id=_require_str(data, "frontier_id"),
+            frontier_target=_require_str(data, "frontier_target"),
+            outcome=_require_str(data, "outcome"),
+            reason=_require_str(data, "reason"),
+            primary_metric=_require_str(data, "primary_metric"),
+            baseline_snapshot=ExperimentSnapshotRecord.from_dict(
+                _require_mapping(data.get("baseline_snapshot"), "baseline_snapshot")
+            ),
+            candidate_snapshot=ExperimentSnapshotRecord.from_dict(
+                _require_mapping(data.get("candidate_snapshot"), "candidate_snapshot")
+            ),
+            incumbent_tokens_per_sec_after_decision=_maybe_float(
+                data.get("incumbent_tokens_per_sec_after_decision")
+            ),
+            running_best_tokens_per_sec=_maybe_float(
+                data.get("running_best_tokens_per_sec")
+            ),
+            running_best_experiment_number=_maybe_int(
+                data.get("running_best_experiment_number")
+            ),
+            benchmark_report_path=_require_str(data, "benchmark_report_path"),
+            frontier_state_path=_require_str(data, "frontier_state_path"),
+            decision_path=_require_str(data, "decision_path"),
+            sequential_only=bool(data.get("sequential_only", True)),
+        )
 
     def to_dict(self) -> dict[str, JsonValue]:
         return asdict(self)
@@ -229,6 +324,35 @@ def write_json_record(path: str | Path, payload: object) -> Path:
     return destination
 
 
+def append_jsonl_record(path: str | Path, payload: object) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as handle:
+        _ = handle.write(json.dumps(_to_jsonable(payload), sort_keys=True) + "\n")
+    return destination
+
+
+def load_last_jsonl_record(path: str | Path) -> dict[str, object] | None:
+    destination = Path(path)
+    if not destination.exists():
+        return None
+
+    last_line = ""
+    with destination.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                last_line = line
+
+    if not last_line:
+        return None
+
+    payload_obj = cast(Callable[[str], object], json.loads)(last_line)
+    if not isinstance(payload_obj, dict):
+        raise ValueError("JSONL record root must be a JSON object.")
+    payload_mapping = cast(Mapping[object, object], payload_obj)
+    return {str(key): item for key, item in payload_mapping.items()}
+
+
 def _to_jsonable(value: object) -> JsonValue:
     if isinstance(
         value,
@@ -236,6 +360,8 @@ def _to_jsonable(value: object) -> JsonValue:
             BenchmarkRunRecord,
             BenchmarkComparisonRecord,
             DecisionRecord,
+            ExperimentSnapshotRecord,
+            ExperimentLedgerRecord,
             ObservationRecord,
             WorktreePlanRecord,
             MutationPlanRecord,

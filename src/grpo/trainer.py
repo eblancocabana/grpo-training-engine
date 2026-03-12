@@ -1000,6 +1000,7 @@ class GRPOTrainerLoop:
                     {
                         "loss": f"{metrics['loss']:.4f}",
                         "reward": f"{metrics['avg_reward']:.3f}",
+                        "tokens_per_sec": f"{metrics['tokens_per_sec']:.3f}",
                         "vram": vram_str,
                         "step": self.global_step,
                     }

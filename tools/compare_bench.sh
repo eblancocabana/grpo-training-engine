@@ -296,8 +296,9 @@ done
 
 run_python <<PY
 import json
-import re
 from pathlib import Path
+
+from optimizer.benchmark_log_parser import parse_benchmark_log
 
 run_meta = Path("$run_meta_path")
 output_root = Path("$output_root")
@@ -305,95 +306,6 @@ timestamp = ""
 
 if not run_meta.exists():
     raise SystemExit("No run metadata found.")
-
-step_pattern = re.compile(r"\bstep[:=]\s*([0-9]+)\b", re.IGNORECASE)
-alt_step_pattern = re.compile(r"\bStep\s+([0-9]+)\b", re.IGNORECASE)
-number_pattern = r"-?[0-9]+(?:\.[0-9]+)?(?:e[-+]?[0-9]+)?"
-loss_pattern = re.compile(rf"\bloss=({number_pattern})", re.IGNORECASE)
-reward_pattern = re.compile(rf"\breward=({number_pattern})", re.IGNORECASE)
-it_s_pattern = re.compile(r"([0-9]+(?:\.[0-9]+)?)it/s")
-s_it_pattern = re.compile(r"([0-9]+(?:\.[0-9]+)?)s/it")
-vram_postfix_pattern = re.compile(r"\bvram=([0-9]+(?:\.[0-9]+)?)GB")
-vram_log_pattern = re.compile(r"VRAM:\s*([0-9]+(?:\.[0-9]+)?)GB")
-effective_batch_pattern = re.compile(r"Effective batch size:\s*([0-9]+)")
-oom_pattern = re.compile(r"\[OOM\]|out of memory", re.IGNORECASE)
-traceback_pattern = re.compile(r"Traceback \(most recent call last\):")
-exception_pattern = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)):\s*(?P<message>.+)$")
-
-def parse_log(path: Path):
-    step_times = {}
-    step_loss = {}
-    step_reward = {}
-    vram_samples = []
-    effective_batch = None
-    oom_events = 0
-    last_step = None
-    saw_traceback = False
-    terminal_error = None
-
-    with path.open("r", encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            if oom_pattern.search(line):
-                oom_events += 1
-            if traceback_pattern.search(line):
-                saw_traceback = True
-
-            exception_match = exception_pattern.search(line.strip())
-            if exception_match:
-                terminal_error = {
-                    "type": exception_match.group("name"),
-                    "message": exception_match.group("message"),
-                }
-
-            if effective_batch is None:
-                match = effective_batch_pattern.search(line)
-                if match:
-                    effective_batch = int(match.group(1))
-
-            step_match = step_pattern.search(line) or alt_step_pattern.search(line)
-            step = int(step_match.group(1)) if step_match else None
-            if step is not None:
-                last_step = step
-
-            it_s_match = it_s_pattern.search(line)
-            s_it_match = s_it_pattern.search(line)
-            step_time_s = None
-            if s_it_match:
-                step_time_s = float(s_it_match.group(1))
-            elif it_s_match:
-                it_s = float(it_s_match.group(1))
-                if it_s > 0:
-                    step_time_s = 1.0 / it_s
-            if step is not None and step_time_s is not None:
-                step_times[step] = step_time_s
-
-            loss_match = loss_pattern.search(line)
-            if step is not None and loss_match:
-                step_loss[step] = float(loss_match.group(1))
-
-            reward_match = reward_pattern.search(line)
-            if step is not None and reward_match:
-                step_reward[step] = float(reward_match.group(1))
-
-            vram_match = vram_postfix_pattern.search(line)
-            if vram_match:
-                vram_samples.append(float(vram_match.group(1)))
-
-            vram_log_match = vram_log_pattern.search(line)
-            if vram_log_match:
-                vram_samples.append(float(vram_log_match.group(1)))
-
-    return {
-        "step_times": step_times,
-        "step_loss": step_loss,
-        "step_reward": step_reward,
-        "vram_samples": vram_samples,
-        "effective_batch": effective_batch,
-        "oom_events": oom_events,
-        "last_step": last_step,
-        "saw_traceback": saw_traceback,
-        "terminal_error": terminal_error,
-    }
 
 def classify_run(exit_code, parsed, meta):
     if exit_code == 0:
@@ -430,7 +342,7 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
     if not timestamp:
         timestamp = meta.get("timestamp", "")
     log_path = Path(meta["log_path"])
-    parsed = parse_log(log_path)
+    parsed = parse_benchmark_log(log_path)
 
     smi_samples = []
     smi_path = Path(meta.get("vram_samples_path", ""))
@@ -448,6 +360,7 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
     time_samples = [v for k, v in parsed["step_times"].items() if k > 1]
     loss_samples = [v for _, v in parsed["step_loss"].items()]
     reward_samples = [v for _, v in parsed["step_reward"].items()]
+    tokens_per_sec_samples = [v for k, v in parsed["step_tokens_per_sec"].items() if k > 1]
     vram_samples = smi_samples or parsed["vram_samples"]
 
     status, valid, failure_phase, terminal_error = classify_run(
@@ -464,6 +377,7 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
         "valid": valid,
         "steps_requested": meta["steps_requested"],
         "steps_observed": parsed["last_step"],
+        "tokens_per_sec": safe_avg(tokens_per_sec_samples),
         "time_avg_s": safe_avg(time_samples),
         "time_min_s": safe_min(time_samples),
         "time_max_s": safe_max(time_samples),
@@ -502,6 +416,7 @@ columns = [
     "error_message",
     "steps_requested",
     "steps_observed",
+    "tokens_per_sec",
     "time_avg_s",
     "time_min_s",
     "time_max_s",
