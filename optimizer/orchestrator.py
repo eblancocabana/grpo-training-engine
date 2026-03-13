@@ -15,6 +15,7 @@ from optimizer.records import (
     ExperimentSnapshotRecord,
     JsonValue,
     append_jsonl_record,
+    load_json_record,
     load_last_jsonl_record,
     utc_timestamp,
     write_json_record,
@@ -73,6 +74,63 @@ class SequentialOptimizerOrchestrator:
             allow_recovered_oom_promotion=self.allow_recovered_oom_promotion,
         )
         return self.frontier.seed(entry)
+
+    def restore_frontier(self, path: str | Path) -> FrontierTransition:
+        payload = load_json_record(path)
+        current_obj = payload.get("current")
+        if not isinstance(current_obj, dict):
+            raise ValueError(
+                "Frontier state does not contain a current frontier entry."
+            )
+        benchmark_obj = current_obj.get("benchmark")
+        if isinstance(benchmark_obj, dict):
+            benchmark = BenchmarkRunRecord.from_dict(
+                {str(key): item for key, item in benchmark_obj.items()}
+            )
+        else:
+            # Legacy format: construct benchmark from direct fields
+            tokens_per_sec = current_obj.get("tokens_per_sec")
+            vram_peak_gb = current_obj.get("vram_peak_gb")
+            if tokens_per_sec is None or vram_peak_gb is None:
+                raise ValueError(
+                    "Frontier state current entry must include either 'benchmark' or 'tokens_per_sec' and 'vram_peak_gb' fields."
+                )
+            benchmark = BenchmarkRunRecord(
+                input=target,
+                label=target,
+                commit="unknown",
+                triton_mode="auto",
+                status="ok",
+                valid=True,
+                steps_requested=5,
+                steps_observed=5,
+                tokens_per_sec=float(tokens_per_sec),
+                vram_peak_gb=float(vram_peak_gb),
+            )
+        candidate_id = current_obj.get("candidate_id")
+        target = current_obj.get("target")
+        comparability = current_obj.get("comparability")
+        if not isinstance(candidate_id, str):
+            raise ValueError("Frontier state current candidate_id must be a string.")
+        if not isinstance(target, str):
+            raise ValueError("Frontier state current target must be a string.")
+        if not isinstance(comparability, str):
+            raise ValueError("Frontier state current comparability must be a string.")
+        entry = FrontierEntry(
+            candidate_id=candidate_id,
+            target=target,
+            benchmark=benchmark,
+            comparability=comparability,
+        )
+        transition = FrontierTransition(
+            accepted=True,
+            previous_candidate_id=None,
+            current_candidate_id=entry.candidate_id,
+            reason="frontier_restored",
+        )
+        self.frontier.current = entry
+        self.frontier.history = [transition]
+        return transition
 
     def evaluate_candidate(self, candidate: CandidateSpec) -> DecisionRecord:
         if self.frontier.current is None:
