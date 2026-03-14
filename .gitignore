@@ -54,6 +54,7 @@ docs/
 *.md
 !/.gitignore
 !/README.md
+!/.opencode/skills/optimizer-ai-agent/SKILL.md
 
 # Other common Python caches
 .mypy_cache/
