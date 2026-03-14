@@ -168,3 +168,45 @@ def test_jsonl_helpers_preserve_latest_experiment_record(tmp_path: Path) -> None
     assert latest is not None
     assert latest["experiment_number"] == 2
     assert latest["change_summary"] == "second change"
+
+
+def test_experiment_ledger_record_reads_legacy_row_with_flat_fields() -> None:
+    record = ExperimentLedgerRecord.from_dict(
+        {
+            "experiment_number": 3,
+            "timestamp": "20260313T124741Z",
+            "campaign": "generation_general",
+            "candidate_id": "feat/example-candidate-legacy",
+            "change_summary": "Legacy attempt",
+            "outcome": "kept",
+            "reason": "tokens_per_sec_improved",
+            "primary_metric": "tokens_per_sec",
+            "baseline_snapshot": {
+                "target": "main",
+                "status": "oom_recovered",
+                "tokens_per_sec": 12.15,
+                "time_avg_s": 83.68,
+                "loss_avg": 0.42,
+                "reward_avg": 0.75,
+                "oom_events": 2,
+            },
+            "candidate_snapshot": {
+                "target": "feat/example-candidate-legacy",
+                "status": "oom_recovered",
+                "tokens_per_sec": 25.35,
+                "time_avg_s": 47.39,
+                "loss_avg": 0.17,
+                "reward_avg": 0.52,
+                "oom_events": 1,
+            },
+            "tokens_per_sec_delta": 13.2,
+            "tokens_per_sec_pct_change": 108.64,
+            "benchmark_report_path": "/tmp/bench.json",
+        }
+    )
+
+    assert record.timestamp == "20260313T124741Z"
+    assert record.decision_id == "20260313T124741Z"
+    assert record.baseline_snapshot.comparability == "unknown"
+    assert record.candidate_snapshot.time_avg_s == 47.39
+    assert record.tokens_per_sec_delta == 13.2

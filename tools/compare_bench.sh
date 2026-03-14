@@ -12,13 +12,13 @@ Arguments can be:
   - Worktree paths (/path/to/worktree)
 
 Options:
-  --steps N   Number of training steps (default: 5)
+  --steps N   Number of training steps (default: 10)
   --triton MODE  Triton mode: auto, on, off (default: auto)
   -h, --help  Show this help
 USAGE
 }
 
-steps=5
+steps=10
 triton_mode="auto"
 targets=()
 
