@@ -9,8 +9,9 @@ def _run(name: str, **overrides: JsonValue) -> BenchmarkRunRecord:
         "commit": "abc123",
         "status": "ok",
         "valid": True,
-        "steps_requested": 5,
-        "steps_observed": 5,
+        "steps_requested": 10,
+        "steps_observed": 10,
+        "tokens_per_sec": 10.0,
         "reward_avg": 0.4,
         "loss_avg": 0.9,
         "effective_batch": 16,
@@ -22,23 +23,23 @@ def _run(name: str, **overrides: JsonValue) -> BenchmarkRunRecord:
 
 
 def test_accepts_clean_improvement() -> None:
-    frontier = _run("frontier", reward_avg=0.4, loss_avg=0.9)
-    candidate = _run("candidate", reward_avg=0.5, loss_avg=1.1)
+    frontier = _run("frontier", tokens_per_sec=10.0)
+    candidate = _run("candidate", tokens_per_sec=12.0)
 
     decision = decide_acceptance(candidate, frontier)
 
     assert decision.accepted is True
-    assert decision.reason == "reward_improved"
+    assert decision.reason == "tokens_per_sec_improved"
     assert decision.diagnostics["authority"] == "benchmark_only"
 
 
-def test_accepts_recovered_comparable_when_reward_improves() -> None:
-    frontier = _run("frontier", reward_avg=0.4, loss_avg=0.9)
+def test_accepts_recovered_comparable_when_tokens_per_sec_improves() -> None:
+    frontier = _run("frontier", tokens_per_sec=10.0)
     candidate = _run(
         "candidate",
         status="oom_recovered",
         valid=True,
-        reward_avg=0.45,
+        tokens_per_sec=10.5,
         oom_events=1,
     )
 
@@ -49,9 +50,9 @@ def test_accepts_recovered_comparable_when_reward_improves() -> None:
 
 
 def test_rejects_effective_batch_mismatch_and_non_improvement() -> None:
-    frontier = _run("frontier", reward_avg=0.4, loss_avg=0.9)
-    mismatched = _run("candidate-a", reward_avg=0.5, effective_batch=8)
-    weaker = _run("candidate-b", reward_avg=0.39, loss_avg=0.7)
+    frontier = _run("frontier", tokens_per_sec=10.0)
+    mismatched = _run("candidate-a", tokens_per_sec=11.0, effective_batch=8)
+    weaker = _run("candidate-b", tokens_per_sec=9.9)
 
     mismatch_decision = decide_acceptance(mismatched, frontier)
     weaker_decision = decide_acceptance(weaker, frontier)
@@ -59,4 +60,4 @@ def test_rejects_effective_batch_mismatch_and_non_improvement() -> None:
     assert mismatch_decision.accepted is False
     assert mismatch_decision.reason == "effective_batch_mismatch"
     assert weaker_decision.accepted is False
-    assert weaker_decision.reason == "benchmark_not_better"
+    assert weaker_decision.reason == "tokens_per_sec_not_improved"

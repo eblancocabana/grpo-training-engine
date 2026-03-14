@@ -12,8 +12,7 @@ class AcceptanceDecision:
     reason: str
     candidate_classification: BenchmarkClassification
     frontier_classification: BenchmarkClassification
-    reward_delta: float | None
-    loss_delta: float | None
+    tokens_per_sec_delta: float | None
     diagnostics: dict[str, JsonValue] = field(default_factory=dict)
 
 
@@ -21,8 +20,7 @@ def decide_acceptance(
     candidate: BenchmarkRunRecord,
     frontier: BenchmarkRunRecord,
     *,
-    reward_tolerance: float = 1e-9,
-    loss_tolerance: float = 1e-9,
+    tokens_per_sec_tolerance: float = 1e-9,
     allow_recovered_oom_promotion: bool = True,
 ) -> AcceptanceDecision:
     candidate_classification = classify_run(
@@ -33,8 +31,7 @@ def decide_acceptance(
         frontier,
         allow_recovered_oom_promotion=allow_recovered_oom_promotion,
     )
-    reward_delta = _delta(candidate.reward_avg, frontier.reward_avg)
-    loss_delta = _delta(candidate.loss_avg, frontier.loss_avg)
+    tokens_per_sec_delta = _delta(candidate.tokens_per_sec, frontier.tokens_per_sec)
 
     diagnostics: dict[str, JsonValue] = {
         "candidate_status": candidate.status,
@@ -60,8 +57,7 @@ def decide_acceptance(
             reason="frontier_not_comparable",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
+            tokens_per_sec_delta=tokens_per_sec_delta,
             diagnostics=diagnostics,
         )
 
@@ -71,8 +67,7 @@ def decide_acceptance(
             reason="candidate_not_comparable",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
+            tokens_per_sec_delta=tokens_per_sec_delta,
             diagnostics=diagnostics,
         )
 
@@ -82,55 +77,36 @@ def decide_acceptance(
             reason="effective_batch_mismatch",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
+            tokens_per_sec_delta=tokens_per_sec_delta,
             diagnostics=diagnostics,
         )
 
-    if reward_delta is None:
+    if tokens_per_sec_delta is None:
         return AcceptanceDecision(
             accepted=False,
-            reason="reward_missing",
+            reason="tokens_per_sec_missing",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
+            tokens_per_sec_delta=tokens_per_sec_delta,
             diagnostics=diagnostics,
         )
 
-    if reward_delta > reward_tolerance:
+    if tokens_per_sec_delta > tokens_per_sec_tolerance:
         return AcceptanceDecision(
             accepted=True,
-            reason="reward_improved",
+            reason="tokens_per_sec_improved",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
-            diagnostics=diagnostics,
-        )
-
-    if (
-        abs(reward_delta) <= reward_tolerance
-        and loss_delta is not None
-        and loss_delta < -loss_tolerance
-    ):
-        return AcceptanceDecision(
-            accepted=True,
-            reason="reward_tied_loss_improved",
-            candidate_classification=candidate_classification,
-            frontier_classification=frontier_classification,
-            reward_delta=reward_delta,
-            loss_delta=loss_delta,
+            tokens_per_sec_delta=tokens_per_sec_delta,
             diagnostics=diagnostics,
         )
 
     return AcceptanceDecision(
         accepted=False,
-        reason="benchmark_not_better",
+        reason="tokens_per_sec_not_improved",
         candidate_classification=candidate_classification,
         frontier_classification=frontier_classification,
-        reward_delta=reward_delta,
-        loss_delta=loss_delta,
+        tokens_per_sec_delta=tokens_per_sec_delta,
         diagnostics=diagnostics,
     )
 

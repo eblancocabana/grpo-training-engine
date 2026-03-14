@@ -10,8 +10,9 @@ def _run(name: str, **overrides: JsonValue) -> BenchmarkRunRecord:
         "commit": "abc123",
         "status": "ok",
         "valid": True,
-        "steps_requested": 5,
-        "steps_observed": 5,
+        "steps_requested": 10,
+        "steps_observed": 10,
+        "tokens_per_sec": 10.0,
         "reward_avg": 0.4,
         "loss_avg": 0.9,
         "effective_batch": 16,
@@ -27,13 +28,13 @@ def test_frontier_promotes_on_acceptance() -> None:
         FrontierEntry.from_run(
             candidate_id="baseline",
             target="main",
-            benchmark=_run("main", reward_avg=0.4),
+            benchmark=_run("main", tokens_per_sec=10.0),
         )
     )
     current = frontier.current
     assert current is not None
 
-    candidate_run = _run("candidate", reward_avg=0.5)
+    candidate_run = _run("candidate", tokens_per_sec=12.0)
     decision = decide_acceptance(candidate_run, current.benchmark)
     transition = frontier.apply_decision(
         candidate_id="candidate-1",
@@ -45,7 +46,7 @@ def test_frontier_promotes_on_acceptance() -> None:
     assert transition.accepted is True
     assert frontier.current is not None
     assert frontier.current.candidate_id == "candidate-1"
-    assert frontier.history[-1].reason == "reward_improved"
+    assert frontier.history[-1].reason == "tokens_per_sec_improved"
 
 
 def test_frontier_holds_incumbent_on_rejection() -> None:
@@ -54,13 +55,13 @@ def test_frontier_holds_incumbent_on_rejection() -> None:
         FrontierEntry.from_run(
             candidate_id="baseline",
             target="main",
-            benchmark=_run("main", reward_avg=0.4),
+            benchmark=_run("main", tokens_per_sec=10.0),
         )
     )
     current = frontier.current
     assert current is not None
 
-    candidate_run = _run("candidate", reward_avg=0.35)
+    candidate_run = _run("candidate", tokens_per_sec=9.0)
     decision = decide_acceptance(candidate_run, current.benchmark)
     transition = frontier.apply_decision(
         candidate_id="candidate-2",

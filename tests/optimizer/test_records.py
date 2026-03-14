@@ -82,7 +82,7 @@ def test_jsonl_helpers_preserve_latest_experiment_record(tmp_path: Path) -> None
             "frontier_id": "f0",
             "frontier_target": "main",
             "outcome": "kept",
-            "reason": "reward_improved",
+            "reason": "tokens_per_sec_improved",
             "primary_metric": "tokens_per_sec",
             "baseline_snapshot": {
                 "target": "main",
@@ -126,7 +126,7 @@ def test_jsonl_helpers_preserve_latest_experiment_record(tmp_path: Path) -> None
             "frontier_id": "c1",
             "frontier_target": "feat/a",
             "outcome": "discarded",
-            "reason": "benchmark_not_better",
+            "reason": "tokens_per_sec_not_improved",
             "primary_metric": "tokens_per_sec",
             "baseline_snapshot": {
                 "target": "feat/a",

@@ -44,8 +44,8 @@ def classify_run(
         comparability = "not_comparable"
         reasons.append(f"status:{run.status}")
 
-    if run.reward_avg is None:
-        reasons.append("reward_missing")
+    if run.tokens_per_sec is None:
+        reasons.append("tokens_per_sec_missing")
         comparability = "not_comparable"
 
     if run.effective_batch is None:

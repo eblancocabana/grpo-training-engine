@@ -163,8 +163,8 @@ def reduce_attempt(
         frontier_status=frontier_run.status,
         candidate_comparability=acceptance.candidate_classification.comparability,
         frontier_comparability=acceptance.frontier_classification.comparability,
-        reward_delta=acceptance.reward_delta,
-        loss_delta=acceptance.loss_delta,
+        reward_delta=None,
+        loss_delta=None,
         benchmark_report_path=str(stored_benchmark_path),
         frontier_state_path=str(stored_frontier_state_path),
         diagnostics={
