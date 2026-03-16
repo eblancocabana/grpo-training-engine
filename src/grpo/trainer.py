@@ -517,6 +517,94 @@ class GRPOTrainerLoop:
             expanded.update(k, v, len(expanded.layers))
         return expanded
 
+    def _compute_old_log_probs_with_prompt_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        response_only_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = input_ids.shape[0]
+        group_size = self.config.grpo.group_size
+        gen_micro_batch = self._gen_micro_batch
+        prompt_width = input_ids.shape[1]
+        response_width = response_ids.shape[1]
+        num_samples = response_ids.shape[0]
+
+        all_old_log_probs = torch.zeros(
+            num_samples,
+            prompt_width + response_width - 1,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        for prompt_idx in range(batch_size):
+            single_ids = input_ids[prompt_idx : prompt_idx + 1]
+            single_mask = attention_mask[prompt_idx : prompt_idx + 1]
+
+            first_real = single_mask[0].argmax().item()
+            real_ids = single_ids[:, first_real:]
+            real_mask = single_mask[:, first_real:]
+            real_prompt_len = real_ids.shape[1]
+            prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
+
+            group_start = prompt_idx * group_size
+            group_end = group_start + group_size
+            group_response_ids = response_ids[group_start:group_end]
+            group_response_mask = response_mask[group_start:group_end]
+
+            for g_start in range(0, group_size, gen_micro_batch):
+                g_end = min(g_start + gen_micro_batch, group_size)
+                current_micro = g_end - g_start
+
+                mb_response_ids = group_response_ids[g_start:g_end]
+                mb_response_mask = group_response_mask[g_start:g_end]
+                mb_cache = self._expand_prefix_cache(prefix_cache, current_micro)
+
+                anchor_ids = real_ids[:, -1:].expand(current_micro, -1)
+                scorer_input_ids = torch.cat([anchor_ids, mb_response_ids], dim=1)
+                scorer_attention_mask = torch.cat(
+                    [
+                        torch.ones(
+                            current_micro,
+                            real_prompt_len,
+                            dtype=real_mask.dtype,
+                            device=self.device,
+                        ),
+                        mb_response_mask,
+                    ],
+                    dim=1,
+                )
+
+                outputs = self.model(
+                    input_ids=scorer_input_ids,
+                    attention_mask=scorer_attention_mask,
+                    past_key_values=mb_cache,
+                    use_cache=True,
+                )
+
+                compact_logits = outputs.logits[:, :-1, :]
+                compact_targets = mb_response_ids
+                compact_log_probs = -F.cross_entropy(
+                    compact_logits.reshape(-1, compact_logits.size(-1)),
+                    compact_targets.reshape(-1),
+                    reduction="none",
+                ).view(compact_targets.shape)
+                compact_log_probs = compact_log_probs * mb_response_mask
+
+                all_old_log_probs[
+                    group_start + g_start : group_start + g_end,
+                    prompt_width - 1 : prompt_width - 1 + response_width,
+                ] = compact_log_probs
+
+                del outputs, compact_logits, mb_cache
+
+            del prefix_cache
+            self.memory_manager.clear_cache()
+
+        return all_old_log_probs * response_only_mask[:, 1:]
+
     def training_step(self, batch: Dict) -> Dict[str, float]:
         """
         Execute one training step.
@@ -734,39 +822,13 @@ class GRPOTrainerLoop:
             self._profiler_hooks.on_phase_start("old_log_probs", step=self.global_step)
 
         with torch.no_grad():
-            gen_micro_batch = self._gen_micro_batch
-            for start_idx in range(0, num_samples, gen_micro_batch):
-                end_idx = min(start_idx + gen_micro_batch, num_samples)
-
-                batch_ids = all_input_ids[start_idx:end_idx]
-                batch_mask = all_attention_mask[start_idx:end_idx]
-
-                outputs = self.model(
-                    input_ids=batch_ids,
-                    attention_mask=batch_mask,
-                    use_cache=False,
-                )
-
-                # Logits for next-token prediction
-                logits = outputs.logits[:, :-1, :]
-                targets = batch_ids[:, 1:]
-
-                # Compute log probs for target tokens without materializing full vocab
-                token_log_probs = -F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets.reshape(-1),
-                    reduction="none",
-                ).view(targets.shape)
-                token_log_probs = (
-                    token_log_probs * response_only_mask[start_idx:end_idx, 1:]
-                )
-
-                all_old_log_probs.append(token_log_probs)
-
-                del outputs, logits
-                self.memory_manager.clear_cache()
-
-        all_old_log_probs = torch.cat(all_old_log_probs, dim=0)
+            all_old_log_probs = self._compute_old_log_probs_with_prompt_cache(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                response_ids=all_input_ids[:, prompt_len:],
+                response_mask=response_only_mask[:, prompt_len:],
+                response_only_mask=response_only_mask,
+            )
 
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_end("old_log_probs", step=self.global_step)
