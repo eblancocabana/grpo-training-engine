@@ -2,6 +2,13 @@
 
 The candidate replaces the frontier only when benchmark comparison says it is better.
 
+## Blocked Parameters
+
+The following parameters are **BLOCKED** from modification:
+
+- **group_size** - Must remain at 8. Any candidate modifying this will be rejected.
+- **entropy_mask** - Must remain at True. Any candidate disabling this will be rejected.
+
 ## Authority
 
 Use only `tools/compare_bench.sh --steps 10` output.
@@ -21,5 +28,6 @@ The candidate must be benchmark-comparable.
 1. Reject if the frontier is not comparable.
 2. Reject if the candidate is not comparable.
 3. Reject if effective batch differs.
-4. Accept if tokens/sec improves.
+4. Reject if blocked parameters were modified.
+5. Accept if tokens/sec improves.
 6. Otherwise discard the candidate.

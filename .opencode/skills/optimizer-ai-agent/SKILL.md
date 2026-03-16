@@ -45,6 +45,8 @@ Read these before acting:
 - Do not treat profiler evidence as authority.
 - Do not rewrite experiment history.
 - Do not replace benchmark authority.
+- **CRITICAL: group_size must remain at 8. Do NOT modify group_size under any circumstances.**
+- **CRITICAL: entropy_mask must remain at True (use_entropy_mask = True). Do NOT disable entropy_mask.**
 
 # Attempt markdown contract
 
