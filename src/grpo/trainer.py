@@ -38,6 +38,12 @@ from src.utils.checkpoint import CheckpointManager, save_training_config
 from src.utils.config import Config, get_8gb_vram_config
 from tools.vram_profiler.profiler_hooks import ProfilerHooks, ProfilerState
 
+# Enable TF32 for faster matrix operations on Ampere (RTX 3060 Ti)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+logger.info("[Setup] TF32 and cudnn.benchmark enabled for faster operations")
+
 try:
     import wandb
 
@@ -466,20 +472,21 @@ class GRPOTrainerLoop:
                             use_cache=True,
                         )
 
-                    for j in range(outputs.shape[0]):
-                        response_ids = outputs[j, prompt_len:]
-                        generated_texts.append(
-                            self.tokenizer.decode(
-                                response_ids, skip_special_tokens=True
-                            )
-                        )
+                    # CPU offload outputs before decoding to reduce GPU sync
+                    outputs_cpu = outputs[:, prompt_len:].detach().cpu()
+
+                    # Batch decode all responses at once for efficiency
+                    decoded_batch = self.tokenizer.batch_decode(
+                        outputs_cpu, skip_special_tokens=True
+                    )
+                    generated_texts.extend(decoded_batch)
 
                     if use_triton_kernels:
                         del outputs
                     else:
                         del outputs, mb_cache
 
-                    if (g_start // micro_batch_size) % 2 == 0:
+                    if (g_start // micro_batch_size) % 6 == 0:
                         self.memory_manager.clear_cache()
 
                 if use_triton_kernels:
