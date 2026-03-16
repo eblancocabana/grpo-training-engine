@@ -29,5 +29,13 @@ The candidate must be benchmark-comparable.
 2. Reject if the candidate is not comparable.
 3. Reject if effective batch differs.
 4. Reject if blocked parameters were modified.
-5. Accept if tokens/sec improves.
+5. Accept if step time (seconds per iteration, s/it) improves (lower is better).
 6. Otherwise discard the candidate.
+
+## Primary Metric
+
+The primary optimization metric is **step time** (seconds per iteration, s/it), not tokens/sec.
+
+- Lower step time = better performance
+- Reported as `time_avg_s` in benchmark output
+- Goal: minimize time per training step

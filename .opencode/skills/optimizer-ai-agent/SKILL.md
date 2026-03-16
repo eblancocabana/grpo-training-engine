@@ -73,4 +73,11 @@ These directories may still exist for historical reasons, but they are no longer
 
 # Success condition
 
-The loop is successful only when the benchmark promotes the candidate and the reducer updates frontier, ledger, and tokens/sec reporting accordingly.
+The loop is successful only when the benchmark promotes the candidate and the reducer updates frontier, ledger, and step time (s/it) reporting accordingly.
+
+## Primary Metric
+
+Optimize for **step time** (seconds per iteration, s/it), not tokens/sec.
+- Lower step time = better performance
+- Reported as `time_avg_s` in benchmark output
+- Goal: minimize time per training step
