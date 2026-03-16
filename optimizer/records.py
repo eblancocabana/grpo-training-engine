@@ -180,8 +180,8 @@ class ExperimentLedgerRecord:
     primary_metric: str
     baseline_snapshot: ExperimentSnapshotRecord
     candidate_snapshot: ExperimentSnapshotRecord
-    incumbent_tokens_per_sec_after_decision: float | None
-    running_best_tokens_per_sec: float | None
+    incumbent_step_time_after_decision: float | None
+    running_best_step_time: float | None
     running_best_experiment_number: int | None
     benchmark_report_path: str
     frontier_state_path: str
@@ -192,8 +192,8 @@ class ExperimentLedgerRecord:
     hypothesis: str | None = None
     worktree_path: str | None = None
     attempt_markdown_path: str | None = None
-    tokens_per_sec_delta: float | None = None
-    tokens_per_sec_pct_change: float | None = None
+    step_time_delta: float | None = None
+    step_time_pct_change: float | None = None
     sequential_only: bool = True
     generation_only: bool = True
 
@@ -232,14 +232,14 @@ class ExperimentLedgerRecord:
             frontier_target=str(frontier_target),
             outcome=str(data.get("outcome", "unknown")),
             reason=str(data.get("reason", "unknown")),
-            primary_metric=str(data.get("primary_metric", "tokens_per_sec")),
+            primary_metric=str(data.get("primary_metric", "step_time")),
             baseline_snapshot=baseline_snapshot,
             candidate_snapshot=candidate_snapshot,
-            incumbent_tokens_per_sec_after_decision=_maybe_float(
-                data.get("incumbent_tokens_per_sec_after_decision")
+            incumbent_step_time_after_decision=_maybe_float(
+                data.get("incumbent_step_time_after_decision")
             ),
-            running_best_tokens_per_sec=_maybe_float(
-                data.get("running_best_tokens_per_sec")
+            running_best_step_time=_maybe_float(
+                data.get("running_best_step_time")
             ),
             running_best_experiment_number=_maybe_int(
                 data.get("running_best_experiment_number")
@@ -253,9 +253,9 @@ class ExperimentLedgerRecord:
             hypothesis=_optional_str(data.get("hypothesis")),
             worktree_path=_optional_str(data.get("worktree_path")),
             attempt_markdown_path=_optional_str(data.get("attempt_markdown_path")),
-            tokens_per_sec_delta=_maybe_float(data.get("tokens_per_sec_delta")),
-            tokens_per_sec_pct_change=_maybe_float(
-                data.get("tokens_per_sec_pct_change")
+            step_time_delta=_maybe_float(data.get("step_time_delta")),
+            step_time_pct_change=_maybe_float(
+                data.get("step_time_pct_change")
             ),
             sequential_only=bool(data.get("sequential_only", True)),
             generation_only=bool(data.get("generation_only", True)),

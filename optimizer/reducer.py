@@ -7,7 +7,7 @@ from pathlib import Path
 
 from optimizer.evaluation.acceptance import decide_acceptance
 from optimizer.frontier import Frontier, FrontierEntry, FrontierTransition
-from optimizer.plot_tokens_per_sec import load_ledger, write_report, write_svg_plot
+from optimizer.plot_step_time import load_ledger, write_report, write_svg_plot
 from optimizer.records import (
     BenchmarkComparisonRecord,
     BenchmarkRunRecord,
@@ -191,14 +191,14 @@ def reduce_attempt(
         artifacts_dir / "experiments" / "experiment_ledger.jsonl",
         ledger_record,
     )
-    _regenerate_tokens_per_sec_report(artifacts_dir)
+    _regenerate_step_time_report(artifacts_dir)
     return {
         "decision_id": decision_id,
         "accepted": decision.accepted,
         "reason": decision.reason,
         "frontier_state_path": str(stored_frontier_state_path),
         "ledger_path": str(ledger_path),
-        "plot_path": str(artifacts_dir.parent / "reports" / "tokens_per_sec.svg"),
+        "plot_path": str(artifacts_dir.parent / "reports" / "step_time.svg"),
     }
 
 
@@ -321,14 +321,14 @@ def _build_experiment_ledger(
     ledger_path = artifacts_dir / "experiments" / "experiment_ledger.jsonl"
     last_record = load_last_jsonl_record(ledger_path)
     previous_experiment_number = 0
-    running_best_tokens_per_sec = None
+    running_best_step_time = None
     running_best_experiment_number = None
     if last_record is not None:
         previous_experiment_number = (
             _maybe_int(last_record.get("experiment_number")) or 0
         )
-        running_best_tokens_per_sec = _maybe_float(
-            last_record.get("running_best_tokens_per_sec")
+        running_best_step_time = _maybe_float(
+            last_record.get("running_best_step_time")
         )
         running_best_experiment_number = _maybe_int(
             last_record.get("running_best_experiment_number")
@@ -340,16 +340,17 @@ def _build_experiment_ledger(
     candidate_snapshot = _build_snapshot(
         decision.candidate_target, candidate_run, decision.candidate_comparability
     )
-    incumbent_tokens_per_sec_after_decision = (
-        candidate_run.tokens_per_sec
+    incumbent_step_time_after_decision = (
+        candidate_run.time_avg_s
         if decision.accepted
-        else frontier_run.tokens_per_sec
+        else frontier_run.time_avg_s
     )
-    if incumbent_tokens_per_sec_after_decision is not None and (
-        running_best_tokens_per_sec is None
-        or incumbent_tokens_per_sec_after_decision > running_best_tokens_per_sec
+    # For step time, lower is better (unlike tokens/sec where higher is better)
+    if incumbent_step_time_after_decision is not None and (
+        running_best_step_time is None
+        or incumbent_step_time_after_decision < running_best_step_time
     ):
-        running_best_tokens_per_sec = incumbent_tokens_per_sec_after_decision
+        running_best_step_time = incumbent_step_time_after_decision
         running_best_experiment_number = experiment_number
     return ExperimentLedgerRecord(
         experiment_number=experiment_number,
@@ -362,11 +363,11 @@ def _build_experiment_ledger(
         frontier_target=decision.frontier_target,
         outcome="kept" if decision.accepted else "discarded",
         reason=decision.reason,
-        primary_metric="tokens_per_sec",
+        primary_metric="step_time",
         baseline_snapshot=baseline_snapshot,
         candidate_snapshot=candidate_snapshot,
-        incumbent_tokens_per_sec_after_decision=incumbent_tokens_per_sec_after_decision,
-        running_best_tokens_per_sec=running_best_tokens_per_sec,
+        incumbent_step_time_after_decision=incumbent_step_time_after_decision,
+        running_best_step_time=running_best_step_time,
         running_best_experiment_number=running_best_experiment_number,
         benchmark_report_path=decision.benchmark_report_path,
         frontier_state_path=decision.frontier_state_path,
@@ -377,11 +378,11 @@ def _build_experiment_ledger(
         hypothesis=attempt.hypothesis,
         worktree_path=attempt.worktree_path,
         attempt_markdown_path=attempt.attempt_markdown_path,
-        tokens_per_sec_delta=_maybe_delta(
-            candidate_snapshot.tokens_per_sec, baseline_snapshot.tokens_per_sec
+        step_time_delta=_maybe_delta(
+            candidate_snapshot.time_avg_s, baseline_snapshot.time_avg_s
         ),
-        tokens_per_sec_pct_change=_percent_change(
-            candidate_snapshot.tokens_per_sec, baseline_snapshot.tokens_per_sec
+        step_time_pct_change=_percent_change(
+            candidate_snapshot.time_avg_s, baseline_snapshot.time_avg_s
         ),
         sequential_only=True,
         generation_only=True,
@@ -395,7 +396,7 @@ def _build_snapshot(
         target=target,
         status=benchmark.status,
         comparability=comparability,
-        tokens_per_sec=benchmark.tokens_per_sec,
+
         time_avg_s=benchmark.time_avg_s,
         reward_avg=benchmark.reward_avg,
         loss_avg=benchmark.loss_avg,
@@ -473,13 +474,13 @@ def _resolve_frontier_target_for_comparison(
     )
 
 
-def _regenerate_tokens_per_sec_report(artifacts_dir: Path) -> None:
+def _regenerate_step_time_report(artifacts_dir: Path) -> None:
     ledger_path = artifacts_dir / "experiments" / "experiment_ledger.jsonl"
     reports_dir = artifacts_dir.parent / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     rows = load_ledger(ledger_path)
-    svg_path = reports_dir / "tokens_per_sec.svg"
-    md_path = reports_dir / "tokens_per_sec.md"
+    svg_path = reports_dir / "step_time.svg"
+    md_path = reports_dir / "step_time.md"
     write_svg_plot(rows, svg_path)
     write_report(rows, md_path, svg_path)
 
