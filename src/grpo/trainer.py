@@ -417,6 +417,11 @@ class GRPOTrainerLoop:
                     if use_triton_kernels:
                         if TRITON_AVAILABLE:
                             try:
+                                # Ensure model is on the correct device
+                                model_device = next(self.model.parameters()).device
+                                input_ids_device = real_ids.device
+                                if model_device != input_ids_device:
+                                    self.model = self.model.to(input_ids_device)
                                 outputs = paged_kv_decode(
                                     self.model,
                                     input_ids=real_ids.expand(current_micro, -1),
@@ -1229,6 +1234,9 @@ class GRPOTrainerLoop:
         force = getattr(self.config.training, "force_initial_benchmark", False)
         skip_initial = getattr(self.config.training, "skip_initial_benchmark", False)
 
+        # Initialize run_initial
+        run_initial = True
+        
         if skip_initial:
             logger.info("[Benchmark] Initial benchmark skipped by configuration.")
             run_initial = False
@@ -1243,8 +1251,6 @@ class GRPOTrainerLoop:
                 if f.startswith("checkpoint_step_") or f.endswith(".pt"):
                     return True
             return False
-
-        run_initial = True
         if not force:
             if _has_checkpoints():
                 logger.info(
