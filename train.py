@@ -204,6 +204,11 @@ def main():
         action="store_true",
         help="Skip the initial GSM8K benchmark before training",
     )
+    parser.add_argument(
+        "--no-checkpoints",
+        action="store_true",
+        help="Disable checkpoint saving during training",
+    )
 
     args = parser.parse_args()
 
@@ -262,6 +267,10 @@ def main():
 
     # Initial benchmark configuration
     config.training.skip_initial_benchmark = args.no_initial_benchmark
+    
+    # Checkpoint configuration
+    if args.no_checkpoints:
+        config.training.checkpoint_dir = None
 
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
