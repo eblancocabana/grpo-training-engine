@@ -207,9 +207,12 @@ class GRPOTrainerLoop:
         self.group_sampler = GroupSampler(group_size=self.config.grpo.group_size)
 
         # Setup checkpoint manager
-        self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=self.config.training.checkpoint_dir
-        )
+        if self.config.training.checkpoint_dir is not None:
+            self.checkpoint_manager = CheckpointManager(
+                checkpoint_dir=self.config.training.checkpoint_dir
+            )
+        else:
+            self.checkpoint_manager = None
 
         # Initialize benchmark
         self.benchmark = GSM8KBenchmark(
@@ -1416,6 +1419,9 @@ class GRPOTrainerLoop:
 
     def save_checkpoint(self, suffix: str = ""):
         """Save training checkpoint."""
+        if self.checkpoint_manager is None:
+            return
+        
         checkpoint_name = f"checkpoint_step_{self.global_step}{suffix}.pt"
 
         self.checkpoint_manager.save_checkpoint(
@@ -1428,7 +1434,10 @@ class GRPOTrainerLoop:
         )
 
     def save_lora_weights(self, suffix: str = ""):
-        """Save only LoRA weights."""
+        """Save only LoRa weights."""
+        if self.checkpoint_manager is None:
+            return
+        
         save_path = os.path.join(
             self.config.training.output_dir, f"lora_weights{suffix}.pt"
         )
