@@ -285,8 +285,9 @@ def main():
         config.wandb.tags = ["grpo", "deepseek-r1", "8gb-vram", "python"]
     config.wandb.implementation = "python"
 
-    # Create checkpoint directory
-    os.makedirs(config.training.checkpoint_dir, exist_ok=True)
+    # Create checkpoint directory only when checkpointing is enabled.
+    if config.training.checkpoint_dir is not None:
+        os.makedirs(config.training.checkpoint_dir, exist_ok=True)
 
     # Print configuration
     logger.info("Training Configuration:")

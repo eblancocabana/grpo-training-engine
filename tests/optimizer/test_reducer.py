@@ -17,6 +17,8 @@ def _benchmark_report(frontier_target: str, candidate_target: str) -> dict[str, 
                 "commit": "abc123",
                 "status": "ok",
                 "valid": True,
+                "triton_mode": "on",
+                "triton_arg": "--use-triton",
                 "steps_requested": 10,
                 "steps_observed": 10,
                 "tokens_per_sec": 100.0,
@@ -32,6 +34,8 @@ def _benchmark_report(frontier_target: str, candidate_target: str) -> dict[str, 
                 "commit": "def456",
                 "status": "ok",
                 "valid": True,
+                "triton_mode": "on",
+                "triton_arg": "--use-triton",
                 "steps_requested": 10,
                 "steps_observed": 10,
                 "tokens_per_sec": 140.0,
@@ -43,6 +47,52 @@ def _benchmark_report(frontier_target: str, candidate_target: str) -> dict[str, 
             },
         ],
     }
+
+
+def _write_test_result(path: Path, *, passed: bool = True) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "20260331T120000Z",
+                "command": "conda run --no-capture-output -n grpo-3060ti pytest -q --ignore=optimizer/backups -m 'not performance'",
+                "passed": passed,
+                "exit_code": 0 if passed else 1,
+                "failed_count": 0 if passed else 1,
+                "passed_count": 145 if passed else 144,
+                "skipped_count": 0,
+                "xfailed_count": 2,
+                "log_path": "/tmp/pytest.log",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_generation_review(
+    path: Path,
+    *,
+    candidate_target: str,
+    verdict: str = "not_gibberish",
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "review_id": "review-1",
+                "generated_at": "20260331T120000Z",
+                "reviewer": "agent",
+                "candidate_target": candidate_target,
+                "benchmark_log_path": "/tmp/train.log",
+                "verdict": verdict,
+                "reason": "Reviewed failed generations from benchmark log.",
+                "examples_reviewed": [
+                    "text=<think>12 + 30 = 42</think> | extracted=42 | gt=40 | match=False"
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_parse_attempt_markdown_reads_minimal_contract(tmp_path: Path) -> None:
@@ -76,6 +126,8 @@ def test_reducer_updates_frontier_ledger_and_plot(tmp_path: Path) -> None:
     benchmark_dir.mkdir(parents=True)
     candidate_worktree = tmp_path / "candidate-worktree"
     candidate_worktree.mkdir(parents=True)
+    test_result_path = tmp_path / "test_result.json"
+    _write_test_result(test_result_path, passed=True)
 
     attempt = tmp_path / "attempt.md"
     attempt.write_text(
@@ -101,6 +153,7 @@ def test_reducer_updates_frontier_ledger_and_plot(tmp_path: Path) -> None:
         benchmark_report_path=report_path,
         artifacts_dir=artifacts_dir,
         allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
     )
 
     assert result["accepted"] is True
@@ -125,8 +178,11 @@ def test_reducer_updates_frontier_ledger_and_plot(tmp_path: Path) -> None:
         == "Reducing generation overhead should improve throughput."
     )
     assert ledger["change_summary"] == "tighten decode path"
+    assert ledger["primary_metric"] == "step_time"
     assert (reports_dir / "tokens_per_sec.svg").exists()
     assert (reports_dir / "tokens_per_sec.md").exists()
+    assert (reports_dir / "step_time.svg").exists()
+    assert (reports_dir / "step_time.md").exists()
 
 
 def test_reducer_rejects_non_sequential_report(tmp_path: Path) -> None:
@@ -135,6 +191,8 @@ def test_reducer_rejects_non_sequential_report(tmp_path: Path) -> None:
     benchmark_dir.mkdir(parents=True)
     candidate_worktree = tmp_path / "candidate-worktree"
     candidate_worktree.mkdir(parents=True)
+    test_result_path = tmp_path / "test_result.json"
+    _write_test_result(test_result_path, passed=True)
     attempt = tmp_path / "attempt.md"
     attempt.write_text(
         "# Optimization Attempt\n\n"
@@ -173,6 +231,7 @@ def test_reducer_rejects_non_sequential_report(tmp_path: Path) -> None:
             benchmark_report_path=report_path,
             artifacts_dir=artifacts_dir,
             allow_recovered_oom_promotion=True,
+            test_result_path=test_result_path,
         )
     except ValueError as error:
         assert "exactly one frontier and one candidate run" in str(error)
@@ -188,6 +247,8 @@ def test_reducer_sanitizes_decision_filename_for_slash_candidate_ids(
     benchmark_dir.mkdir(parents=True)
     candidate_worktree = tmp_path / "candidate-worktree"
     candidate_worktree.mkdir(parents=True)
+    test_result_path = tmp_path / "test_result.json"
+    _write_test_result(test_result_path, passed=True)
     attempt = tmp_path / "attempt.md"
     attempt.write_text(
         "# Optimization Attempt\n\n"
@@ -211,8 +272,123 @@ def test_reducer_sanitizes_decision_filename_for_slash_candidate_ids(
         benchmark_report_path=report_path,
         artifacts_dir=artifacts_dir,
         allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
     )
 
     decision_files = list((artifacts_dir / "decisions").glob("*.json"))
     assert len(decision_files) == 1
     assert decision_files[0].name.endswith("feat-example.json")
+
+
+def test_reducer_rejects_candidate_when_hard_gate_tests_fail(tmp_path: Path) -> None:
+    artifacts_dir = tmp_path / "optimizer-artifacts"
+    benchmark_dir = tmp_path / "benchmarks"
+    benchmark_dir.mkdir(parents=True)
+    candidate_worktree = tmp_path / "candidate-worktree"
+    candidate_worktree.mkdir(parents=True)
+    test_result_path = tmp_path / "test_result.json"
+    _write_test_result(test_result_path, passed=False)
+
+    attempt = tmp_path / "attempt.md"
+    attempt.write_text(
+        "# Optimization Attempt\n\n"
+        "## Frontier\n\n"
+        "- Frontier target: `main`\n"
+        "- Candidate id: `cand-1`\n"
+        f"- Candidate worktree: `{candidate_worktree}`\n\n"
+        "## Hypothesis\n\n"
+        "One hypothesis.\n\n"
+        "Change summary: one change\n",
+        encoding="utf-8",
+    )
+    report_path = benchmark_dir / "compare.json"
+    report_path.write_text(
+        json.dumps(_benchmark_report("main", str(candidate_worktree))),
+        encoding="utf-8",
+    )
+
+    result = reduce_attempt(
+        attempt_markdown_path=attempt,
+        benchmark_report_path=report_path,
+        artifacts_dir=artifacts_dir,
+        allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
+    )
+
+    assert result["accepted"] is False
+    decision_files = list((artifacts_dir / "decisions").glob("*.json"))
+    decision = cast(dict[str, object], load_json_record(decision_files[0]))
+    assert decision["reason"] == "candidate_tests_failed"
+
+
+def test_reducer_requires_generation_review_for_failed_generations(tmp_path: Path) -> None:
+    artifacts_dir = tmp_path / "optimizer-artifacts"
+    benchmark_dir = tmp_path / "benchmarks"
+    benchmark_dir.mkdir(parents=True)
+    candidate_worktree = tmp_path / "candidate-worktree"
+    candidate_worktree.mkdir(parents=True)
+    test_result_path = tmp_path / "test_result.json"
+    _write_test_result(test_result_path, passed=True)
+
+    report = _benchmark_report("main", str(candidate_worktree))
+    candidate = cast(list[object], report["runs"])[1]
+    assert isinstance(candidate, dict)
+    candidate["failed_response_count"] = 1
+    candidate["failed_response_examples"] = [
+        "text=asdfasdfasdfasdf | extracted=None | gt=42 | match=False"
+    ]
+
+    attempt = tmp_path / "attempt.md"
+    attempt.write_text(
+        "# Optimization Attempt\n\n"
+        "## Frontier\n\n"
+        "- Frontier target: `main`\n"
+        "- Candidate id: `cand-1`\n"
+        f"- Candidate worktree: `{candidate_worktree}`\n\n"
+        "## Hypothesis\n\n"
+        "One hypothesis.\n\n"
+        "Change summary: one change\n",
+        encoding="utf-8",
+    )
+    report_path = benchmark_dir / "compare.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    missing_review = reduce_attempt(
+        attempt_markdown_path=attempt,
+        benchmark_report_path=report_path,
+        artifacts_dir=artifacts_dir,
+        allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
+    )
+    assert missing_review["accepted"] is False
+
+    review_path = tmp_path / "generation_review.json"
+    _write_generation_review(
+        review_path,
+        candidate_target=str(candidate_worktree),
+        verdict="gibberish",
+    )
+    gibberish_review = reduce_attempt(
+        attempt_markdown_path=attempt,
+        benchmark_report_path=report_path,
+        artifacts_dir=tmp_path / "artifacts-gibberish",
+        allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
+        generation_review_path=review_path,
+    )
+    assert gibberish_review["accepted"] is False
+
+    _write_generation_review(
+        review_path,
+        candidate_target=str(candidate_worktree),
+        verdict="not_gibberish",
+    )
+    clean_review = reduce_attempt(
+        attempt_markdown_path=attempt,
+        benchmark_report_path=report_path,
+        artifacts_dir=tmp_path / "artifacts-clean",
+        allow_recovered_oom_promotion=True,
+        test_result_path=test_result_path,
+        generation_review_path=review_path,
+    )
+    assert clean_review["accepted"] is True

@@ -44,12 +44,20 @@ def classify_run(
         comparability = "not_comparable"
         reasons.append(f"status:{run.status}")
 
-    if run.tokens_per_sec is None:
-        reasons.append("tokens_per_sec_missing")
+    if run.time_avg_s is None:
+        reasons.append("step_time_missing")
         comparability = "not_comparable"
 
     if run.effective_batch is None:
         reasons.append("effective_batch_missing")
+        comparability = "not_comparable"
+
+    if run.triton_mode != "on":
+        reasons.append("triton_not_forced_on")
+        comparability = "not_comparable"
+
+    if run.triton_arg != "--use-triton":
+        reasons.append("triton_flag_missing")
         comparability = "not_comparable"
 
     promotable = comparability in {"clean_comparable", "recovered_comparable"}

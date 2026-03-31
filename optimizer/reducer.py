@@ -2,23 +2,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from optimizer.evaluation.acceptance import decide_acceptance
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from optimizer.evaluation.acceptance import AcceptanceDecision, decide_acceptance
+from optimizer.evaluation.benchmark_gate import classify_run
 from optimizer.frontier import Frontier, FrontierEntry, FrontierTransition
-from optimizer.plot_step_time import load_ledger, write_report, write_svg_plot
+from optimizer.plot_step_time import (
+    load_ledger,
+    write_report as write_step_time_report,
+    write_svg_plot as write_step_time_svg_plot,
+)
+from optimizer.plot_tokens_per_sec import (
+    write_report as write_tokens_per_sec_report,
+    write_svg_plot as write_tokens_per_sec_svg_plot,
+)
 from optimizer.records import (
     BenchmarkComparisonRecord,
     BenchmarkRunRecord,
     DecisionRecord,
     ExperimentLedgerRecord,
     ExperimentSnapshotRecord,
+    GenerationReviewRecord,
     JsonValue,
+    TestRunRecord,
     append_jsonl_record,
     load_benchmark_report,
+    load_generation_review_record,
     load_json_record,
     load_last_jsonl_record,
+    load_test_run_record,
     utc_timestamp,
     write_json_record,
 )
@@ -52,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         default=False,
     )
+    parser.add_argument("--test-result", type=Path, required=True)
+    parser.add_argument("--generation-review", type=Path)
     args = parser.parse_args(argv)
 
     result = reduce_attempt(
@@ -59,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         benchmark_report_path=args.benchmark_report,
         artifacts_dir=args.artifacts_dir,
         allow_recovered_oom_promotion=args.allow_recovered_oom_promotion,
+        test_result_path=args.test_result,
+        generation_review_path=args.generation_review,
     )
     print(f"decision_id={result['decision_id']}")
     print(f"accepted={result['accepted']}")
@@ -75,10 +96,14 @@ def reduce_attempt(
     benchmark_report_path: Path,
     artifacts_dir: Path,
     allow_recovered_oom_promotion: bool = True,
+    test_result_path: Path | None = None,
+    generation_review_path: Path | None = None,
 ) -> dict[str, str | bool]:
     artifacts_dir = artifacts_dir.resolve()
     attempt = parse_attempt_markdown(attempt_markdown_path)
     comparison = load_benchmark_report(benchmark_report_path)
+    test_result = _load_required_test_run(test_result_path)
+    generation_review = _load_optional_generation_review(generation_review_path)
     _enforce_sequential_report(
         comparison, attempt.frontier_target, attempt.worktree_path
     )
@@ -128,9 +153,11 @@ def reduce_attempt(
             "Failed to refresh restored frontier from current benchmark run."
         )
     candidate_run = comparison.require_run(attempt.worktree_path)
-    acceptance = decide_acceptance(
-        candidate_run,
-        frontier_run,
+    acceptance = _decide_with_hard_gates(
+        candidate_run=candidate_run,
+        frontier_run=frontier_run,
+        test_result=test_result,
+        generation_review=generation_review,
         allow_recovered_oom_promotion=allow_recovered_oom_promotion,
     )
     transition = frontier.apply_decision(
@@ -171,6 +198,10 @@ def reduce_attempt(
             **acceptance.diagnostics,
             "frontier_transition_reason": transition.reason,
             "sequential_only": True,
+            "test_result_path": str(test_result_path) if test_result_path else None,
+            "generation_review_path": (
+                str(generation_review_path) if generation_review_path else None
+            ),
         },
     )
     safe_candidate_id = attempt.candidate_id.replace("/", "-")
@@ -200,6 +231,122 @@ def reduce_attempt(
         "ledger_path": str(ledger_path),
         "plot_path": str(artifacts_dir.parent / "reports" / "step_time.svg"),
     }
+
+
+def _load_required_test_run(path: Path | None) -> TestRunRecord:
+    if path is None:
+        raise ValueError("Reducer requires a test result artifact.")
+    return load_test_run_record(path)
+
+
+def _load_optional_generation_review(
+    path: Path | None,
+) -> GenerationReviewRecord | None:
+    if path is None:
+        return None
+    return load_generation_review_record(path)
+
+
+def _decide_with_hard_gates(
+    *,
+    candidate_run: BenchmarkRunRecord,
+    frontier_run: BenchmarkRunRecord,
+    test_result: TestRunRecord,
+    generation_review: GenerationReviewRecord | None,
+    allow_recovered_oom_promotion: bool,
+) -> AcceptanceDecision:
+    benchmark_decision = decide_acceptance(
+        candidate_run,
+        frontier_run,
+        allow_recovered_oom_promotion=allow_recovered_oom_promotion,
+    )
+    diagnostics = dict(benchmark_decision.diagnostics)
+    diagnostics["test_command"] = test_result.command
+    diagnostics["test_passed"] = test_result.passed
+    diagnostics["test_exit_code"] = test_result.exit_code
+    diagnostics["test_failed_count"] = test_result.failed_count
+    diagnostics["test_xfailed_count"] = test_result.xfailed_count
+    diagnostics["test_log_path"] = test_result.log_path
+
+    candidate_classification = classify_run(
+        candidate_run,
+        allow_recovered_oom_promotion=allow_recovered_oom_promotion,
+    )
+    frontier_classification = classify_run(
+        frontier_run,
+        allow_recovered_oom_promotion=allow_recovered_oom_promotion,
+    )
+
+    if not test_result.passed:
+        return _forced_rejection(
+            reason="candidate_tests_failed",
+            candidate_run=candidate_run,
+            frontier_run=frontier_run,
+            candidate_classification=candidate_classification,
+            frontier_classification=frontier_classification,
+            diagnostics=diagnostics,
+        )
+
+    if (candidate_run.failed_response_count or 0) > 0:
+        if generation_review is None:
+            return _forced_rejection(
+                reason="candidate_generation_review_missing",
+                candidate_run=candidate_run,
+                frontier_run=frontier_run,
+                candidate_classification=candidate_classification,
+                frontier_classification=frontier_classification,
+                diagnostics=diagnostics,
+            )
+        diagnostics["generation_review_verdict"] = generation_review.verdict
+        diagnostics["generation_review_reason"] = generation_review.reason
+        diagnostics["generation_review_examples"] = generation_review.examples_reviewed
+        diagnostics["generation_review_reviewer"] = generation_review.reviewer
+        if generation_review.candidate_target != candidate_run.input:
+            return _forced_rejection(
+                reason="candidate_generation_review_target_mismatch",
+                candidate_run=candidate_run,
+                frontier_run=frontier_run,
+                candidate_classification=candidate_classification,
+                frontier_classification=frontier_classification,
+                diagnostics=diagnostics,
+            )
+        if generation_review.verdict != "not_gibberish":
+            return _forced_rejection(
+                reason="candidate_failed_generations_gibberish",
+                candidate_run=candidate_run,
+                frontier_run=frontier_run,
+                candidate_classification=candidate_classification,
+                frontier_classification=frontier_classification,
+                diagnostics=diagnostics,
+            )
+
+    return AcceptanceDecision(
+        accepted=benchmark_decision.accepted,
+        reason=benchmark_decision.reason,
+        candidate_classification=benchmark_decision.candidate_classification,
+        frontier_classification=benchmark_decision.frontier_classification,
+        step_time_delta=benchmark_decision.step_time_delta,
+        diagnostics=diagnostics,
+    )
+
+
+def _forced_rejection(
+    *,
+    reason: str,
+    candidate_run: BenchmarkRunRecord,
+    frontier_run: BenchmarkRunRecord,
+    candidate_classification,
+    frontier_classification,
+    diagnostics: dict[str, JsonValue],
+) -> AcceptanceDecision:
+    return AcceptanceDecision(
+        accepted=False,
+        reason=reason,
+        candidate_classification=candidate_classification,
+        frontier_classification=frontier_classification,
+        step_time_delta=_maybe_delta(candidate_run.time_avg_s, frontier_run.time_avg_s),
+        diagnostics=diagnostics,
+    )
 
 
 def parse_attempt_markdown(path: Path) -> AttemptRecord:
@@ -384,6 +531,23 @@ def _build_experiment_ledger(
         step_time_pct_change=_percent_change(
             candidate_snapshot.time_avg_s, baseline_snapshot.time_avg_s
         ),
+        incumbent_tokens_per_sec_after_decision=(
+            candidate_run.tokens_per_sec
+            if decision.accepted
+            else frontier_run.tokens_per_sec
+        ),
+        running_best_tokens_per_sec=_running_best_tokens_per_sec(
+            last_record=last_record,
+            accepted=decision.accepted,
+            candidate_run=candidate_run,
+            frontier_run=frontier_run,
+        ),
+        tokens_per_sec_delta=_maybe_delta(
+            candidate_snapshot.tokens_per_sec, baseline_snapshot.tokens_per_sec
+        ),
+        tokens_per_sec_pct_change=_percent_change(
+            candidate_snapshot.tokens_per_sec, baseline_snapshot.tokens_per_sec
+        ),
         sequential_only=True,
         generation_only=True,
     )
@@ -396,7 +560,7 @@ def _build_snapshot(
         target=target,
         status=benchmark.status,
         comparability=comparability,
-
+        tokens_per_sec=benchmark.tokens_per_sec,
         time_avg_s=benchmark.time_avg_s,
         reward_avg=benchmark.reward_avg,
         loss_avg=benchmark.loss_avg,
@@ -481,8 +645,12 @@ def _regenerate_step_time_report(artifacts_dir: Path) -> None:
     rows = load_ledger(ledger_path)
     svg_path = reports_dir / "step_time.svg"
     md_path = reports_dir / "step_time.md"
-    write_svg_plot(rows, svg_path)
-    write_report(rows, md_path, svg_path)
+    write_step_time_svg_plot(rows, svg_path)
+    write_step_time_report(rows, md_path, svg_path)
+    tps_svg_path = reports_dir / "tokens_per_sec.svg"
+    tps_md_path = reports_dir / "tokens_per_sec.md"
+    write_tokens_per_sec_svg_plot(rows, tps_svg_path)
+    write_tokens_per_sec_report(rows, tps_md_path, tps_svg_path)
 
 
 def _maybe_float(value: object) -> float | None:
@@ -521,6 +689,24 @@ def _percent_change(
     if candidate_value is None or baseline_value is None or baseline_value == 0:
         return None
     return ((candidate_value - baseline_value) / baseline_value) * 100.0
+
+
+def _running_best_tokens_per_sec(
+    *,
+    last_record: dict[str, object] | None,
+    accepted: bool,
+    candidate_run: BenchmarkRunRecord,
+    frontier_run: BenchmarkRunRecord,
+) -> float | None:
+    running_best = None
+    if last_record is not None:
+        running_best = _maybe_float(last_record.get("running_best_tokens_per_sec"))
+    incumbent = candidate_run.tokens_per_sec if accepted else frontier_run.tokens_per_sec
+    if incumbent is None:
+        return running_best
+    if running_best is None or incumbent > running_best:
+        return incumbent
+    return running_best
 
 
 if __name__ == "__main__":

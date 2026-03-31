@@ -271,6 +271,7 @@ def test_triton_paged_kv_decode_matches_generate() -> None:
     assert torch.equal(generated_triton, generated_reference)
 
 
+@pytest.mark.performance
 def test_triton_grpo_perf_improves_over_torch() -> None:
     _skip_if_no_cuda_or_triton()
 
@@ -391,6 +392,7 @@ def test_triton_grpo_perf_improves_over_torch() -> None:
 
 
 
+@pytest.mark.performance
 def test_triton_entropy_mask_perf_improves_over_torch() -> None:
     _skip_if_no_cuda_or_triton()
 
@@ -483,6 +485,7 @@ def test_triton_entropy_mask_perf_improves_over_torch() -> None:
 
 
 
+@pytest.mark.performance
 def test_triton_paged_kv_decode_perf_improves_over_generate() -> None:
     _skip_if_no_cuda_or_triton()
 

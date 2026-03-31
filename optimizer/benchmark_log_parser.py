@@ -22,6 +22,10 @@ traceback_pattern = re.compile(r"Traceback \(most recent call last\):")
 exception_pattern = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)):\s*(?P<message>.+)$"
 )
+failed_response_pattern = re.compile(
+    r"\[FAILED\]\s+Response\s+(?P<index>[0-9]+)\s+\(Reward:\s*(?P<reward>-?[0-9]+(?:\.[0-9]+)?)\):"
+)
+arrow_field_pattern = re.compile(r"->\s*(?P<key>[A-Za-z ]+):\s*(?P<value>.+)$")
 
 
 def parse_benchmark_log(path: Path) -> dict[str, object]:
@@ -35,9 +39,52 @@ def parse_benchmark_log(path: Path) -> dict[str, object]:
     last_step: int | None = None
     saw_traceback = False
     terminal_error: dict[str, str] | None = None
+    failed_response_examples: list[str] = []
+    current_failed_response: dict[str, str] | None = None
+
+    def flush_failed_response() -> None:
+        nonlocal current_failed_response
+        if current_failed_response is None:
+            return
+        text = current_failed_response.get("text", "")
+        extracted = current_failed_response.get("extracted", "")
+        ground_truth = current_failed_response.get("gt", "")
+        match = current_failed_response.get("match", "")
+        example = (
+            f"text={text} | extracted={extracted} | gt={ground_truth} | match={match}"
+        )
+        failed_response_examples.append(example)
+        current_failed_response = None
 
     content = path.read_text(encoding="utf-8", errors="ignore").replace("\r", "\n")
     for line in content.splitlines():
+        failed_response_match = failed_response_pattern.search(line)
+        if failed_response_match:
+            flush_failed_response()
+            current_failed_response = {
+                "index": failed_response_match.group("index"),
+                "reward": failed_response_match.group("reward"),
+            }
+            continue
+
+        arrow_field_match = arrow_field_pattern.search(line.strip())
+        if current_failed_response is not None and arrow_field_match:
+            raw_key = arrow_field_match.group("key").strip().lower().replace(" ", "_")
+            value = arrow_field_match.group("value").strip()
+            if raw_key == "text":
+                current_failed_response["text"] = value
+            elif raw_key == "extracted":
+                current_failed_response["extracted"] = value
+            elif raw_key == "gt":
+                current_failed_response["gt"] = value
+            elif raw_key == "match":
+                current_failed_response["match"] = value
+            continue
+
+        if current_failed_response is not None and line.strip().startswith("----------"):
+            flush_failed_response()
+            continue
+
         if oom_pattern.search(line):
             oom_events += 1
         if traceback_pattern.search(line):
@@ -92,6 +139,8 @@ def parse_benchmark_log(path: Path) -> dict[str, object]:
         if vram_log_match:
             vram_samples.append(float(vram_log_match.group(1)))
 
+    flush_failed_response()
+
     return {
         "step_times": step_times,
         "step_loss": step_loss,
@@ -103,4 +152,6 @@ def parse_benchmark_log(path: Path) -> dict[str, object]:
         "last_step": last_step,
         "saw_traceback": saw_traceback,
         "terminal_error": terminal_error,
+        "failed_response_count": len(failed_response_examples),
+        "failed_response_examples": failed_response_examples,
     }

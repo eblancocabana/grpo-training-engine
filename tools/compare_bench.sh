@@ -13,13 +13,13 @@ Arguments can be:
 
 Options:
   --steps N   Number of training steps (default: 10)
-  --triton MODE  Triton mode: auto, on, off (default: auto)
+  --triton MODE  Triton mode: auto, on, off (default: on)
   -h, --help  Show this help
 USAGE
 }
 
 steps=10
-triton_mode="auto"
+triton_mode="on"
 targets=()
 
 while [[ $# -gt 0 ]]; do
@@ -390,6 +390,8 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
         "failure_phase": failure_phase,
         "error_type": terminal_error["type"] if terminal_error else None,
         "error_message": terminal_error["message"] if terminal_error else None,
+        "failed_response_count": parsed["failed_response_count"],
+        "failed_response_examples": parsed["failed_response_examples"],
         "log_path": str(log_path),
     }
     runs.append(run)
@@ -426,6 +428,7 @@ columns = [
     "reward_avg",
     "effective_batch",
     "oom_events",
+    "failed_response_count",
     "log_path",
 ]
 

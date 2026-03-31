@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 
 from optimizer.evaluation.benchmark_gate import BenchmarkClassification, classify_run
@@ -12,7 +11,7 @@ class AcceptanceDecision:
     reason: str
     candidate_classification: BenchmarkClassification
     frontier_classification: BenchmarkClassification
-    tokens_per_sec_delta: float | None
+    step_time_delta: float | None
     diagnostics: dict[str, JsonValue] = field(default_factory=dict)
 
 
@@ -20,7 +19,7 @@ def decide_acceptance(
     candidate: BenchmarkRunRecord,
     frontier: BenchmarkRunRecord,
     *,
-    tokens_per_sec_tolerance: float = 1e-9,
+    step_time_tolerance: float = 1e-9,
     allow_recovered_oom_promotion: bool = True,
 ) -> AcceptanceDecision:
     candidate_classification = classify_run(
@@ -31,7 +30,7 @@ def decide_acceptance(
         frontier,
         allow_recovered_oom_promotion=allow_recovered_oom_promotion,
     )
-    tokens_per_sec_delta = _delta(candidate.tokens_per_sec, frontier.tokens_per_sec)
+    step_time_delta = _delta(candidate.time_avg_s, frontier.time_avg_s)
 
     diagnostics: dict[str, JsonValue] = {
         "candidate_status": candidate.status,
@@ -40,6 +39,18 @@ def decide_acceptance(
         "frontier_oom_events": frontier.oom_events,
         "candidate_triton_mode": candidate.triton_mode,
         "frontier_triton_mode": frontier.triton_mode,
+        "candidate_triton_arg": candidate.triton_arg,
+        "frontier_triton_arg": frontier.triton_arg,
+        "candidate_step_time_s": candidate.time_avg_s,
+        "frontier_step_time_s": frontier.time_avg_s,
+        "candidate_tokens_per_sec": candidate.tokens_per_sec,
+        "frontier_tokens_per_sec": frontier.tokens_per_sec,
+        "candidate_reward_avg": candidate.reward_avg,
+        "frontier_reward_avg": frontier.reward_avg,
+        "candidate_failed_response_count": candidate.failed_response_count,
+        "frontier_failed_response_count": frontier.failed_response_count,
+        "candidate_failed_response_examples": candidate.failed_response_examples or [],
+        "frontier_failed_response_examples": frontier.failed_response_examples or [],
         "authority": "benchmark_only",
         "allow_recovered_oom_promotion": allow_recovered_oom_promotion,
         "diagnostic_only_fields": [
@@ -48,6 +59,7 @@ def decide_acceptance(
             "oom_events",
             "vram_peak_gb",
             "time_avg_s",
+            "failed_response_examples",
         ],
     }
 
@@ -57,7 +69,7 @@ def decide_acceptance(
             reason="frontier_not_comparable",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            tokens_per_sec_delta=tokens_per_sec_delta,
+            step_time_delta=step_time_delta,
             diagnostics=diagnostics,
         )
 
@@ -67,7 +79,7 @@ def decide_acceptance(
             reason="candidate_not_comparable",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            tokens_per_sec_delta=tokens_per_sec_delta,
+            step_time_delta=step_time_delta,
             diagnostics=diagnostics,
         )
 
@@ -77,36 +89,36 @@ def decide_acceptance(
             reason="effective_batch_mismatch",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            tokens_per_sec_delta=tokens_per_sec_delta,
+            step_time_delta=step_time_delta,
             diagnostics=diagnostics,
         )
 
-    if tokens_per_sec_delta is None:
+    if step_time_delta is None:
         return AcceptanceDecision(
             accepted=False,
-            reason="tokens_per_sec_missing",
+            reason="step_time_missing",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            tokens_per_sec_delta=tokens_per_sec_delta,
+            step_time_delta=step_time_delta,
             diagnostics=diagnostics,
         )
 
-    if tokens_per_sec_delta > tokens_per_sec_tolerance:
+    if step_time_delta < -step_time_tolerance:
         return AcceptanceDecision(
             accepted=True,
-            reason="tokens_per_sec_improved",
+            reason="step_time_improved",
             candidate_classification=candidate_classification,
             frontier_classification=frontier_classification,
-            tokens_per_sec_delta=tokens_per_sec_delta,
+            step_time_delta=step_time_delta,
             diagnostics=diagnostics,
         )
 
     return AcceptanceDecision(
         accepted=False,
-        reason="tokens_per_sec_not_improved",
+        reason="step_time_not_improved",
         candidate_classification=candidate_classification,
         frontier_classification=frontier_classification,
-        tokens_per_sec_delta=tokens_per_sec_delta,
+        step_time_delta=step_time_delta,
         diagnostics=diagnostics,
     )
 

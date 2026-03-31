@@ -18,8 +18,11 @@ def _run(**overrides: JsonValue) -> BenchmarkRunRecord:
         "tokens_per_sec": 10.0,
         "reward_avg": 0.4,
         "loss_avg": 0.9,
+        "time_avg_s": 1.0,
         "effective_batch": 16,
         "oom_events": 0,
+        "triton_mode": "on",
+        "triton_arg": "--use-triton",
     }
     payload.update(overrides)
     return BenchmarkRunRecord.from_dict(payload)
@@ -62,6 +65,19 @@ def test_rejects_incomplete_or_missing_metrics() -> None:
     assert "benchmark_incomplete" in incomplete_recovered.reasons
 
 
+def test_rejects_runs_without_forced_triton_or_step_time() -> None:
+    missing_triton = classify_run(_run(triton_mode="off", triton_arg="--no-triton"))
+    missing_flag = classify_run(_run(triton_mode="on", triton_arg=None))
+    missing_step_time = classify_run(_run(time_avg_s=None))
+
+    assert missing_triton.comparability == "not_comparable"
+    assert "triton_not_forced_on" in missing_triton.reasons
+    assert missing_flag.comparability == "not_comparable"
+    assert "triton_flag_missing" in missing_flag.reasons
+    assert missing_step_time.comparability == "not_comparable"
+    assert "step_time_missing" in missing_step_time.reasons
+
+
 def test_compare_bench_script_marks_complete_recovered_oom_runs_valid() -> None:
     script = Path(__file__).resolve().parents[2] / "tools" / "compare_bench.sh"
     content = script.read_text(encoding="utf-8")
@@ -100,3 +116,25 @@ def test_parse_benchmark_log_handles_tqdm_carriage_return_updates(
         value for step, value in step_tokens.items() if step > 1
     ]
     assert sum(samples_after_warmup) / len(samples_after_warmup) == 110.0
+
+
+def test_parse_benchmark_log_extracts_failed_response_samples(tmp_path: Path) -> None:
+    log_path = tmp_path / "train.log"
+    _ = log_path.write_text(
+        (
+            "[DEBUG][grpo.grpo.trainer] [FAILED] Response 1 (Reward: 0.00):\n"
+            "[DEBUG][grpo.grpo.trainer]   -> Text: <think>2+2=5</think>\n"
+            "[DEBUG][grpo.grpo.trainer]   -> Extracted: 5\n"
+            "[DEBUG][grpo.grpo.trainer]   -> GT: 4\n"
+            "[DEBUG][grpo.grpo.trainer]   -> Match: False\n"
+            "[DEBUG][grpo.grpo.trainer] ----------\n"
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_benchmark_log(log_path)
+
+    assert parsed["failed_response_count"] == 1
+    examples = cast(list[object], parsed["failed_response_examples"])
+    assert len(examples) == 1
+    assert "text=<think>2+2=5</think>" in str(examples[0])

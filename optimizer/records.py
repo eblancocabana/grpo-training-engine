@@ -40,6 +40,8 @@ class BenchmarkRunRecord:
     log_path: str | None = None
     triton_mode: str | None = None
     triton_arg: str | None = None
+    failed_response_count: int | None = None
+    failed_response_examples: list[str] | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "BenchmarkRunRecord":
@@ -67,6 +69,10 @@ class BenchmarkRunRecord:
             log_path=_optional_str(data.get("log_path")),
             triton_mode=_optional_str(data.get("triton_mode")),
             triton_arg=_optional_str(data.get("triton_arg")),
+            failed_response_count=_maybe_int(data.get("failed_response_count")),
+            failed_response_examples=_maybe_str_list(
+                data.get("failed_response_examples")
+            ),
         )
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -134,6 +140,68 @@ class DecisionRecord:
 
 
 @dataclass(frozen=True)
+class TestRunRecord:
+    schema_version: int
+    generated_at: str
+    command: str
+    passed: bool
+    exit_code: int
+    failed_count: int
+    passed_count: int
+    skipped_count: int
+    xfailed_count: int
+    log_path: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "TestRunRecord":
+        return cls(
+            schema_version=_maybe_int(data.get("schema_version")) or 1,
+            generated_at=_require_str(data, "generated_at"),
+            command=_require_str(data, "command"),
+            passed=bool(data.get("passed", False)),
+            exit_code=_maybe_int(data.get("exit_code")) or 0,
+            failed_count=_maybe_int(data.get("failed_count")) or 0,
+            passed_count=_maybe_int(data.get("passed_count")) or 0,
+            skipped_count=_maybe_int(data.get("skipped_count")) or 0,
+            xfailed_count=_maybe_int(data.get("xfailed_count")) or 0,
+            log_path=_optional_str(data.get("log_path")),
+        )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class GenerationReviewRecord:
+    schema_version: int
+    review_id: str
+    generated_at: str
+    reviewer: str
+    candidate_target: str
+    benchmark_log_path: str | None
+    verdict: str
+    reason: str
+    examples_reviewed: list[str]
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "GenerationReviewRecord":
+        return cls(
+            schema_version=_maybe_int(data.get("schema_version")) or 1,
+            review_id=_require_str(data, "review_id"),
+            generated_at=_require_str(data, "generated_at"),
+            reviewer=_require_str(data, "reviewer"),
+            candidate_target=_require_str(data, "candidate_target"),
+            benchmark_log_path=_optional_str(data.get("benchmark_log_path")),
+            verdict=_require_str(data, "verdict"),
+            reason=_require_str(data, "reason"),
+            examples_reviewed=_maybe_str_list(data.get("examples_reviewed")) or [],
+        )
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ExperimentSnapshotRecord:
     target: str
     status: str
@@ -194,6 +262,10 @@ class ExperimentLedgerRecord:
     attempt_markdown_path: str | None = None
     step_time_delta: float | None = None
     step_time_pct_change: float | None = None
+    incumbent_tokens_per_sec_after_decision: float | None = None
+    running_best_tokens_per_sec: float | None = None
+    tokens_per_sec_delta: float | None = None
+    tokens_per_sec_pct_change: float | None = None
     sequential_only: bool = True
     generation_only: bool = True
 
@@ -257,6 +329,16 @@ class ExperimentLedgerRecord:
             step_time_pct_change=_maybe_float(
                 data.get("step_time_pct_change")
             ),
+            incumbent_tokens_per_sec_after_decision=_maybe_float(
+                data.get("incumbent_tokens_per_sec_after_decision")
+            ),
+            running_best_tokens_per_sec=_maybe_float(
+                data.get("running_best_tokens_per_sec")
+            ),
+            tokens_per_sec_delta=_maybe_float(data.get("tokens_per_sec_delta")),
+            tokens_per_sec_pct_change=_maybe_float(
+                data.get("tokens_per_sec_pct_change")
+            ),
             sequential_only=bool(data.get("sequential_only", True)),
             generation_only=bool(data.get("generation_only", True)),
         )
@@ -273,6 +355,14 @@ def load_benchmark_report(path: str | Path) -> BenchmarkComparisonRecord:
     payload_mapping = cast(Mapping[object, object], payload_obj)
     payload = {str(key): item for key, item in payload_mapping.items()}
     return BenchmarkComparisonRecord.from_dict(payload)
+
+
+def load_test_run_record(path: str | Path) -> TestRunRecord:
+    return TestRunRecord.from_dict(load_json_record(path))
+
+
+def load_generation_review_record(path: str | Path) -> GenerationReviewRecord:
+    return GenerationReviewRecord.from_dict(load_json_record(path))
 
 
 def load_json_record(path: str | Path) -> dict[str, object]:
@@ -327,6 +417,8 @@ def _to_jsonable(value: object) -> JsonValue:
             BenchmarkRunRecord,
             BenchmarkComparisonRecord,
             DecisionRecord,
+            TestRunRecord,
+            GenerationReviewRecord,
             ExperimentSnapshotRecord,
             ExperimentLedgerRecord,
         ),
@@ -398,3 +490,18 @@ def _maybe_int(value: object) -> int | None:
     if isinstance(value, str):
         return int(value)
     raise ValueError(f"Expected int-compatible value, got {type(value)!r}.")
+
+
+def _maybe_str_list(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"Expected list-compatible value, got {type(value)!r}.")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"Expected list of strings, got item of type {type(item)!r}."
+            )
+        items.append(item)
+    return items
