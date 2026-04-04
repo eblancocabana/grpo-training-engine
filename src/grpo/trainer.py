@@ -358,6 +358,113 @@ class GRPOTrainerLoop:
         del outputs
         return past_kv
 
+    def _sample_next_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample the next token using the configured generation policy."""
+        if not self.config.training.generation_do_sample:
+            return logits.argmax(dim=-1)
+
+        temperature = max(
+            float(self.config.training.generation_temperature),
+            torch.finfo(logits.dtype).eps,
+        )
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        top_p = self.config.training.generation_top_p
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            sorted_remove = cumulative_probs > top_p
+            sorted_remove[..., 0] = False
+            sorted_logits = sorted_logits.masked_fill(
+                sorted_remove, torch.finfo(sorted_logits.dtype).min
+            )
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            sampled_sorted = torch.multinomial(sorted_probs, num_samples=1)
+            return sorted_indices.gather(dim=-1, index=sampled_sorted).squeeze(-1)
+
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    def _generate_with_expanded_prefix_cache(
+        self,
+        real_ids: torch.Tensor,
+        real_mask: torch.Tensor,
+        prefix_cache,
+        current_micro: int,
+    ) -> torch.Tensor:
+        """Decode responses directly from a prefetched prompt cache."""
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = pad_token_id
+        max_new_tokens = self.config.training.max_response_length
+        prompt_len = real_ids.shape[1]
+        mb_cache = self._expand_prefix_cache(prefix_cache, current_micro)
+
+        generated_ids = torch.full(
+            (current_micro, max_new_tokens),
+            pad_token_id,
+            dtype=real_ids.dtype,
+            device=self.device,
+        )
+        current_input_ids = real_ids[:, -1:].expand(current_micro, -1)
+        current_attention_mask = torch.ones(
+            current_micro,
+            prompt_len,
+            dtype=real_mask.dtype,
+            device=self.device,
+        )
+        unfinished = torch.ones(current_micro, dtype=torch.bool, device=self.device)
+        generated_steps = 0
+        pad_tokens = torch.full(
+            (current_micro,), pad_token_id, dtype=real_ids.dtype, device=self.device
+        )
+
+        for step_idx in range(max_new_tokens):
+            outputs = self.model(
+                input_ids=current_input_ids,
+                attention_mask=current_attention_mask,
+                past_key_values=mb_cache,
+                use_cache=True,
+            )
+            next_logits = outputs.logits[:, -1, :]
+            sampled_tokens = self._sample_next_tokens(next_logits)
+            next_tokens = torch.where(unfinished, sampled_tokens, pad_tokens)
+
+            generated_ids[:, step_idx] = next_tokens
+            generated_steps = step_idx + 1
+            mb_cache = outputs.past_key_values
+            unfinished = unfinished & next_tokens.ne(eos_token_id)
+
+            del outputs, next_logits, sampled_tokens
+
+            if not unfinished.any():
+                break
+
+            current_input_ids = next_tokens.unsqueeze(1)
+            current_attention_mask = torch.cat(
+                [
+                    current_attention_mask,
+                    torch.ones(
+                        current_micro,
+                        1,
+                        dtype=real_mask.dtype,
+                        device=self.device,
+                    ),
+                ],
+                dim=1,
+            )
+
+        del mb_cache, current_input_ids, current_attention_mask, unfinished, pad_tokens
+        return generated_ids[:, :generated_steps]
+
     def generate_responses(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> List[str]:
@@ -389,12 +496,10 @@ class GRPOTrainerLoop:
         batch_size = input_ids.shape[0]
         micro_batch_size = self._gen_micro_batch
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for prompt_idx in range(batch_size):
-                single_ids = input_ids[prompt_idx : prompt_idx + 1].to(self.device)
-                single_mask = attention_mask[prompt_idx : prompt_idx + 1].to(
-                    self.device
-                )
+                single_ids = input_ids[prompt_idx : prompt_idx + 1]
+                single_mask = attention_mask[prompt_idx : prompt_idx + 1]
 
                 # Strip left-padding: only process real tokens
                 first_real = single_mask[0].argmax().item()
@@ -462,26 +567,18 @@ class GRPOTrainerLoop:
                                 use_cache=True,
                             )
                     else:
-                        # Expand prefix cache to micro-batch size (no deepcopy)
-                        mb_cache = self._expand_prefix_cache(
-                            prefix_cache, current_micro
-                        )
-
-                        outputs = self.model.generate(
-                            input_ids=real_ids.expand(current_micro, -1),
-                            attention_mask=real_mask.expand(current_micro, -1),
-                            past_key_values=mb_cache,
-                            max_new_tokens=self.config.training.max_response_length,
-                            do_sample=self.config.training.generation_do_sample,
-                            temperature=self.config.training.generation_temperature,
-                            top_p=self.config.training.generation_top_p,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=self.tokenizer.eos_token_id,
-                            use_cache=True,
+                        outputs = self._generate_with_expanded_prefix_cache(
+                            real_ids=real_ids,
+                            real_mask=real_mask,
+                            prefix_cache=prefix_cache,
+                            current_micro=current_micro,
                         )
 
                     # CPU offload outputs before decoding to reduce GPU sync
-                    outputs_cpu = outputs[:, prompt_len:].detach().cpu()
+                    if use_triton_kernels:
+                        outputs_cpu = outputs[:, prompt_len:].detach().cpu()
+                    else:
+                        outputs_cpu = outputs.detach().cpu()
 
                     # Batch decode all responses at once for efficiency
                     decoded_batch = self.tokenizer.batch_decode(
@@ -492,7 +589,7 @@ class GRPOTrainerLoop:
                     if use_triton_kernels:
                         del outputs
                     else:
-                        del outputs, mb_cache
+                        del outputs
 
                     if (g_start // micro_batch_size) % 6 == 0:
                         self.memory_manager.clear_cache()
