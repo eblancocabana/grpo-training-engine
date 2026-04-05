@@ -99,6 +99,22 @@ if TRITON_AVAILABLE:
             num_warps=8,
             num_stages=2,
         ),
+        # Additional configs for small-batch GRPO training
+        triton.Config(
+            {"BLOCK_M": 8, "BLOCK_N": 128, "BLOCK_K": 32, "BLOCK_R": 16},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32, "BLOCK_R": 32},
+            num_warps=4,
+            num_stages=3,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64, "BLOCK_R": 16},
+            num_warps=8,
+            num_stages=2,
+        ),
     ]
 
     @triton.autotune(configs=LORA_FORWARD_CONFIGS, key=["M", "N", "K", "R"])

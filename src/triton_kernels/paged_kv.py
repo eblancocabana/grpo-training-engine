@@ -333,6 +333,8 @@ def _select_block_ctx(max_context: int) -> int:
         return 32
     if max_context <= 512:
         return 64
+    if max_context <= 2048:
+        return 256
     return 128
 
 
@@ -354,12 +356,18 @@ def _select_num_warps_update(head_dim: int) -> int:
 
 def _select_num_warps_decode(block_d: int, block_ctx: int) -> int:
     tile = block_d * block_ctx
-    if tile <= 2048:
+    if tile <= 1024:
         return 2
-    return 4
+    if tile <= 4096:
+        return 4
+    return 8
 
 
 def _select_num_stages_decode(max_context: int) -> int:
+    if max_context <= 128:
+        return 3
+    if max_context <= 512:
+        return 2
     return 1
 
 

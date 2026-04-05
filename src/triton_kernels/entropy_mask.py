@@ -128,11 +128,29 @@ else:
 
 
 def _select_block_vocab(vocab_size: int) -> int:
+    # Tuned heuristics for RTX 3060 Ti
+    # Finer-grained selection for better SM occupancy with large vocabularies
     if vocab_size <= 256:
         return 256
     if vocab_size <= 512:
         return 512
-    return 1024
+    if vocab_size <= 2048:
+        return 1024
+    if vocab_size <= 8192:
+        return 2048
+    # For very large vocabularies (e.g., Qwen 1.5B ~151936), use 4096
+    return 4096
+
+
+def _select_num_warps_entropy(vocab_size: int, block_vocab: int) -> int:
+    # Tuned heuristics for RTX 3060 Ti
+    # More warps for larger vocabularies to better utilize SMs
+    if vocab_size <= 512:
+        return 4
+    if vocab_size <= 8192:
+        return 8
+    # For very large vocabularies, use 8 warps for better occupancy
+    return 8
 
 
 def _validate_inputs(
@@ -255,7 +273,7 @@ def fused_entropy_mask(
         histogram = torch.zeros(256, device=logits.device, dtype=torch.int32)
 
     block_vocab = _select_block_vocab(vocab_size)
-    num_warps = 4 if block_vocab <= 512 else 8
+    num_warps = _select_num_warps_entropy(vocab_size, block_vocab)
 
     max_entropy = float(math.log(vocab_size))
     inv_max_entropy = 255.0 / max_entropy

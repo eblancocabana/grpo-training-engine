@@ -124,12 +124,21 @@ def fused_rmsnorm(
     batch, seq_len, dim = x.shape
     x_2d = x.reshape(batch * seq_len, dim)
     y = torch.empty_like(x_2d)
-    block_d = 2 ** int((dim - 1).bit_length())
-    block_d = max(128, min(block_d, 1024))
+    
+    # Tuned heuristics for RTX 3060 Ti - optimized for Qwen 1.5B hidden_dim=1536
+    # Use 512 block size for better memory coalescing with 1536 dim
+    if dim <= 512:
+        block_d = 512
+        num_warps = 4
+    elif dim <= 1536:
+        block_d = 512
+        num_warps = 8
+    else:
+        block_d = 1024
+        num_warps = 8
+    num_stages = 1
 
     grid = (x_2d.shape[0],)
-    num_warps = 2 if dim <= 256 else 4
-    num_stages = 1
     _rmsnorm_kernel[grid](
         x_2d,
         weight,
@@ -157,12 +166,21 @@ def fused_silu_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x_2d = x.reshape(batch * seq_len, dim)
     y_2d = y.reshape(batch * seq_len, dim)
     out = torch.empty_like(x_2d)
-    block_d = 2 ** int((dim - 1).bit_length())
-    block_d = max(128, min(block_d, 1024))
+    
+    # Tuned heuristics for RTX 3060 Ti - optimized for Qwen 1.5B hidden_dim=1536
+    # Use 512 block size with 8 warps for better SM occupancy
+    if dim <= 512:
+        block_d = 512
+        num_warps = 4
+    elif dim <= 1536:
+        block_d = 512
+        num_warps = 8
+    else:
+        block_d = 1024
+        num_warps = 8
+    num_stages = 1
 
     grid = (x_2d.shape[0],)
-    num_warps = 2 if dim <= 256 else 4
-    num_stages = 1
     _silu_mul_kernel[grid](
         x_2d,
         y_2d,
