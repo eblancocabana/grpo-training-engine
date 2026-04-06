@@ -1148,12 +1148,6 @@ class GRPOTrainerLoop:
             ):
                 logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
                 break
-            if (
-                self.config.training.max_steps is not None
-                and self.global_step >= self.config.training.max_steps
-            ):
-                logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
-                break
             try:
                 metrics = self.training_step(batch)
                 epoch_metrics.append(metrics)
