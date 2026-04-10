@@ -104,6 +104,7 @@ class GRPOTrainerLoop:
         self._resume_step = None
         self._resume_epoch = None
         self._profiler_hooks: ProfilerHooks | None = None
+        self._metrics_jsonl_path: Optional[str] = None
 
     def setup(self):
         """Setup model, tokenizer, and training components."""
@@ -277,15 +278,11 @@ class GRPOTrainerLoop:
             logger.info("[WandB] Failed to initialize: %s", e)
             self._wandb_run = None
 
-    def _log_wandb_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
-        """Log metrics to WandB."""
-        if self._wandb_run is None:
-            return
-
-        if self.global_step % self.config.wandb.log_frequency != 0:
-            return
-
-        log_dict = {
+    def _build_metrics_log_dict(
+        self, metrics: Dict[str, float], prefix: str = "train"
+    ) -> Dict[str, float]:
+        """Build the canonical metrics payload shared by WandB and JSONL logs."""
+        log_dict: Dict[str, float] = {
             f"{prefix}/epoch": self.current_epoch,
         }
 
@@ -297,7 +294,10 @@ class GRPOTrainerLoop:
             log_dict["memory/vram_used_gb"] = vram_stats.get("reserved_gb", 0)
             log_dict["memory/vram_allocated_gb"] = vram_stats.get("allocated_gb", 0)
 
-        log_dict["train/learning_rate"] = self.scheduler.get_last_lr()[0]
+        if self.scheduler is not None:
+            log_dict["train/learning_rate"] = self.scheduler.get_last_lr()[0]
+        else:
+            log_dict["train/learning_rate"] = self.config.training.learning_rate
         log_dict["train/gen_micro_batch"] = self._gen_micro_batch
         log_dict["train/train_micro_batch"] = self._train_micro_batch
         log_dict["train/oom_backoff_count"] = self._oom_backoff_count
@@ -305,6 +305,53 @@ class GRPOTrainerLoop:
         if self._step_start_time:
             step_time = time.time() - self._step_start_time
             log_dict["perf/step_time_s"] = step_time
+
+        return log_dict
+
+    def _resolve_metrics_jsonl_path(self) -> Optional[str]:
+        if not getattr(self.config.training, "log_metrics_jsonl", False):
+            return None
+
+        if self.config.training.metrics_jsonl_path:
+            return self.config.training.metrics_jsonl_path
+
+        return os.path.join(self.config.training.output_dir, "metrics.jsonl")
+
+    def _prepare_metrics_jsonl(self):
+        self._metrics_jsonl_path = self._resolve_metrics_jsonl_path()
+        if self._metrics_jsonl_path is None:
+            return
+
+        metrics_dir = os.path.dirname(self._metrics_jsonl_path)
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
+        with open(self._metrics_jsonl_path, "w", encoding="utf-8"):
+            pass
+
+    def _append_metrics_jsonl_entry(self, event: str, payload: Dict[str, Any]):
+        if self._metrics_jsonl_path is None:
+            return
+
+        entry = {
+            "event": event,
+            "step": self.global_step,
+            "epoch": self.current_epoch,
+            "timestamp": time.time(),
+            **payload,
+        }
+        with open(self._metrics_jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    def _log_wandb_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
+        """Log metrics to WandB and optional local JSONL."""
+        log_dict = self._build_metrics_log_dict(metrics, prefix=prefix)
+        self._append_metrics_jsonl_entry("train_metrics", log_dict)
+
+        if self._wandb_run is None:
+            return
+
+        if self.global_step % self.config.wandb.log_frequency != 0:
+            return
 
         wandb.log(log_dict, step=self.global_step)
 
@@ -1106,9 +1153,14 @@ class GRPOTrainerLoop:
         """
         return self.train_epoch_with_skip(dataloader, epoch, skip_steps=0)
 
+    def _max_steps_reached(self) -> bool:
+        max_steps = self.config.training.max_steps
+        return max_steps is not None and self.global_step >= max_steps
+
     def train_epoch_with_skip(self, dataloader, epoch: int, skip_steps: int = 0):
         self.model.train()
         epoch_metrics = []
+        reached_max_steps = False
 
         dataloader_iter = iter(dataloader)
         total_steps = len(dataloader)
@@ -1142,11 +1194,9 @@ class GRPOTrainerLoop:
                         epoch + 1,
                     )
                 continue
-            if (
-                self.config.training.max_steps is not None
-                and self.global_step >= self.config.training.max_steps
-            ):
+            if self._max_steps_reached():
                 logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
+                reached_max_steps = True
                 break
             try:
                 metrics = self.training_step(batch)
@@ -1231,7 +1281,7 @@ class GRPOTrainerLoop:
                 "\n[Epoch %s] No steps completed; skipping summary.",
                 epoch + 1,
             )
-            return
+            return reached_max_steps
 
         avg_loss = sum(m["loss"] for m in epoch_metrics) / len(epoch_metrics)
         avg_reward = sum(m["avg_reward"] for m in epoch_metrics) / len(epoch_metrics)
@@ -1240,19 +1290,24 @@ class GRPOTrainerLoop:
             f"\n[Epoch {epoch + 1}] Avg Loss: {avg_loss:.4f}, Avg Reward: {avg_reward:.3f}"
         )
 
+        epoch_summary = {
+            "epoch/loss": avg_loss,
+            "epoch/avg_reward": avg_reward,
+            "epoch/steps": len(epoch_metrics),
+        }
+        if epoch_metrics:
+            for key in epoch_metrics[0].keys():
+                if key not in ["loss", "avg_reward"]:
+                    epoch_summary[f"epoch/{key}"] = sum(
+                        m.get(key, 0) for m in epoch_metrics
+                    ) / len(epoch_metrics)
+
+        self._append_metrics_jsonl_entry("epoch_summary", epoch_summary)
+
         if self._wandb_run is not None:
-            epoch_summary = {
-                "epoch/loss": avg_loss,
-                "epoch/avg_reward": avg_reward,
-                "epoch/steps": len(epoch_metrics),
-            }
-            if epoch_metrics:
-                for key in epoch_metrics[0].keys():
-                    if key not in ["loss", "avg_reward"]:
-                        epoch_summary[f"epoch/{key}"] = sum(
-                            m.get(key, 0) for m in epoch_metrics
-                        ) / len(epoch_metrics)
             wandb.log(epoch_summary, step=self.global_step)
+
+        return reached_max_steps
 
     def train(self, num_epochs: Optional[int] = None, sent_stage: int = 1):
         """
@@ -1319,6 +1374,21 @@ class GRPOTrainerLoop:
         os.makedirs(self.config.training.output_dir, exist_ok=True)
         save_training_config(
             self.config, os.path.join(self.config.training.output_dir, "config.json")
+        )
+        self._prepare_metrics_jsonl()
+        self._append_metrics_jsonl_entry(
+            "run_info",
+            {
+                "effective_batch": (
+                    self.config.training.batch_size
+                    * self.config.training.gradient_accumulation_steps
+                ),
+                "group_size": self.config.grpo.group_size,
+                "max_steps": self.config.training.max_steps,
+                "steps_per_epoch": len(dataloader),
+                "output_dir": self.config.training.output_dir,
+                "use_triton": self.config.training.use_triton_kernels,
+            },
         )
 
         # Run initial benchmark once per model/config (sentinel)
@@ -1453,6 +1523,12 @@ class GRPOTrainerLoop:
             self._profiler_hooks.on_training_start(self.global_step, self.current_epoch)
 
         for epoch in range(resume_epoch, num_epochs):
+            if self._max_steps_reached():
+                logger.info(
+                    "[Train] Reached max steps (%d); stopping training loop.",
+                    self.global_step,
+                )
+                break
             self.current_epoch = epoch
             epoch_skip = resume_skip_steps if epoch == resume_epoch else 0
             if self._profiler_hooks:
@@ -1465,10 +1541,19 @@ class GRPOTrainerLoop:
                         "num_stages": self.config.sent.curriculum_stages,
                     },
                 )
-            self.train_epoch_with_skip(dataloader, epoch, skip_steps=epoch_skip)
+            should_stop_training = self.train_epoch_with_skip(
+                dataloader, epoch, skip_steps=epoch_skip
+            )
 
             # Save epoch checkpoint
             self.save_checkpoint(suffix=f"_epoch_{epoch + 1}")
+
+            if should_stop_training:
+                logger.info(
+                    "[Train] Reached max steps (%d); stopping training loop.",
+                    self.global_step,
+                )
+                break
 
         logger.info("\n[Train] Training complete!")
 
@@ -1604,6 +1689,17 @@ def main():
         action="store_true",
         help="Force running the initial benchmark even if sentinel/checkpoints exist",
     )
+    parser.add_argument(
+        "--log-metrics-jsonl",
+        action="store_true",
+        help="Write structured training metrics to JSONL",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=str,
+        default=None,
+        help="Custom JSONL metrics path; defaults to output_dir/metrics.jsonl when enabled",
+    )
 
     args = parser.parse_args()
 
@@ -1639,6 +1735,8 @@ def main():
         config.training.output_dir = args.output_dir
         config.training.checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
         config.training.log_dir = os.path.join(args.output_dir, "logs")
+    config.training.log_metrics_jsonl = args.log_metrics_jsonl
+    config.training.metrics_jsonl_path = args.metrics_path
 
     # Force initial benchmark via CLI flag
     if getattr(args, "force_initial_benchmark", None) is not None:
@@ -1661,6 +1759,13 @@ def main():
     logger.info("LoRA Rank: %s", config.lora.rank)
     logger.info("Learning Rate: %s", config.training.learning_rate)
     logger.info("Output Dir: %s", config.training.output_dir)
+    logger.info("Metrics JSONL: %s", config.training.log_metrics_jsonl)
+    if config.training.log_metrics_jsonl:
+        logger.info(
+            "Metrics Path: %s",
+            config.training.metrics_jsonl_path
+            or os.path.join(config.training.output_dir, "metrics.jsonl"),
+        )
     logger.info("=" * 60 + "\n")
 
     # Create trainer

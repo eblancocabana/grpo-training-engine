@@ -154,6 +154,8 @@ class TrainingConfig:
     save_interval: int = 500
 
     profile_enabled: bool = False
+    log_metrics_jsonl: bool = False
+    metrics_jsonl_path: Optional[str] = None
 
     # Generation
     generation_temperature: float = 0.7

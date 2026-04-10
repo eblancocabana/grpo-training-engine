@@ -9,6 +9,9 @@ import sys
 import torch
 import argparse
 import logging
+import random
+
+import numpy as np
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -87,6 +90,18 @@ def main():
         "--learning-rate", type=float, default=1e-4, help="Learning rate"
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Prompt batch size before GRPO group expansion",
+    )
+    parser.add_argument(
+        "--clip-epsilon",
+        type=float,
+        default=None,
+        help="Lower PPO/GRPO clip bound epsilon (default: config value)",
+    )
+    parser.add_argument(
         "--use-entropy-mask",
         action="store_true",
         default=True,
@@ -157,6 +172,17 @@ def main():
         help="Stop training after this many steps",
     )
     parser.add_argument(
+        "--log-metrics-jsonl",
+        action="store_true",
+        help="Write structured training metrics to JSONL",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=str,
+        default=None,
+        help="Custom JSONL metrics path; defaults to output_dir/metrics.jsonl when enabled",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Test setup without training"
     )
     parser.add_argument(
@@ -200,6 +226,47 @@ def main():
         help="Enable live profiler server + Tier 1 hooks",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature used during GRPO generation",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p nucleus sampling threshold used during GRPO generation",
+    )
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Disable sampling and use greedy decoding during GRPO generation",
+    )
+    parser.add_argument(
+        "--entropy-percentile",
+        type=float,
+        default=None,
+        help="Fraction of highest-entropy tokens to keep when entropy masking is enabled",
+    )
+    parser.add_argument(
+        "--entropy-min-tokens",
+        type=int,
+        default=None,
+        help="Minimum masked-in tokens per sequence for entropy masking",
+    )
+    parser.add_argument(
+        "--length-penalty-coef",
+        type=float,
+        default=None,
+        help="Penalty applied per generated token before GRPO advantage calculation",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Global random seed for Python, NumPy, and PyTorch",
+    )
+    parser.add_argument(
         "--no-initial-benchmark",
         action="store_true",
         help="Skip the initial GSM8K benchmark before training",
@@ -233,6 +300,14 @@ def main():
     if not check_system():
         sys.exit(1)
 
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logger.info("Global seed set to %s", args.seed)
+
     # Get optimized config for 8GB VRAM
     logger.info("Loading 8GB VRAM optimized configuration...")
     config = get_8gb_vram_config()
@@ -243,6 +318,8 @@ def main():
     config.training.checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
     config.training.log_dir = os.path.join(args.output_dir, "logs")
     config.grpo.group_size = args.group_size
+    if args.batch_size is not None:
+        config.training.batch_size = args.batch_size
     config.lora.rank = args.lora_rank
     config.lora.adapter_quantization = args.lora_adapter_quant
     config.training.learning_rate = args.learning_rate
@@ -252,18 +329,34 @@ def main():
     config.training.use_triton_kernels = args.use_triton and not args.no_triton
     config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
     config.training.profile_enabled = args.profile
+    if args.clip_epsilon is not None:
+        config.grpo.clip_epsilon = args.clip_epsilon
 
     if args.epsilon_high is not None:
         config.grpo.epsilon_high = args.epsilon_high
     if args.delta is not None:
         config.grpo.delta = args.delta
+    if args.length_penalty_coef is not None:
+        config.grpo.length_penalty_coef = args.length_penalty_coef
     if args.no_mask_truncated:
         config.grpo.mask_truncated_completions = False
     if args.gradient_accumulation_steps is not None:
         config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.temperature is not None:
+        config.training.generation_temperature = args.temperature
+    if args.top_p is not None:
+        config.training.generation_top_p = args.top_p
+    if args.greedy:
+        config.training.generation_do_sample = False
+    if args.entropy_percentile is not None:
+        config.entropy.percentile = args.entropy_percentile
+    if args.entropy_min_tokens is not None:
+        config.entropy.min_tokens = args.entropy_min_tokens
 
     if args.max_steps is not None:
         config.training.max_steps = args.max_steps
+    config.training.log_metrics_jsonl = args.log_metrics_jsonl
+    config.training.metrics_jsonl_path = args.metrics_path
 
     # Initial benchmark configuration
     config.training.skip_initial_benchmark = args.no_initial_benchmark
@@ -295,9 +388,11 @@ def main():
     logger.info("  LoRA Rank: %s", config.lora.rank)
     logger.info("  LoRA Alpha: %s", config.lora.alpha)
     logger.info("  Group Size: %s", config.grpo.group_size)
+    logger.info("  Batch Size: %s", config.training.batch_size)
     logger.info("  Clip Epsilon: %s", config.grpo.clip_epsilon)
     logger.info("  Epsilon High: %s", config.grpo.epsilon_high)
     logger.info("  Delta (safety cap): %s", config.grpo.delta)
+    logger.info("  Length Penalty Coef: %s", config.grpo.length_penalty_coef)
     logger.info("  Mask Truncated: %s", config.grpo.mask_truncated_completions)
     logger.info("  Learning Rate: %s", config.training.learning_rate)
     logger.info("  Epochs: %s", config.training.num_epochs)
@@ -305,12 +400,23 @@ def main():
         "  Gradient Accumulation: %s", config.training.gradient_accumulation_steps
     )
     logger.info("  Entropy Mask: %s", config.entropy.use_entropy_mask)
+    logger.info("  Entropy Percentile: %s", config.entropy.percentile)
+    logger.info("  Entropy Min Tokens: %s", config.entropy.min_tokens)
     logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
     logger.info("  Max Prompt Length: %s", config.training.max_prompt_length)
     logger.info("  Max Response Length: %s", config.training.max_response_length)
+    logger.info("  Generation Temperature: %s", config.training.generation_temperature)
+    logger.info("  Generation Top-p: %s", config.training.generation_top_p)
+    logger.info("  Generation Do Sample: %s", config.training.generation_do_sample)
     logger.info("  Output Directory: %s", config.training.output_dir)
     logger.info("  WandB Enabled: %s", config.wandb.enabled)
     logger.info("  Profiler Enabled: %s", config.training.profile_enabled)
+    logger.info("  Metrics JSONL: %s", config.training.log_metrics_jsonl)
+    if config.training.log_metrics_jsonl:
+        logger.info(
+            "  Metrics Path: %s",
+            config.training.metrics_jsonl_path or os.path.join(args.output_dir, "metrics.jsonl"),
+        )
     if config.wandb.enabled:
         logger.info("  WandB Project: %s", config.wandb.project)
         logger.info("  WandB Implementation: %s", config.wandb.implementation)
