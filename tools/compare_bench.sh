@@ -214,30 +214,43 @@ run_training() {
   local log_path="$logs_dir/${run_id}.log"
   local run_output_dir="$output_root/run_${run_id}"
   local vram_samples_path="$output_root/vram_${run_id}.txt"
+  local metrics_path="$output_root/metrics_${run_id}.jsonl"
   local exit_code_path="$output_root/exit_${run_id}.txt"
 
   local start_ts
   start_ts="$(date +%s)"
 
-  rm -f "$vram_samples_path" "$exit_code_path"
+  rm -f "$vram_samples_path" "$metrics_path" "$exit_code_path"
   current_exit_code_path="$exit_code_path"
 
   # Create baseline benchmark marker to skip initial benchmark
   mkdir -p "$run_output_dir"
   echo '{"model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "skipped": true}' > "$run_output_dir/baseline_benchmark_done.json"
 
+  local -a train_args=(
+    "$workdir/train.py"
+    "--no-wandb"
+    "--epochs" "1"
+    "--max-steps" "$steps"
+    "--output-dir" "$run_output_dir"
+  )
+  if [[ -n "$no_checkpoint_arg" ]]; then
+    train_args+=("$no_checkpoint_arg")
+  fi
+  if [[ -n "$no_initial_benchmark_arg" ]]; then
+    train_args+=("$no_initial_benchmark_arg")
+  fi
+  if [[ -n "$triton_arg" ]]; then
+    train_args+=("$triton_arg")
+  fi
+  if [[ "$help_output" == *"--log-metrics-jsonl"* ]]; then
+    train_args+=("--log-metrics-jsonl" "--metrics-path" "$metrics_path")
+  fi
+
   (
     cd "$workdir"
     WANDB_DISABLED=true \
-      run_python "$workdir/train.py" \
-      --no-wandb \
-      $no_checkpoint_arg \
-      $no_initial_benchmark_arg \
-      $triton_arg \
-      --epochs 1 \
-      --max-steps "$steps" \
-      --output-dir "$run_output_dir" \
-      > "$log_path" 2>&1
+      run_python "${train_args[@]}" > "$log_path" 2>&1
     echo $? > "$exit_code_path"
   ) &
   local train_pid=$!
@@ -286,7 +299,7 @@ run_training() {
   fi
 
   cat <<EOF >>"$run_meta_path"
-{"input":"$target","label":"$label","commit":"$commit","log_path":"$log_path","exit_code":$exit_code,"start_ts":$start_ts,"end_ts":$end_ts,"steps_requested":$steps,"timestamp":"$timestamp","vram_samples_path":"$vram_samples_path","run_origin":"isolated_worktree","triton_mode":"$triton_mode","triton_arg":"$triton_arg"}
+{"input":"$target","label":"$label","commit":"$commit","log_path":"$log_path","metrics_path":"$metrics_path","exit_code":$exit_code,"start_ts":$start_ts,"end_ts":$end_ts,"steps_requested":$steps,"timestamp":"$timestamp","vram_samples_path":"$vram_samples_path","run_origin":"isolated_worktree","triton_mode":"$triton_mode","triton_arg":"$triton_arg"}
 EOF
 }
 
@@ -342,7 +355,9 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
     if not timestamp:
         timestamp = meta.get("timestamp", "")
     log_path = Path(meta["log_path"])
-    parsed = parse_benchmark_log(log_path)
+    metrics_path_value = meta.get("metrics_path")
+    metrics_path = Path(metrics_path_value) if metrics_path_value else None
+    parsed = parse_benchmark_log(log_path, metrics_path=metrics_path)
 
     smi_samples = []
     smi_path = Path(meta.get("vram_samples_path", ""))
@@ -393,6 +408,7 @@ for line in run_meta.read_text(encoding="utf-8").splitlines():
         "failed_response_count": parsed["failed_response_count"],
         "failed_response_examples": parsed["failed_response_examples"],
         "log_path": str(log_path),
+        "metrics_path": str(metrics_path) if metrics_path is not None else None,
     }
     runs.append(run)
 
@@ -429,6 +445,7 @@ columns = [
     "effective_batch",
     "oom_events",
     "failed_response_count",
+    "metrics_path",
     "log_path",
 ]
 

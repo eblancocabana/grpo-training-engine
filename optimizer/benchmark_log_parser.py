@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -28,7 +29,9 @@ failed_response_pattern = re.compile(
 arrow_field_pattern = re.compile(r"->\s*(?P<key>[A-Za-z ]+):\s*(?P<value>.+)$")
 
 
-def parse_benchmark_log(path: Path) -> dict[str, object]:
+def parse_benchmark_log(
+    path: Path, metrics_path: Path | None = None
+) -> dict[str, object]:
     step_times: dict[int, float] = {}
     step_loss: dict[int, float] = {}
     step_reward: dict[int, float] = {}
@@ -140,6 +143,51 @@ def parse_benchmark_log(path: Path) -> dict[str, object]:
             vram_samples.append(float(vram_log_match.group(1)))
 
     flush_failed_response()
+
+    if metrics_path is not None and metrics_path.is_file():
+        for raw_line in metrics_path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                entry = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+
+            event = entry.get("event")
+            if event == "run_info":
+                raw_effective_batch = entry.get("effective_batch")
+                if isinstance(raw_effective_batch, int):
+                    effective_batch = raw_effective_batch
+                continue
+
+            if event != "train_metrics":
+                continue
+
+            raw_step = entry.get("step")
+            if not isinstance(raw_step, int):
+                continue
+
+            last_step = raw_step if last_step is None else max(last_step, raw_step)
+
+            raw_step_time = entry.get("perf/step_time_s")
+            if isinstance(raw_step_time, (int, float)):
+                step_times[raw_step] = float(raw_step_time)
+
+            raw_loss = entry.get("train/loss")
+            if isinstance(raw_loss, (int, float)):
+                step_loss[raw_step] = float(raw_loss)
+
+            raw_reward = entry.get("train/avg_reward")
+            if isinstance(raw_reward, (int, float)):
+                step_reward[raw_step] = float(raw_reward)
+
+            raw_tokens_per_sec = entry.get("train/tokens_per_sec")
+            if isinstance(raw_tokens_per_sec, (int, float)):
+                step_tokens_per_sec[raw_step] = float(raw_tokens_per_sec)
+
+            raw_vram = entry.get("memory/vram_used_gb")
+            if isinstance(raw_vram, (int, float)):
+                vram_samples.append(float(raw_vram))
 
     return {
         "step_times": step_times,
