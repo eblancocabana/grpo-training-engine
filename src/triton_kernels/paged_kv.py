@@ -417,10 +417,19 @@ def _validate_inputs(
     if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
         raise ValueError("k_cache/v_cache must be bfloat16.")
 
-    num_blocks, num_heads, block_size, head_dim = k_cache.shape
+    num_blocks, num_kv_heads, block_size, head_dim = k_cache.shape
     max_blocks = block_tables.shape[1]
     max_context = max_blocks * block_size
-    return num_heads, block_size, head_dim, max_context
+    if torch.any(context_lens < 0):
+        raise ValueError("context_lens must be non-negative.")
+    if torch.any(context_lens >= max_context):
+        raise ValueError("context_lens exceed block table capacity.")
+    if block_tables.numel() > 0:
+        if torch.any(block_tables < 0):
+            raise ValueError("block_tables entries must be non-negative.")
+        if torch.any(block_tables >= num_blocks):
+            raise ValueError("block_tables entries exceed cache capacity.")
+    return num_kv_heads, block_size, head_dim, max_context
 
 
 def _apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -612,7 +621,11 @@ def paged_kv_decode_model(
         raise ImportError("Triton is not available for paged_kv_decode.")
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
-
+    if do_sample:
+        raise ValueError(
+            "paged_kv_decode_model sampling is not production-safe yet; "
+            "use do_sample=False or fall back to model.generate()."
+        )
     (
         embeddings,
         layers,
@@ -630,29 +643,37 @@ def paged_kv_decode_model(
     prompt_len = input_ids.shape[1]
     if prompt_len == 0:
         raise ValueError("input_ids must have at least 1 token.")
+    prompt_lens = attention_mask.sum(dim=1).to(dtype=torch.int32)
+    if torch.any(prompt_lens <= 0):
+        raise ValueError("Each prompt must contain at least one unmasked token.")
+    max_prompt_len = int(prompt_lens.max().item())
 
-    max_context_needed = max(prompt_len - 1 + max_new_tokens + 1, 1)
+    max_context_needed = max(max_prompt_len - 1 + max_new_tokens + 1, 1)
     max_blocks = math.ceil(max_context_needed / block_size)
+    total_blocks = batch_size * max_blocks
+
+    if num_heads != num_kv_heads:
+        raise ValueError(
+            "paged_kv_decode currently supports only models with num_heads == num_kv_heads. "
+            f"Got num_heads={num_heads}, num_kv_heads={num_kv_heads}."
+        )
 
     k_cache = torch.zeros(
-        (num_layers, max_blocks, num_heads, block_size, head_dim),
+        (num_layers, total_blocks, num_heads, block_size, head_dim),
         device=input_ids.device,
         dtype=torch.bfloat16,
     )
     v_cache = torch.zeros_like(k_cache)
-    block_tables = torch.arange(
+    block_offsets = (
+        torch.arange(batch_size, device=input_ids.device, dtype=torch.int32) * max_blocks
+    ).unsqueeze(1)
+    block_tables = block_offsets + torch.arange(
         max_blocks, device=input_ids.device, dtype=torch.int32
     ).unsqueeze(0)
-    block_tables = block_tables.repeat(batch_size, 1)
 
-    context_lens = torch.full(
-        (batch_size,),
-        prompt_len - 1,
-        device=input_ids.device,
-        dtype=torch.int32,
-    )
+    context_lens = torch.clamp(prompt_lens - 1, min=0)
 
-    if prompt_len > 1:
+    if max_prompt_len > 1:
         prefill_ids = input_ids[:, :-1]
         prefill_mask = attention_mask[:, :-1]
         _prefill_paged_cache(
@@ -678,7 +699,12 @@ def paged_kv_decode_model(
         generator = torch.Generator(device=input_ids.device)
         generator.manual_seed(seed)
 
-    last_tokens = input_ids[:, -1]
+    last_token_positions = (
+        attention_mask.shape[1]
+        - 1
+        - attention_mask.flip(dims=(1,)).to(dtype=torch.int64).argmax(dim=1)
+    )
+    last_tokens = input_ids.gather(1, last_token_positions.unsqueeze(1)).squeeze(1)
     finished = torch.zeros(batch_size, device=input_ids.device, dtype=torch.bool)
 
     block_ctx = _select_block_ctx(max_context_needed)
@@ -690,8 +716,6 @@ def paged_kv_decode_model(
 
     update_kernel = cast(_TritonKernel, _paged_kv_update_kernel)
     decode_kernel = cast(_TritonKernel, _paged_attention_decode_kernel)
-    repeats = num_heads // num_kv_heads
-
     use_cuda_graph = False
     graph = None
 
@@ -728,9 +752,8 @@ def paged_kv_decode_model(
                 num_kv_heads,
                 head_dim,
             )
-            k_states = repeat_kv(k_states, repeats)
-            v_states = repeat_kv(v_states, repeats)
-
+            k_states = repeat_kv(k_states, num_heads // num_kv_heads)
+            v_states = repeat_kv(v_states, num_heads // num_kv_heads)
             q = q_states[:, :, 0, :].to(dtype=torch.bfloat16)
             k_new = k_states[:, :, 0, :].to(dtype=torch.bfloat16)
             v_new = v_states[:, :, 0, :].to(dtype=torch.bfloat16)
@@ -868,7 +891,11 @@ def paged_kv_decode(
         raise ImportError("Triton is not available for paged_kv_decode.")
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
-
+    if do_sample:
+        raise ValueError(
+            "paged_kv_decode sampling is not production-safe yet; "
+            "use do_sample=False."
+        )
     update_kernel = cast(_TritonKernel, _paged_kv_update_kernel)
     decode_kernel = cast(_TritonKernel, _paged_attention_decode_kernel)
 
@@ -878,6 +905,8 @@ def paged_kv_decode(
 
     if context_lens.max().item() >= max_context:
         raise ValueError("context_lens exceed block table capacity.")
+    if torch.any(context_lens + max_new_tokens > max_context):
+        raise ValueError("Requested decode exceeds block table capacity.")
 
     if eos_token_id is None:
         eos_token_id = -1
@@ -983,7 +1012,11 @@ def paged_kv_decode(
         next_tokens = _sample_tokens(
             logits, do_sample, temperature, top_p, generator
         )
-        next_tokens = torch.where(finished, input_ids[:, 0], next_tokens)
+        next_tokens = torch.where(
+            finished,
+            torch.full_like(next_tokens, pad_token_id),
+            next_tokens,
+        )
         generated[:, step] = next_tokens
         last_tokens = next_tokens
 

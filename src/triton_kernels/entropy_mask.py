@@ -187,12 +187,20 @@ def _compute_threshold_from_histogram(
     percentile: float,
 ) -> float:
     histogram = histogram.to(dtype=torch.float32)
-    cumulative = torch.cumsum(histogram, dim=0)
-    target = cumulative[-1] * (1.0 - percentile)
-    target = target.unsqueeze(0)
-    bin_idx = torch.searchsorted(cumulative, target)
-    bin_idx = torch.clamp(bin_idx, 0, histogram.numel() - 1)
-    threshold = (bin_idx.to(torch.float32) / 255.0) * max_entropy
+    if histogram.numel() == 0 or histogram.sum().item() == 0:
+        return 0.0
+    edges = torch.linspace(
+        0.0,
+        max_entropy,
+        histogram.numel() + 1,
+        device=histogram.device,
+        dtype=torch.float32,
+    )
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    expanded = centers.repeat_interleave(histogram.to(dtype=torch.long))
+    if expanded.numel() == 0:
+        return 0.0
+    threshold = torch.quantile(expanded, 1.0 - percentile)
     return float(threshold.item())
 
 
@@ -267,10 +275,8 @@ def fused_entropy_mask(
         (batch_size, seq_len), device=logits.device, dtype=torch.float32
     )
 
-    compute_hist = threshold is None
+    compute_hist = False
     histogram = None
-    if compute_hist:
-        histogram = torch.zeros(256, device=logits.device, dtype=torch.int32)
 
     block_vocab = _select_block_vocab(vocab_size)
     num_warps = _select_num_warps_entropy(vocab_size, block_vocab)
@@ -296,15 +302,15 @@ def fused_entropy_mask(
 
     threshold_explicit = threshold is not None
     strict_greater = threshold_explicit
-    if compute_hist:
-        histogram_tensor = cast(torch.Tensor, histogram)
-        total_valid = int(histogram_tensor.sum().item())
-        if total_valid == 0:
+    if threshold is None:
+        if attention_mask is not None:
+            valid_entropy = entropy[attention_mask.bool()].float()
+        else:
+            valid_entropy = entropy.reshape(-1).float()
+        if valid_entropy.numel() == 0:
             mask = torch.zeros_like(entropy)
             return entropy, mask
-        threshold = _compute_threshold_from_histogram(
-            histogram_tensor, max_entropy, float(percentile)
-        )
+        threshold = float(torch.quantile(valid_entropy, 1.0 - float(percentile)).item())
 
     mask = torch.empty(
         (batch_size, seq_len), device=logits.device, dtype=torch.float32
@@ -320,7 +326,8 @@ def fused_entropy_mask(
         num_stages=1,
     )
 
-    mask = _enforce_min_tokens(mask, entropy, attention_mask, min_tokens)
+    if not threshold_explicit:
+        mask = _enforce_min_tokens(mask, entropy, attention_mask, min_tokens)
     if original_dtype != torch.bfloat16:
         entropy = entropy.to(dtype=original_dtype)
     return entropy, mask

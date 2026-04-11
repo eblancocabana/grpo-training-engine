@@ -127,10 +127,40 @@ def test_triton_entropy_mask_matches_torch_entropy_mask() -> None:
     )
 
     torch.testing.assert_close(entropy_triton, entropy_torch, rtol=1e-3, atol=1e-3)
+    assert torch.equal(mask_triton, mask_torch)
 
-    if not torch.equal(mask_triton, mask_torch):
-        ratio = (mask_triton.mean() / mask_torch.mean()).item()
-        assert ratio == pytest.approx(1.0, rel=0.01, abs=0.01)
+
+def test_triton_entropy_mask_threshold_mode_matches_torch() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    device = torch.device("cuda")
+    logits = torch.tensor(
+        [
+            [
+                [6.0, -6.0, -6.0, -6.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.5, 0.5, 0.5, 0.5],
+                [1.0, -1.0, 1.0, -1.0],
+            ]
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    attention_mask = torch.ones((1, 4), device=device, dtype=torch.float32)
+    calculator = EntropyCalculator(threshold=0.5, min_tokens=3)
+
+    _, mask_triton = calculator.calculate_entropy_and_mask(
+        logits,
+        attention_mask=attention_mask,
+        use_triton_kernels=True,
+    )
+    _, mask_torch = calculator.calculate_entropy_and_mask(
+        logits,
+        attention_mask=attention_mask,
+        use_triton_kernels=False,
+    )
+
+    assert torch.equal(mask_triton, mask_torch)
 
 
 def test_triton_paged_kv_decode_matches_generate() -> None:
@@ -269,6 +299,142 @@ def test_triton_paged_kv_decode_matches_generate() -> None:
 
     generated_reference = model.generate(input_ids, max_new_tokens)
     assert torch.equal(generated_triton, generated_reference)
+
+
+def test_triton_paged_kv_decode_pads_finished_sequences_with_pad_token() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    device = torch.device("cuda")
+    batch_size = 2
+    num_heads = 1
+    head_dim = 4
+    block_size = 4
+    max_context = 8
+    eos_token_id = 7
+    pad_token_id = 0
+    step_state = {"idx": 0}
+
+    input_ids = torch.tensor([[3], [4]], device=device, dtype=torch.long)
+    k_cache = torch.zeros(
+        (2, num_heads, block_size, head_dim), device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = torch.arange(2, device=device, dtype=torch.int32).unsqueeze(0)
+    block_tables = block_tables.repeat(batch_size, 1)
+    context_lens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    def qkv_proj_fn(
+        tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del tokens
+        q = torch.zeros(batch_size, num_heads, head_dim, device=device)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        return q, k, v
+
+    def logits_fn(attn_out: torch.Tensor) -> torch.Tensor:
+        del attn_out
+        logits = torch.full((batch_size, 16), -1000.0, device=device)
+        if step_state["idx"] == 0:
+            logits[0, eos_token_id] = 10.0
+            logits[1, 5] = 10.0
+        else:
+            logits[0, 9] = 10.0
+            logits[1, 6] = 10.0
+        step_state["idx"] += 1
+        return logits
+
+    generated = paged_kv_decode(
+        input_ids=input_ids,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        qkv_proj_fn=qkv_proj_fn,
+        logits_fn=logits_fn,
+        max_new_tokens=3,
+        temperature=0.0,
+        top_p=1.0,
+        do_sample=False,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    )
+
+    assert generated[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
+    assert generated[1].tolist() == [5, 6, 6]
+
+
+def test_triton_paged_kv_decode_validates_remaining_capacity() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    device = torch.device("cuda")
+    input_ids = torch.tensor([[3]], device=device, dtype=torch.long)
+    k_cache = torch.zeros((1, 1, 4, 4), device=device, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = torch.zeros((1, 1), device=device, dtype=torch.int32)
+    context_lens = torch.tensor([3], device=device, dtype=torch.int32)
+
+    def qkv_proj_fn(
+        tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del tokens
+        q = torch.zeros((1, 1, 4), device=device)
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        return q, k, v
+
+    def logits_fn(attn_out: torch.Tensor) -> torch.Tensor:
+        del attn_out
+        return torch.zeros((1, 8), device=device)
+
+    with pytest.raises(ValueError, match="exceeds block table capacity"):
+        paged_kv_decode(
+            input_ids=input_ids,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            qkv_proj_fn=qkv_proj_fn,
+            logits_fn=logits_fn,
+            max_new_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            do_sample=False,
+            eos_token_id=None,
+            pad_token_id=0,
+        )
+
+
+def test_triton_paged_kv_decode_rejects_sampling_mode() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    device = torch.device("cuda")
+    input_ids = torch.tensor([[1]], device=device, dtype=torch.long)
+    k_cache = torch.zeros((1, 1, 4, 8), device=device, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = torch.zeros((1, 1), device=device, dtype=torch.int32)
+    context_lens = torch.zeros((1,), device=device, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="sampling is not production-safe"):
+        paged_kv_decode(
+            input_ids=input_ids,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            qkv_proj_fn=lambda tokens: (
+                torch.zeros((1, 1, 8), device=device),
+                torch.zeros((1, 1, 8), device=device),
+                torch.zeros((1, 1, 8), device=device),
+            ),
+            logits_fn=lambda attn_out: torch.zeros((1, 8), device=device),
+            max_new_tokens=1,
+            temperature=1.0,
+            top_p=1.0,
+            do_sample=True,
+            eos_token_id=None,
+            pad_token_id=0,
+        )
 
 
 @pytest.mark.performance
