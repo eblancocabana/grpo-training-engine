@@ -62,6 +62,18 @@ class _LoRAContext(Protocol):
     def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
 
 
+def _run_base_projection(base_layer: _Linear4BitLike, x: torch.Tensor) -> torch.Tensor:
+    weight = cast(torch.Tensor, getattr(base_layer, "weight"))
+    proj_input = x
+    if (
+        getattr(weight, "quant_state", None) is None
+        and torch.is_floating_point(proj_input)
+        and proj_input.dtype != weight.dtype
+    ):
+        proj_input = proj_input.to(dtype=weight.dtype)
+    return cast(torch.Tensor, base_layer(proj_input))
+
+
 try:
     import triton
     import triton.language as tl
@@ -1009,7 +1021,7 @@ def lora_fused_forward(
     lora_A_contig = cast(torch.Tensor, lora_A_weight).contiguous()
     lora_B_contig = cast(torch.Tensor, lora_B_weight).contiguous()
 
-    base_output = base_layer(x_contig)
+    base_output = _run_base_projection(base_layer, x_contig)
     if getattr(base_output, "requires_grad", False):
         base_output = base_output.clone()
 

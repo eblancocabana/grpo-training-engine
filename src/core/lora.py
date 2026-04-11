@@ -5,7 +5,8 @@ Implements low-rank adaptation without using PEFT library.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, List, Protocol, cast
 
 import torch
@@ -80,21 +81,40 @@ def _create_lora_linear(
     adapter_quantization: str,
     compute_dtype: torch.dtype,
 ) -> tuple[nn.Module, bool]:
+    def _dense_fallback(reason: str) -> tuple[nn.Module, bool]:
+        logger.warning("%s Falling back to dense LoRA adapter.", reason)
+        linear = nn.Linear(in_features, out_features, bias=False)
+        return linear.to(dtype=compute_dtype), False
+
+    def _adapter_is_trainable(module: nn.Module) -> bool:
+        params = list(module.parameters())
+        if not params:
+            return False
+        return any(param.requires_grad and torch.is_floating_point(param) for param in params)
+
     quantization = adapter_quantization.lower()
     if quantization == "8bit":
         linear8bit = _get_bnb_linear8bit()
         if linear8bit is not None:
-            return linear8bit(in_features, out_features, bias=False), True
-        logger.warning(
-            "bitsandbytes unavailable for 8-bit LoRA adapters; falling back to BF16."
-        )
+            try:
+                layer = linear8bit(in_features, out_features, bias=False)
+                if _adapter_is_trainable(layer):
+                    return layer, True
+                return _dense_fallback("8-bit LoRA adapter is not trainable in this environment.")
+            except Exception as exc:
+                return _dense_fallback(f"8-bit LoRA adapter unavailable ({exc}).")
+        return _dense_fallback("bitsandbytes unavailable for 8-bit LoRA adapters.")
     elif quantization == "4bit":
         linear4bit = _get_bnb_linear4bit()
         if linear4bit is not None:
-            return linear4bit(in_features, out_features, bias=False), True
-        logger.warning(
-            "bitsandbytes unavailable for 4-bit LoRA adapters; falling back to BF16."
-        )
+            try:
+                layer = linear4bit(in_features, out_features, bias=False)
+                if _adapter_is_trainable(layer):
+                    return layer, True
+                return _dense_fallback("4-bit LoRA adapter is not trainable in this environment.")
+            except Exception as exc:
+                return _dense_fallback(f"4-bit LoRA adapter unavailable ({exc}).")
+        return _dense_fallback("bitsandbytes unavailable for 4-bit LoRA adapters.")
     elif quantization != "none":
         message = (
             f"Unsupported LoRA adapter quantization: {adapter_quantization}. "
@@ -138,7 +158,7 @@ class ManualLoRALayer(nn.Module):
         dropout: float = 0.0,
         use_triton: bool = True,
         prefer_base_layer: bool = False,
-        adapter_quantization: str = "8bit",
+        adapter_quantization: str = "none",
     ):
         super().__init__()
         self.base_layer = base_layer
@@ -147,9 +167,14 @@ class ManualLoRALayer(nn.Module):
         self.scaling = alpha / rank
         self.use_triton = use_triton
         self.prefer_base_layer = prefer_base_layer
+        self.adapter_quantization = adapter_quantization.lower()
+        self.adapters_enabled = True
 
         # Freeze base layer weights
         self.base_layer.weight.requires_grad = False
+        base_bias = getattr(self.base_layer, "bias", None)
+        if base_bias is not None:
+            base_bias.requires_grad = False
 
         # Get dimensions
         in_features = base_layer.in_features
@@ -178,6 +203,37 @@ class ManualLoRALayer(nn.Module):
         # B: Zero initialization (start with identity behavior)
         nn.init.zeros_(self.lora_B.weight)
 
+    @staticmethod
+    def _run_projection(module: _LoRALinearLike | _Linear4bitLike, x: torch.Tensor) -> torch.Tensor:
+        module_weight = cast(torch.Tensor, module.weight)
+        proj_input = x
+        if (
+            not _is_linear4bit(cast(object, module))
+            and torch.is_floating_point(proj_input)
+            and proj_input.dtype != module_weight.dtype
+        ):
+            proj_input = proj_input.to(module_weight.dtype)
+        return cast(Callable[[torch.Tensor], torch.Tensor], module)(proj_input)
+
+    def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
+        base_output = self._run_projection(self.base_layer, x)
+        if not self.adapters_enabled:
+            return base_output
+        if base_output.requires_grad:
+            base_output = base_output.clone()
+
+        x_adapt = x.to(self.lora_compute_dtype)
+        lora_hidden = self._run_projection(
+            cast(_LoRALinearLike, self.lora_A), self.lora_dropout(x_adapt)
+        )
+        lora_output = self._run_projection(cast(_LoRALinearLike, self.lora_B), lora_hidden)
+        lora_output = lora_output * self.scaling
+
+        if lora_output.dtype != base_output.dtype:
+            lora_output = lora_output.to(base_output.dtype)
+
+        return base_output + lora_output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass combining base layer and LoRA adaptation.
@@ -188,44 +244,29 @@ class ManualLoRALayer(nn.Module):
         Returns:
             Output tensor [batch, seq_len, out_features]
         """
-        if self.use_triton:
+        if (
+            self.use_triton
+            and self.adapters_enabled
+            and not self.prefer_base_layer
+            and self.adapter_quantization == "none"
+        ):
             try:
                 return cast(
                     torch.Tensor,
                     lora_fused_forward(
                         x,
-                        lora_layer=self,
+                        base_layer=self.base_layer,
+                        lora_A=self.lora_A,
+                        lora_B=self.lora_B,
+                        scaling=self.scaling,
+                        dropout=self.lora_dropout,
                         prefer_base_layer=self.prefer_base_layer,
                     ),
                 )
             except (ImportError, RuntimeError, ValueError):
                 pass
 
-        try:
-            base_output = cast(Callable[[torch.Tensor], torch.Tensor], self.base_layer)(
-                x
-            )
-            if base_output.requires_grad:
-                base_output = base_output.clone()
-
-            x_adapt = x.to(self.lora_compute_dtype)
-            lora_output = self.lora_B(self.lora_A(self.lora_dropout(x_adapt)))
-            lora_output = lora_output * self.scaling
-
-            if lora_output.dtype != base_output.dtype:
-                lora_output = lora_output.to(base_output.dtype)
-
-            return base_output + lora_output
-        except Exception:
-            if not self.use_triton:
-                raise
-            return cast(
-                torch.Tensor,
-                lora_fused_forward(
-                    x,
-                    lora_layer=self,
-                ),
-            )
+        return self._forward_torch(x)
 
     def merge_weights(self) -> torch.Tensor:
         """
@@ -256,7 +297,7 @@ def inject_lora_layers(
     dropout: float = 0.0,
     use_triton: bool = True,
     prefer_base_layer: bool = False,
-    adapter_quantization: str = "8bit",
+    adapter_quantization: str = "none",
     verbose: bool = True,
 ) -> int:
     """
@@ -337,3 +378,30 @@ def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
         if param.requires_grad and ("lora_A" in name or "lora_B" in name):
             lora_params.append(param)
     return lora_params
+
+
+def iter_lora_layers(model: nn.Module) -> Iterator[ManualLoRALayer]:
+    """Yield all ManualLoRALayer instances in a model."""
+    for module in model.modules():
+        if isinstance(module, ManualLoRALayer):
+            yield module
+
+
+def set_lora_enabled(model: nn.Module, enabled: bool) -> None:
+    """Enable or disable LoRA adapters in-place."""
+    for layer in iter_lora_layers(model):
+        layer.adapters_enabled = enabled
+
+
+@contextmanager
+def lora_disabled(model: nn.Module) -> Iterator[None]:
+    """Temporarily disable LoRA adapters for base-policy forwards."""
+    layers = list(iter_lora_layers(model))
+    previous_states = [layer.adapters_enabled for layer in layers]
+    try:
+        for layer in layers:
+            layer.adapters_enabled = False
+        yield
+    finally:
+        for layer, was_enabled in zip(layers, previous_states):
+            layer.adapters_enabled = was_enabled

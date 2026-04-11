@@ -80,6 +80,20 @@ class _TensorLike(Protocol):
         ...
 
 
+def _run_projection(module: _WeightedModuleLike, x: _TensorLike) -> _TensorLike:
+    weight = cast(_TensorLike, module.weight)
+    input_tensor = x
+    quant_state = getattr(weight, "quant_state", None)
+    tensor_input = cast(torch.Tensor, input_tensor)
+    if (
+        quant_state is None
+        and torch.is_floating_point(tensor_input)
+        and input_tensor.dtype != weight.dtype
+    ):
+        input_tensor = cast(_TensorLike, input_tensor.to(weight.dtype))
+    return cast(_TensorLike, module(input_tensor))
+
+
 def _warn_fallback(kernel_name: str) -> None:
     global _warned_no_triton
     if _warned_no_triton:
@@ -190,8 +204,12 @@ def _lora_fused_forward_torch(
     lora_layer: object | None = None,
 ) -> object:
     if lora_layer is not None:
-        lora_layer_typed = cast(_ModuleLike, lora_layer)
-        return lora_layer_typed(x)
+        lora_layer_obj = cast(object, lora_layer)
+        base_layer = getattr(lora_layer_obj, "base_layer")
+        lora_A = getattr(lora_layer_obj, "lora_A")
+        lora_B = getattr(lora_layer_obj, "lora_B")
+        scaling = cast(float, getattr(lora_layer_obj, "scaling"))
+        dropout = getattr(lora_layer_obj, "lora_dropout", None)
     if base_layer is None or lora_A is None or lora_B is None or scaling is None:
         raise ValueError(
             "Provide lora_layer or base_layer/lora_A/lora_B/scaling for fallback."
@@ -199,16 +217,25 @@ def _lora_fused_forward_torch(
     base_layer_typed = cast(_ModuleLike, base_layer)
     lora_a_typed = cast(_WeightedModuleLike, lora_A)
     lora_b_typed = cast(_WeightedModuleLike, lora_B)
-    base_output = cast(_TensorLike, base_layer_typed(x))
+    base_weight = getattr(base_layer_typed, "weight", None)
+    if base_weight is not None:
+        base_output = _run_projection(cast(_WeightedModuleLike, base_layer_typed), x)
+    else:
+        base_output = cast(_TensorLike, base_layer_typed(x))
     if base_output.requires_grad:
         base_output = cast(_TensorLike, base_output.clone())
     if dropout is not None:
         dropout_typed = cast(_ModuleLike, dropout)
         x = dropout_typed(x)
-    x_adapt = cast(_TensorLike, cast(_TensorLike, x).to(lora_a_typed.weight.dtype))
+    x_tensor = cast(torch.Tensor, x)
+    target_lora_dtype = (
+        x_tensor.dtype if x_tensor.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    )
+    x_adapt = cast(_TensorLike, cast(_TensorLike, x).to(target_lora_dtype))
+    lora_hidden = _run_projection(lora_a_typed, x_adapt)
     lora_output = cast(
         _TensorLike,
-        cast(_TensorLike, lora_b_typed(lora_a_typed(x_adapt))) * scaling,
+        cast(_TensorLike, _run_projection(lora_b_typed, lora_hidden)) * scaling,
     )
     if lora_output.dtype != base_output.dtype:
         lora_output = cast(_TensorLike, lora_output.to(base_output.dtype))
