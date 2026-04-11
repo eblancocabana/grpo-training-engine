@@ -301,6 +301,148 @@ def test_triton_paged_kv_decode_matches_generate() -> None:
     assert torch.equal(generated_triton, generated_reference)
 
 
+def test_triton_paged_kv_decode_supports_gqa_models() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    _ = torch.manual_seed(17)
+    _ = torch.cuda.manual_seed_all(17)
+    torch.backends.cudnn.deterministic = True
+
+    device = torch.device("cuda")
+    batch_size = 1
+    vocab_size = 48
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 8
+    prompt_len = 4
+    max_new_tokens = 4
+    block_size = 4
+
+    class TinyGQAPagedModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            embed_dim = num_heads * head_dim
+            kv_dim = num_kv_heads * head_dim
+            self.embed: torch.nn.Embedding = torch.nn.Embedding(vocab_size, embed_dim)
+            self.q_proj: torch.nn.Linear = torch.nn.Linear(embed_dim, embed_dim, bias=False)
+            self.k_proj: torch.nn.Linear = torch.nn.Linear(embed_dim, kv_dim, bias=False)
+            self.v_proj: torch.nn.Linear = torch.nn.Linear(embed_dim, kv_dim, bias=False)
+            self.out_proj: torch.nn.Linear = torch.nn.Linear(embed_dim, vocab_size, bias=False)
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+
+        def _project(
+            self, token_ids: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = cast(torch.Tensor, self.embed(token_ids))
+            if x.ndim == 2:
+                x = x.unsqueeze(1)
+            batch, seq_len, _ = x.shape
+            q = cast(torch.Tensor, self.q_proj(x)).view(
+                batch, seq_len, self.num_heads, self.head_dim
+            )
+            k = cast(torch.Tensor, self.k_proj(x)).view(
+                batch, seq_len, self.num_kv_heads, self.head_dim
+            )
+            v = cast(torch.Tensor, self.v_proj(x)).view(
+                batch, seq_len, self.num_kv_heads, self.head_dim
+            )
+            return q, k, v
+
+        def prefill_kv(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            _, k, v = self._project(token_ids)
+            return k, v
+
+        def qkv_for_decode(
+            self, token_ids: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            q, k, v = self._project(token_ids)
+            return q[:, 0], k[:, 0], v[:, 0]
+
+        def logits_from_attn(self, attn_out: torch.Tensor) -> torch.Tensor:
+            batch = attn_out.shape[0]
+            return cast(torch.Tensor, self.out_proj(attn_out.reshape(batch, -1)))
+
+        @torch.no_grad()
+        def generate(self, input_ids: torch.Tensor, max_tokens: int) -> torch.Tensor:
+            tokens: torch.Tensor = input_ids
+            generated: list[torch.Tensor] = []
+            scale = 1.0 / math.sqrt(self.head_dim)
+            repeats = self.num_heads // self.num_kv_heads
+
+            for _ in range(max_tokens):
+                q, k, v = self._project(tokens)
+                q_last = q[:, -1].to(torch.bfloat16).float()
+                k = k.repeat_interleave(repeats, dim=2).to(torch.bfloat16).float()
+                v = v.repeat_interleave(repeats, dim=2).to(torch.bfloat16).float()
+
+                scores = (q_last[:, None, :, :] * k).sum(-1) * scale
+                scores = scores.transpose(1, 2)
+                weights = torch.softmax(scores, dim=-1)
+                v = v.transpose(1, 2)
+                attn_out = (weights[..., None] * v).sum(dim=-2)
+
+                logits = self.logits_from_attn(attn_out)
+                next_token = torch.argmax(logits, dim=-1)
+                generated.append(next_token)
+                tokens = torch.cat([tokens, next_token[:, None]], dim=1)
+
+            return torch.stack(generated, dim=1)
+
+    model = TinyGQAPagedModel().to(device)
+    input_ids = torch.randint(0, vocab_size, (batch_size, prompt_len), device=device)
+
+    max_context_needed = prompt_len - 1 + max_new_tokens + 1
+    max_blocks = math.ceil(max_context_needed / block_size)
+    k_cache = torch.zeros(
+        (max_blocks, num_kv_heads, block_size, head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = torch.arange(max_blocks, device=device, dtype=torch.int32)
+    block_tables = block_tables.unsqueeze(0).repeat(batch_size, 1)
+    context_lens = torch.full(
+        (batch_size,),
+        prompt_len - 1,
+        device=device,
+        dtype=torch.int32,
+    )
+
+    if prompt_len > 1:
+        with torch.no_grad():
+            k_prefill, v_prefill = model.prefill_kv(input_ids[:, :-1])
+        k_prefill = k_prefill.to(torch.bfloat16)
+        v_prefill = v_prefill.to(torch.bfloat16)
+        for position in range(prompt_len - 1):
+            block_idx = position // block_size
+            block_off = position % block_size
+            block_id = int(block_tables[0, block_idx].item())
+            k_cache[block_id, :, block_off, :] = k_prefill[0, position]
+            v_cache[block_id, :, block_off, :] = v_prefill[0, position]
+
+    generated_triton = paged_kv_decode(
+        input_ids=input_ids,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        qkv_proj_fn=model.qkv_for_decode,
+        logits_fn=model.logits_from_attn,
+        max_new_tokens=max_new_tokens,
+        temperature=0.0,
+        top_p=1.0,
+        do_sample=False,
+        eos_token_id=None,
+        pad_token_id=0,
+        seed=17,
+    )
+
+    generated_reference = model.generate(input_ids, max_new_tokens)
+    assert torch.equal(generated_triton, generated_reference)
+
+
 def test_triton_paged_kv_decode_pads_finished_sequences_with_pad_token() -> None:
     _skip_if_no_cuda_or_triton()
 
@@ -405,7 +547,7 @@ def test_triton_paged_kv_decode_validates_remaining_capacity() -> None:
         )
 
 
-def test_triton_paged_kv_decode_rejects_sampling_mode() -> None:
+def test_triton_paged_kv_decode_supports_sampling_mode_with_seed() -> None:
     _skip_if_no_cuda_or_triton()
 
     device = torch.device("cuda")
@@ -414,27 +556,32 @@ def test_triton_paged_kv_decode_rejects_sampling_mode() -> None:
     v_cache = torch.zeros_like(k_cache)
     block_tables = torch.zeros((1, 1), device=device, dtype=torch.int32)
     context_lens = torch.zeros((1,), device=device, dtype=torch.int32)
+    logits = torch.tensor([[0.2, 2.0, 1.2, -1.0]], device=device)
 
-    with pytest.raises(ValueError, match="sampling is not production-safe"):
-        paged_kv_decode(
-            input_ids=input_ids,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            qkv_proj_fn=lambda tokens: (
-                torch.zeros((1, 1, 8), device=device),
-                torch.zeros((1, 1, 8), device=device),
-                torch.zeros((1, 1, 8), device=device),
-            ),
-            logits_fn=lambda attn_out: torch.zeros((1, 8), device=device),
-            max_new_tokens=1,
-            temperature=1.0,
-            top_p=1.0,
-            do_sample=True,
-            eos_token_id=None,
-            pad_token_id=0,
-        )
+    kwargs = dict(
+        input_ids=input_ids,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        qkv_proj_fn=lambda tokens: (
+            torch.zeros((1, 1, 8), device=device),
+            torch.zeros((1, 1, 8), device=device),
+            torch.zeros((1, 1, 8), device=device),
+        ),
+        logits_fn=lambda attn_out: logits,
+        max_new_tokens=3,
+        temperature=0.9,
+        top_p=0.95,
+        do_sample=True,
+        eos_token_id=None,
+        pad_token_id=0,
+        seed=123,
+    )
+
+    generated_a = paged_kv_decode(**kwargs)
+    generated_b = paged_kv_decode(**kwargs)
+    assert torch.equal(generated_a, generated_b)
 
 
 @pytest.mark.performance

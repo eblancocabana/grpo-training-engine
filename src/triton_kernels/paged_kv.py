@@ -27,12 +27,10 @@ import math
 
 import torch
 
-from transformers.models.qwen2.modeling_qwen2 import repeat_kv
 from src.triton_kernels.fused_ops import (
     fused_qkv_rope,
     fused_rmsnorm,
     fused_mlp,
-    fused_logits_sampling,
 )
 
 triton = None
@@ -81,6 +79,7 @@ if TRITON_AVAILABLE:
         stride_oh,
         stride_od,
         block_size,
+        kv_group_size,
         scale,
         D: tl.constexpr,
         BLOCK_CTX: tl.constexpr,
@@ -89,6 +88,7 @@ if TRITON_AVAILABLE:
     ):
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
+        kv_head = pid_h // kv_group_size
 
         ctx_len = tl.load(context_lens_ptr + pid_b)
         ctx_len = tl.cast(ctx_len, tl.int32)
@@ -122,7 +122,7 @@ if TRITON_AVAILABLE:
                 k_ptrs = (
                     k_cache_ptr
                     + block_ids[:, None] * stride_kb
-                    + pid_h * stride_kh
+                    + kv_head * stride_kh
                     + block_off[:, None] * stride_kt
                     + d[None, :] * stride_kd
                 )
@@ -166,7 +166,7 @@ if TRITON_AVAILABLE:
                 k_ptrs = (
                     k_cache_ptr
                     + block_ids[:, None] * stride_kb
-                    + pid_h * stride_kh
+                    + kv_head * stride_kh
                     + block_off[:, None] * stride_kt
                     + d[None, :] * stride_kd
                 )
@@ -213,7 +213,7 @@ if TRITON_AVAILABLE:
                     k_ptrs = (
                         k_cache_ptr
                         + block_ids[:, None] * stride_kb
-                        + pid_h * stride_kh
+                        + kv_head * stride_kh
                         + block_off[:, None] * stride_kt
                         + dd[None, :] * stride_kd
                     )
@@ -230,7 +230,7 @@ if TRITON_AVAILABLE:
                 v_ptrs = (
                     v_cache_ptr
                     + block_ids[:, None] * stride_kb
-                    + pid_h * stride_kh
+                    + kv_head * stride_kh
                     + block_off[:, None] * stride_kt
                     + d[None, :] * stride_kd
                 )
@@ -268,11 +268,14 @@ if TRITON_AVAILABLE:
         stride_bb,
         stride_bt,
         block_size,
+        num_kv_heads,
         D: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
+        if pid_h >= num_kv_heads:
+            return
 
         ctx_len = tl.load(context_lens_ptr + pid_b)
         ctx_len = tl.cast(ctx_len, tl.int32)
@@ -583,17 +586,15 @@ def _prefill_paged_cache(
     if past_kv is None:
         return
 
-    repeats = num_heads // num_kv_heads
     seq_len = input_ids.shape[1]
     batch_size = input_ids.shape[0]
     for layer_idx in range(len(past_kv)):
         k_layer, v_layer = past_kv[layer_idx]
-        k_layer = repeat_kv(k_layer, repeats)
-        v_layer = repeat_kv(v_layer, repeats)
         for b in range(batch_size):
-            for pos in range(seq_len):
-                block_idx = pos // block_size
-                block_off = pos % block_size
+            valid_positions = attention_mask[b].bool().nonzero(as_tuple=False).flatten()
+            for cache_pos, pos in enumerate(valid_positions.tolist()):
+                block_idx = cache_pos // block_size
+                block_off = cache_pos % block_size
                 block_id = int(block_tables[b, block_idx].item())
                 k_cache[layer_idx, block_id, :, block_off, :] = k_layer[
                     b, :, pos, :
@@ -621,11 +622,6 @@ def paged_kv_decode_model(
         raise ImportError("Triton is not available for paged_kv_decode.")
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
-    if do_sample:
-        raise ValueError(
-            "paged_kv_decode_model sampling is not production-safe yet; "
-            "use do_sample=False or fall back to model.generate()."
-        )
     (
         embeddings,
         layers,
@@ -652,14 +648,10 @@ def paged_kv_decode_model(
     max_blocks = math.ceil(max_context_needed / block_size)
     total_blocks = batch_size * max_blocks
 
-    if num_heads != num_kv_heads:
-        raise ValueError(
-            "paged_kv_decode currently supports only models with num_heads == num_kv_heads. "
-            f"Got num_heads={num_heads}, num_kv_heads={num_kv_heads}."
-        )
+    kv_group_size = num_heads // num_kv_heads
 
     k_cache = torch.zeros(
-        (num_layers, total_blocks, num_heads, block_size, head_dim),
+        (num_layers, total_blocks, num_kv_heads, block_size, head_dim),
         device=input_ids.device,
         dtype=torch.bfloat16,
     )
@@ -752,13 +744,11 @@ def paged_kv_decode_model(
                 num_kv_heads,
                 head_dim,
             )
-            k_states = repeat_kv(k_states, num_heads // num_kv_heads)
-            v_states = repeat_kv(v_states, num_heads // num_kv_heads)
             q = q_states[:, :, 0, :].to(dtype=torch.bfloat16)
             k_new = k_states[:, :, 0, :].to(dtype=torch.bfloat16)
             v_new = v_states[:, :, 0, :].to(dtype=torch.bfloat16)
 
-            update_grid = (batch_size, num_heads)
+            update_grid = (batch_size, num_kv_heads)
             update_kernel[update_grid](
                 k_new,
                 v_new,
@@ -776,6 +766,7 @@ def paged_kv_decode_model(
                 block_tables.stride(0),
                 block_tables.stride(1),
                 block_size,
+                num_kv_heads,
                 D=head_dim,
                 BLOCK_D=block_d,
                 num_warps=update_warps,
@@ -804,6 +795,7 @@ def paged_kv_decode_model(
                 attn_out.stride(1),
                 attn_out.stride(2),
                 block_size,
+                kv_group_size,
                 scale,
                 D=head_dim,
                 BLOCK_CTX=block_ctx,
@@ -839,14 +831,13 @@ def paged_kv_decode_model(
             hidden_states = residual + hidden_states
 
         hidden_states = norm(hidden_states)
-        logits, next_tokens = fused_logits_sampling(
-            hidden_states[:, -1, :],
-            lm_head,
+        logits = cast(torch.Tensor, lm_head(hidden_states[:, -1, :]))
+        next_tokens = _sample_tokens(
+            logits,
             do_sample,
             temperature,
             top_p,
             generator,
-            eos_token_id,
         )
         return next_tokens, new_context_lens
 
@@ -891,15 +882,10 @@ def paged_kv_decode(
         raise ImportError("Triton is not available for paged_kv_decode.")
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
-    if do_sample:
-        raise ValueError(
-            "paged_kv_decode sampling is not production-safe yet; "
-            "use do_sample=False."
-        )
     update_kernel = cast(_TritonKernel, _paged_kv_update_kernel)
     decode_kernel = cast(_TritonKernel, _paged_attention_decode_kernel)
 
-    num_heads, block_size, head_dim, max_context = _validate_inputs(
+    num_kv_heads, block_size, head_dim, max_context = _validate_inputs(
         input_ids, k_cache, v_cache, block_tables, context_lens
     )
 
@@ -912,6 +898,8 @@ def paged_kv_decode(
         eos_token_id = -1
     if pad_token_id is None:
         pad_token_id = 0
+
+    kv_group_size = 1
 
     batch_size = input_ids.shape[0]
     generated = torch.full(
@@ -941,14 +929,28 @@ def paged_kv_decode(
             break
 
         q, k_new, v_new = qkv_proj_fn(last_tokens)
-        if q.shape != (batch_size, num_heads, head_dim):
+        if q.ndim != 3 or q.shape[0] != batch_size or q.shape[2] != head_dim:
             raise ValueError("qkv_proj_fn must return [B, H, D] tensors.")
+        num_heads = q.shape[1]
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"q heads ({num_heads}) must be divisible by cache kv heads ({num_kv_heads})."
+            )
+        kv_group_size = num_heads // num_kv_heads
+        if k_new.shape != (batch_size, num_kv_heads, head_dim):
+            raise ValueError(
+                "qkv_proj_fn must return [B, H_kv, D] tensors for keys matching cache heads."
+            )
+        if v_new.shape != (batch_size, num_kv_heads, head_dim):
+            raise ValueError(
+                "qkv_proj_fn must return [B, H_kv, D] tensors for values matching cache heads."
+            )
 
         q = q.to(dtype=torch.bfloat16)
         k_new = k_new.to(dtype=torch.bfloat16)
         v_new = v_new.to(dtype=torch.bfloat16)
 
-        update_grid = (batch_size, num_heads)
+        update_grid = (batch_size, num_kv_heads)
         update_kernel[update_grid](
             k_new,
             v_new,
@@ -966,6 +968,7 @@ def paged_kv_decode(
             block_tables.stride(0),
             block_tables.stride(1),
             block_size,
+            num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
             num_warps=update_warps,
@@ -996,6 +999,7 @@ def paged_kv_decode(
             attn_out.stride(1),
             attn_out.stride(2),
             block_size,
+            kv_group_size,
             scale,
             D=head_dim,
             BLOCK_CTX=block_ctx,

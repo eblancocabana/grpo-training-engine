@@ -532,8 +532,6 @@ class GRPOTrainerLoop:
             return False
         if not TRITON_AVAILABLE:
             return False
-        if getattr(self.config.training, "generation_do_sample", False):
-            return False
 
         model_config = getattr(self.model, "config", None)
         num_heads = getattr(model_config, "num_attention_heads", None)
@@ -541,7 +539,7 @@ class GRPOTrainerLoop:
         if (
             num_heads is not None
             and num_kv_heads is not None
-            and num_heads != num_kv_heads
+            and num_heads % num_kv_heads != 0
         ):
             return False
 
