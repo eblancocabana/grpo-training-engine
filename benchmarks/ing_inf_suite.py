@@ -12,7 +12,6 @@ import json
 import time
 import os
 import sys
-import signal
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Any, List, Dict, Optional
@@ -22,49 +21,8 @@ import re
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
-def kill_training_processes():
-    """Kill any lingering Python training processes."""
-    try:
-        # Find and kill train.py processes
-        result = subprocess.run(
-            ["pkill", "-f", "train.py"],
-            capture_output=True,
-            timeout=10
-        )
-        # Also kill any python processes with high GPU usage
-        subprocess.run(
-            ["pkill", "-9", "-f", "python.*grpo"],
-            capture_output=True,
-            timeout=5
-        )
-        time.sleep(2)  # Wait for processes to die
-    except Exception as e:
-        print(f"[WARN] Could not kill processes: {e}")
-
-
-def clear_gpu_memory():
-    """Clear GPU memory and cache."""
-    try:
-        # Try to import torch and clear cache
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            print("[GPU] Cache cleared")
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[WARN] Could not clear GPU: {e}")
-    
-    # Also try nvidia-smi to reset
-    try:
-        subprocess.run(
-            ["nvidia-smi", "--gpu-reset"],
-            capture_output=True,
-            timeout=5
-        )
-    except:
-        pass
+def note_cleanup_moved() -> None:
+    print("[CLEANUP] train.py handles stale-process cleanup and GPU cache.")
 
 
 def get_conda_python() -> str:
@@ -339,15 +297,7 @@ class IngInfBenchmarkSuite:
         print(f"Effective batch: {config.effective_batch}")
         print(f"{'='*60}")
         
-        # === CLEANUP PHASE ===
-        print("[CLEANUP] Killing lingering processes...")
-        kill_training_processes()
-        
-        print("[CLEANUP] Clearing GPU memory...")
-        clear_gpu_memory()
-        
-        # Wait for GPU to settle
-        time.sleep(3)
+        note_cleanup_moved()
         
         run_dir = self.output_dir / config.name.replace(" ", "_").replace("/", "_")
         run_dir.mkdir(parents=True, exist_ok=True)

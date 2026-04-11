@@ -8,8 +8,12 @@ import os
 import sys
 import torch
 import argparse
-import logging
 import random
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
 
 import numpy as np
 
@@ -17,11 +21,131 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.grpo.trainer import GRPOTrainerLoop
-from src.utils.config import get_8gb_vram_config, VerbosityLevel
+from src.utils.config import get_8gb_vram_config
 from src.utils.logging_utils import setup_logging, get_logger
 
 # Module-level logger
 logger = get_logger("main")
+
+
+def _read_cmdline(pid_path: Path) -> list[str]:
+    try:
+        raw = (pid_path / "cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+    if not raw:
+        return []
+    return [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+
+
+def _read_cwd(pid_path: Path) -> Path | None:
+    try:
+        return (pid_path / "cwd").resolve()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _is_under_repo(path: Path, repo_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(repo_root)
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _find_stale_train_pids(train_script: Path, repo_root: Path) -> list[int]:
+    pids: list[int] = []
+    proc_root = Path("/proc")
+    train_name = train_script.name
+    train_path = str(train_script.resolve())
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        cmdline = _read_cmdline(entry)
+        if not cmdline:
+            continue
+        if not any(train_name in arg for arg in cmdline):
+            continue
+        cwd = _read_cwd(entry)
+        if cwd is None or not _is_under_repo(cwd, repo_root):
+            continue
+        if any(train_path == arg for arg in cmdline):
+            pids.append(int(entry.name))
+            continue
+        if any(arg.endswith(train_name) for arg in cmdline):
+            pids.append(int(entry.name))
+    return pids
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def kill_stale_train_processes(train_script: Path, repo_root: Path) -> None:
+    current_pid = os.getpid()
+    candidate_pids = [
+        pid for pid in _find_stale_train_pids(train_script, repo_root) if pid != current_pid
+    ]
+    if not candidate_pids:
+        return
+
+    logger.warning("Found stale train.py processes: %s", ", ".join(map(str, candidate_pids)))
+    for pid in candidate_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            logger.warning("No permission to terminate pid %s: %s", pid, exc)
+            continue
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if all(not _pid_is_alive(pid) for pid in candidate_pids):
+            return
+        time.sleep(0.1)
+
+    for pid in candidate_pids:
+        if not _pid_is_alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logger.warning("Force-killed stale train.py process pid=%s", pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            logger.warning("No permission to force-kill pid %s: %s", pid, exc)
+
+
+def clear_gpu_memory(force_reset: bool) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        logger.info("GPU cache cleared")
+
+    if not force_reset:
+        return
+
+    if not shutil.which("nvidia-smi"):
+        logger.warning("nvidia-smi not available; skipping GPU reset")
+        return
+
+    result = subprocess.run(
+        ["nvidia-smi", "--gpu-reset"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logger.warning("GPU reset failed: %s", (result.stderr or "").strip())
+    else:
+        logger.warning("GPU reset requested via nvidia-smi")
 
 
 def check_system():
@@ -279,6 +403,11 @@ def main():
         action="store_true",
         help="Disable checkpoint saving during training",
     )
+    parser.add_argument(
+        "--gpu-reset",
+        action="store_true",
+        help="Reset GPU via nvidia-smi before training (aggressive)",
+    )
 
     args = parser.parse_args()
 
@@ -298,6 +427,12 @@ def main():
         logger.debug("Verbose mode enabled (level=%d)", args.verbose)
     if args.debug:
         logger.debug("Debug flag used (deprecated, use -v instead)")
+
+    train_script = Path(__file__).resolve()
+    repo_root = train_script.parent
+    logger.info("Clearing stale training processes from %s", repo_root)
+    kill_stale_train_processes(train_script, repo_root)
+    clear_gpu_memory(force_reset=args.gpu_reset)
 
     # System check
     if not check_system():
@@ -378,7 +513,7 @@ def main():
     
     # Checkpoint configuration
     if args.no_checkpoints:
-        config.training.checkpoint_dir = None
+        config.training.checkpoint_dir = ""
 
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
