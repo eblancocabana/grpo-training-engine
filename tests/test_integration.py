@@ -674,7 +674,7 @@ class TestIntegration:
 
         assert loop.model.training is True
 
-    def test_generate_responses_skips_triton_when_sampling_enabled(self):
+    def test_generate_responses_uses_triton_when_sampling_enabled(self):
         import sys
 
         sys.modules.pop("bitsandbytes", None)
@@ -726,12 +726,13 @@ class TestIntegration:
         )
 
         with patch("src.grpo.trainer.paged_kv_decode") as paged_decode:
+            paged_decode.return_value = torch.tensor([[5, 9]], dtype=torch.long)
             generated = loop.generate_responses(
                 input_ids=torch.tensor([[7, 8]], dtype=torch.long),
                 attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
             )
 
-        paged_decode.assert_not_called()
+        paged_decode.assert_called_once()
         assert generated == ["5 9"]
 
     def test_load_checkpoint_discards_partial_accumulation_state(self, tmp_path):
