@@ -6,9 +6,44 @@ import torch
 from unittest.mock import Mock, MagicMock, patch
 
 from src.data.sent_calculator import SemanticEntropyCalculator
-from src.data.gsm8k_loader import SENTGSM8KDataset, _validate_cache, create_grpo_dataloader
+from src.data.gsm8k_loader import (
+    GRPOGSM8KDataset,
+    SENTGSM8KDataset,
+    _make_sent_cache_key,
+    format_grpo_prompt,
+    _validate_cache,
+    create_grpo_dataloader,
+)
 from src.grpo.verifier import RuleBasedVerifier
 from src.utils.config import SENTConfig, Config, get_8gb_vram_config
+
+
+def _configure_mock_tokenizer(mock_tokenizer: Mock, template: str = "<chat>") -> Mock:
+    mock_tokenizer.name_or_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    mock_tokenizer.chat_template = template
+    return mock_tokenizer
+
+
+def _sent_metadata_for(
+    sent_config: SENTConfig,
+    tokenizer: Mock,
+    max_prompt_length: int,
+    model_id: str | None = None,
+) -> dict:
+    if model_id is None:
+        tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
+        if isinstance(tokenizer_model_id, str):
+            model_id = tokenizer_model_id
+    return {
+        "status": "complete",
+        "config_hash": "abc",
+        "sent_cache_key": _make_sent_cache_key(
+            sent_config,
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            model_id=model_id,
+        ),
+    }
 
 
 class TestSemanticEntropyCalculator:
@@ -19,7 +54,7 @@ class TestSemanticEntropyCalculator:
         verifier = RuleBasedVerifier()
         
         mock_model = Mock()
-        mock_tokenizer = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
         config = get_8gb_vram_config()
         
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
@@ -48,7 +83,7 @@ class TestSemanticEntropyCalculator:
         verifier = RuleBasedVerifier()
         
         mock_model = Mock()
-        mock_tokenizer = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
         config = get_8gb_vram_config()
         
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
@@ -139,11 +174,46 @@ class TestSemanticEntropyCalculator:
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
         
         meta = calc._make_metadata(status="test_status")
-        
+
         assert meta["version"] == "sent_v1"
         assert meta["status"] == "test_status"
         assert "config_hash" in meta
+        assert "sent_cache_key" in meta
         assert "created_at" in meta
+
+    def test_sent_uses_formatted_prompt_and_prompt_cap(self):
+        verifier = RuleBasedVerifier()
+        config = get_8gb_vram_config()
+        config.training.max_prompt_length = 17
+
+        mock_model = Mock()
+        mock_model.eval.return_value = None
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        mock_tokenizer = Mock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.eos_token_id = 4
+        mock_tokenizer.apply_chat_template.return_value = "<chat>question</chat>"
+        mock_tokenizer.return_value = {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        }
+        mock_tokenizer.decode.return_value = "answer"
+
+        calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
+        calc.compute_entropy_for_query("question", num_samples=1)
+
+        mock_tokenizer.apply_chat_template.assert_called_once()
+        _, kwargs = mock_tokenizer.call_args
+        assert kwargs["max_length"] == 17
+
+    def test_format_grpo_prompt_falls_back_when_chat_template_render_fails(self):
+        tokenizer = Mock()
+        tokenizer.chat_template = "<chat>"
+        tokenizer.apply_chat_template.side_effect = ValueError("no chat template")
+
+        prompt = format_grpo_prompt(tokenizer, "question")
+
+        assert prompt == "question"
 
 
 class TestSENTConfig:
@@ -227,9 +297,22 @@ class TestValidateCache:
         """Test validation passes for complete cache."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = os.path.join(tmpdir, "cache.json")
+            config = SENTConfig()
+            tokenizer = Mock()
+            tokenizer.name_or_path = "tok"
+            tokenizer.chat_template = "<chat>"
             
             data = {
-                "metadata": {"status": "complete", "config_hash": "abc123"},
+                "metadata": {
+                    "status": "complete",
+                    "config_hash": "abc123",
+                    "sent_cache_key": _make_sent_cache_key(
+                        config,
+                        tokenizer=tokenizer,
+                        max_prompt_length=128,
+                        model_id="model-a",
+                    ),
+                },
                 "indices": [0, 1, 2],
                 "entropies": [0.1, 0.2, 0.3],
                 "clusters": [[], [], []]
@@ -239,9 +322,71 @@ class TestValidateCache:
             with open(cache_path, 'w') as f:
                 json.dump(data, f)
             
-            is_valid, msg = _validate_cache(cache_path)
+            is_valid, msg = _validate_cache(
+                cache_path,
+                config=config,
+                tokenizer=tokenizer,
+                max_prompt_length=128,
+                model_id="model-a",
+            )
             
             assert is_valid is True
+
+    def test_validate_cache_rejects_model_id_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            tokenizer = _configure_mock_tokenizer(Mock())
+            data = {
+                "metadata": {
+                    "status": "complete",
+                    "config_hash": "abc123",
+                    "sent_cache_key": _make_sent_cache_key(
+                        SENTConfig(),
+                        tokenizer=tokenizer,
+                        max_prompt_length=128,
+                        model_id="model-a",
+                    ),
+                },
+                "indices": [0],
+                "entropies": [0.1],
+                "clusters": [[]],
+            }
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+
+            is_valid, msg = _validate_cache(
+                cache_path,
+                config=SENTConfig(),
+                tokenizer=tokenizer,
+                max_prompt_length=128,
+                model_id="model-b",
+            )
+
+            assert is_valid is False
+            assert "mismatch" in msg
+
+    def test_validate_cache_rejects_legacy_hash_only_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            data = {
+                "metadata": {"status": "complete", "config_hash": "abc123"},
+                "indices": [0],
+                "entropies": [0.1],
+                "clusters": [[]],
+            }
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+
+            tokenizer = _configure_mock_tokenizer(Mock())
+            is_valid, msg = _validate_cache(
+                cache_path,
+                config=SENTConfig(),
+                tokenizer=tokenizer,
+                max_prompt_length=128,
+            )
+
+            assert is_valid is False
+            assert "compatibility key" in msg
 
 
 class TestSENTGSM8KDataset:
@@ -263,9 +408,11 @@ class TestSENTGSM8KDataset:
         """Test dataset works with mock cache."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = os.path.join(tmpdir, "cache.json")
+            sent_config = SENTConfig()
+            mock_tokenizer = _configure_mock_tokenizer(Mock())
             
             cache_data = {
-                "metadata": {"status": "complete", "config_hash": "abc"},
+                "metadata": _sent_metadata_for(sent_config, mock_tokenizer, 3),
                 "indices": [0, 1, 2, 3, 4],
                 "entropies": [0.1, 0.2, 0.3, 0.4, 0.5],
                 "clusters": [[], [], [], [], []]
@@ -278,7 +425,7 @@ class TestSENTGSM8KDataset:
             with patch("src.data.gsm8k_loader.load_dataset") as mock_load:
                 mock_load.return_value = [{"question": f"Q{i}?", "answer": str(i)} for i in range(5)]
                 
-                mock_tokenizer = Mock()
+                mock_tokenizer = _configure_mock_tokenizer(Mock())
                 mock_tokenizer.apply_chat_template.return_value = "formatted prompt"
                 mock_tokenizer.return_value = {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
                 
@@ -286,6 +433,8 @@ class TestSENTGSM8KDataset:
                     tokenizer=mock_tokenizer,
                     use_sent=True,
                     cache_path=cache_path,
+                    max_prompt_length=3,
+                    sent_config=sent_config,
                     num_stages=2
                 )
                 
@@ -299,16 +448,68 @@ class TestSENTGSM8KDataset:
                 dataset.set_stage(2)
                 assert len(dataset) == 3
 
+
+class TestCreateDataloaderFallback:
+    def test_missing_sent_cache_falls_back_to_standard_dataset(self):
+        mock_tokenizer = Mock()
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.eos_token_id = 0
+        mock_tokenizer.padding_side = "right"
+        mock_tokenizer.apply_chat_template.return_value = "formatted prompt"
+        mock_tokenizer.return_value = {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+        }
+
+        with patch("src.data.gsm8k_loader.load_dataset") as mock_load:
+            mock_load.return_value = [{"question": "Q?", "answer": "#### 42"}]
+            dataloader = create_grpo_dataloader(
+                tokenizer=mock_tokenizer,
+                split="train",
+                batch_size=1,
+                use_sent=True,
+                cache_path="/nonexistent/cache.pt",
+            )
+
+        assert isinstance(dataloader.dataset, GRPOGSM8KDataset)
+
+    def test_invalid_existing_sent_cache_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with open(cache_path, "w") as f:
+                json.dump({"metadata": {"status": "complete", "config_hash": "legacy"}}, f)
+
+            mock_tokenizer = Mock()
+            mock_tokenizer.pad_token_id = 0
+            mock_tokenizer.eos_token_id = 0
+            mock_tokenizer.padding_side = "right"
+            mock_tokenizer.apply_chat_template.return_value = "formatted prompt"
+            mock_tokenizer.return_value = {
+                "input_ids": [1, 2, 3],
+                "attention_mask": [1, 1, 1],
+            }
+
+            with pytest.raises(ValueError, match="SENT cache invalid"):
+                create_grpo_dataloader(
+                    tokenizer=mock_tokenizer,
+                    split="train",
+                    batch_size=1,
+                    use_sent=True,
+                    cache_path=cache_path,
+                )
+
     def test_stage_slicing(self):
         """Test stage slicing divides data correctly."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = os.path.join(tmpdir, "cache.json")
+            sent_config = SENTConfig()
+            mock_tokenizer = _configure_mock_tokenizer(Mock())
             
             indices = list(range(100))
             entropies = [i * 0.01 for i in range(100)]
             
             cache_data = {
-                "metadata": {"status": "complete", "config_hash": "abc"},
+                "metadata": _sent_metadata_for(sent_config, mock_tokenizer, 1),
                 "indices": indices,
                 "entropies": entropies,
                 "clusters": [[] for _ in range(100)]
@@ -321,7 +522,7 @@ class TestSENTGSM8KDataset:
             with patch("src.data.gsm8k_loader.load_dataset") as mock_load:
                 mock_load.return_value = [{"question": f"Q{i}?", "answer": str(i)} for i in range(100)]
                 
-                mock_tokenizer = Mock()
+                mock_tokenizer = _configure_mock_tokenizer(mock_tokenizer)
                 mock_tokenizer.apply_chat_template.return_value = "prompt"
                 mock_tokenizer.return_value = {"input_ids": [1], "attention_mask": [1]}
                 
@@ -329,6 +530,8 @@ class TestSENTGSM8KDataset:
                     tokenizer=mock_tokenizer,
                     use_sent=True,
                     cache_path=cache_path,
+                    max_prompt_length=1,
+                    sent_config=sent_config,
                     num_stages=2
                 )
                 
@@ -349,7 +552,7 @@ class TestCheckpointResume:
         """Test that process_dataset can resume from a partial checkpoint."""
         verifier = RuleBasedVerifier()
         mock_model = Mock()
-        mock_tokenizer = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
         config = get_8gb_vram_config()
 
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
@@ -391,7 +594,7 @@ class TestDatasetOrdering:
         """Test that cache entropies are in non-decreasing order after processing."""
         verifier = RuleBasedVerifier()
         mock_model = Mock()
-        mock_tokenizer = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
         config = get_8gb_vram_config()
 
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
@@ -432,9 +635,11 @@ class TestDataloaderCompatibility:
         """Test create_grpo_dataloader works with use_sent=True."""
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = os.path.join(tmpdir, "cache.json")
+            sent_config = SENTConfig()
+            mock_tokenizer = _configure_mock_tokenizer(Mock())
 
             cache_data = {
-                "metadata": {"status": "complete", "config_hash": "abc"},
+                "metadata": _sent_metadata_for(sent_config, mock_tokenizer, 2),
                 "indices": [0, 1, 2, 3],
                 "entropies": [0.1, 0.2, 0.3, 0.4],
                 "clusters": [[], [], [], []],
@@ -449,7 +654,7 @@ class TestDataloaderCompatibility:
                     {"question": f"Q{i}?", "answer": f"#### {i}"} for i in range(4)
                 ]
 
-                mock_tokenizer = Mock()
+                mock_tokenizer = _configure_mock_tokenizer(mock_tokenizer)
                 mock_tokenizer.apply_chat_template.return_value = "formatted"
                 mock_tokenizer.return_value = {"input_ids": [1, 2], "attention_mask": [1, 1]}
                 mock_tokenizer.pad.return_value = {
@@ -462,6 +667,8 @@ class TestDataloaderCompatibility:
                     use_sent=True,
                     batch_size=2,
                     cache_path=cache_path,
+                    max_prompt_length=2,
+                    sent_config=sent_config,
                     shuffle=False,
                 )
 
@@ -505,8 +712,9 @@ class TestEndToEndPreprocess:
         """Test full pipeline: calculator -> cache -> dataset loading."""
         verifier = RuleBasedVerifier()
         mock_model = Mock()
-        mock_tokenizer = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
         config = get_8gb_vram_config()
+        config.training.max_prompt_length = 1
 
         calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
 
@@ -546,7 +754,7 @@ class TestEndToEndPreprocess:
                     {"question": f"What is {i}+1?", "answer": f"#### {i+1}"} for i in range(5)
                 ]
 
-                mock_tok = Mock()
+                mock_tok = _configure_mock_tokenizer(Mock())
                 mock_tok.apply_chat_template.return_value = "prompt"
                 mock_tok.return_value = {"input_ids": [1], "attention_mask": [1]}
 
@@ -554,6 +762,7 @@ class TestEndToEndPreprocess:
                     tokenizer=mock_tok,
                     use_sent=True,
                     cache_path=cache_path,
+                    max_prompt_length=1,
                     num_stages=1,
                 )
 

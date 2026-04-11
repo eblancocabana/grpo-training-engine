@@ -6,6 +6,8 @@ Handles loading, formatting, and batching of GSM8K math problems.
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from typing import Dict, Any, Optional, List
+import hashlib
+import json
 import logging
 import os
 import torch
@@ -16,10 +18,58 @@ from ..utils.config import SENTConfig
 logger = get_logger("data.gsm8k")
 
 
+def format_grpo_prompt(tokenizer, question: str) -> str:
+    """Format a GSM8K question exactly as GRPO training will see it."""
+    messages = [{"role": "user", "content": question}]
+    if hasattr(tokenizer, "apply_chat_template") and getattr(
+        tokenizer, "chat_template", None
+    ):
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            logger.debug("Falling back to raw prompt because chat template rendering failed.")
+    return question
+
+
+def _make_sent_cache_key(
+    sent_config: Optional[object] = None,
+    tokenizer: Optional[object] = None,
+    max_prompt_length: Optional[int] = None,
+    model_id: Optional[str] = None,
+) -> str:
+    """Build a compatibility hash for SENT cache reuse."""
+    sent_dict = sent_config.to_dict() if hasattr(sent_config, "to_dict") else {}
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(chat_template, str):
+        chat_template = None
+    tokenizer_name = getattr(tokenizer, "name_or_path", None)
+    if not isinstance(tokenizer_name, str):
+        tokenizer_name = None
+    chat_template_hash = (
+        hashlib.sha256(chat_template.encode()).hexdigest()
+        if chat_template is not None
+        else None
+    )
+    payload = {
+        "sent": sent_dict,
+        "model_id": model_id,
+        "max_prompt_length": max_prompt_length,
+        "tokenizer_name": tokenizer_name,
+        "tokenizer_class": tokenizer.__class__.__name__ if tokenizer is not None else None,
+        "chat_template_hash": chat_template_hash,
+    }
+    payload_json = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(payload_json.encode()).hexdigest()
+
+
 def _compute_question_length_percentile(
     dataset, tokenizer, percentile: float = 95.0, batch_size: int = 32
 ) -> int:
-    """Estimate a prompt length cap from question lengths."""
+    """Estimate a prompt length cap from templated prompt lengths."""
     if not dataset:
         return 0
 
@@ -34,8 +84,12 @@ def _compute_question_length_percentile(
         if not questions:
             return 0
 
+        prompts = []
+        for question in questions:
+            prompts.append(format_grpo_prompt(tokenizer, question))
+
         encoded = tokenizer(
-            questions,
+            prompts,
             add_special_tokens=False,
             truncation=False,
             padding=False,
@@ -68,15 +122,17 @@ def _compute_question_length_percentile(
 
 
 def _validate_cache(
-    cache_path: str, config: Optional[SENTConfig] = None
+    cache_path: str,
+    config: Optional[SENTConfig] = None,
+    tokenizer: Optional[object] = None,
+    max_prompt_length: Optional[int] = None,
+    model_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Validate cache file exists and has valid metadata."""
     if not os.path.exists(cache_path):
         return False, "Cache file does not exist"
 
     try:
-        import json
-        import hashlib
         import torch
 
         if cache_path.endswith(".json"):
@@ -93,13 +149,25 @@ def _validate_cache(
             )
 
         if config is not None:
-            cfg_dict = config.to_dict() if hasattr(config, "to_dict") else {}
-            cfg_json = json.dumps(cfg_dict, sort_keys=True)
-            cfg_hash = hashlib.sha256(cfg_json.encode()).hexdigest()
-            cached_hash = metadata.get("config_hash", "")
-            if cached_hash and cfg_hash != cached_hash:
-                logger.warning(
-                    f"Config hash mismatch: cache={cached_hash}, current={cfg_hash}"
+            expected_model_id = model_id
+            if expected_model_id is None:
+                tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
+                if isinstance(tokenizer_model_id, str):
+                    expected_model_id = tokenizer_model_id
+            expected_key = _make_sent_cache_key(
+                config,
+                tokenizer=tokenizer,
+                max_prompt_length=max_prompt_length,
+                model_id=expected_model_id,
+            )
+            cached_key = metadata.get("sent_cache_key")
+            if cached_key:
+                if cached_key != expected_key:
+                    return False, "SENT cache compatibility mismatch"
+            elif metadata.get("config_hash"):
+                return (
+                    False,
+                    "Legacy SENT cache metadata lacks compatibility key; regenerate cache.",
                 )
 
         return True, "Cache valid"
@@ -122,16 +190,12 @@ class GRPOGSM8KDataset(Dataset):
         """
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
+        self.requested_max_prompt_length = max_prompt_length
 
         # Load dataset
         logger.info("Loading GSM8K %s split for GRPO...", split)
         self.dataset = load_dataset("gsm8k", "main", split=split)
         logger.info("Loaded %d examples", len(self.dataset))
-        dynamic_max_prompt_length = _compute_question_length_percentile(
-            self.dataset, self.tokenizer
-        )
-        if 0 < dynamic_max_prompt_length < self.max_prompt_length:
-            self.max_prompt_length = dynamic_max_prompt_length
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -156,12 +220,7 @@ class GRPOGSM8KDataset(Dataset):
         # Format prompt using model's native chat template
         # Reference: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/raw/main/tokenizer_config.json
         # DeepSeek-R1-Distill-Qwen uses <｜begin▁of▁sentence｜><｜User｜>{question}<｜Assistant｜><think>\n
-        messages = [{"role": "user", "content": question}]
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,  # Adds "<｜Assistant｜><think>\n"
-        )
+        prompt = format_grpo_prompt(self.tokenizer, question)
 
         # Tokenize prompt only
         encoding = self.tokenizer(
@@ -195,6 +254,7 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
         cache_path: str = "data/cache/gsm8k_sent_sorted.pt",
         sent_config: Optional[SENTConfig] = None,
         num_stages: int = 1,
+        model_id: Optional[str] = None,
     ):
         super().__init__(tokenizer, split, max_prompt_length)
 
@@ -202,6 +262,12 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
         self.cache_path = cache_path
         self.sent_config = sent_config or SENTConfig()
         self.num_stages = max(1, num_stages)
+        tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
+        self.model_id = (
+            model_id
+            if model_id is not None
+            else tokenizer_model_id if isinstance(tokenizer_model_id, str) else None
+        )
 
         self.sorted_indices: List[int] = []
         self.entropies: List[float] = []
@@ -209,7 +275,13 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
         self.current_stage_indices: List[int] = []
 
         if self.use_sent:
-            is_valid, msg = _validate_cache(self.cache_path, self.sent_config)
+            is_valid, msg = _validate_cache(
+                self.cache_path,
+                self.sent_config,
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.max_prompt_length,
+                model_id=self.model_id,
+            )
             if not is_valid:
                 raise ValueError(
                     f"SENT cache invalid: {msg}. "
@@ -297,6 +369,8 @@ def create_grpo_dataloader(
     cache_path: str = "data/cache/gsm8k_sent_sorted.pt",
     num_workers: Optional[int] = None,
     prefetch_factor: int = 2,
+    model_id: Optional[str] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> DataLoader:
     """
     Create DataLoader for GRPO training.
@@ -315,20 +389,51 @@ def create_grpo_dataloader(
     Returns:
         DataLoader instance
     """
+    tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
+    resolved_model_id = (
+        model_id
+        if model_id is not None
+        else tokenizer_model_id if isinstance(tokenizer_model_id, str) else None
+    )
+
     if use_sent:
-        dataset = SENTGSM8KDataset(
+        is_valid, msg = _validate_cache(
+            cache_path,
+            sent_config,
             tokenizer=tokenizer,
-            split=split,
             max_prompt_length=max_prompt_length,
-            use_sent=True,
-            cache_path=cache_path,
-            sent_config=sent_config,
-            num_stages=num_stages,
+            model_id=resolved_model_id,
         )
-        if shuffle:
-            logger.warning(
-                "Shuffle=True is not recommended with SENT (order matters for curriculum)"
+        if is_valid:
+            dataset = SENTGSM8KDataset(
+                tokenizer=tokenizer,
+                split=split,
+                max_prompt_length=max_prompt_length,
+                use_sent=True,
+                cache_path=cache_path,
+                sent_config=sent_config,
+                num_stages=num_stages,
+                model_id=resolved_model_id,
             )
+            if shuffle:
+                logger.warning(
+                    "Shuffle=True is not recommended with SENT (order matters for curriculum)"
+                )
+        else:
+            if not os.path.exists(cache_path):
+                logger.warning(
+                    "SENT cache unavailable (%s); falling back to standard GSM8K ordering.",
+                    msg,
+                )
+                dataset = GRPOGSM8KDataset(
+                    tokenizer=tokenizer, split=split, max_prompt_length=max_prompt_length
+                )
+                use_sent = False
+            else:
+                raise ValueError(
+                    f"SENT cache invalid: {msg}. "
+                    "Regenerate the cache or disable SENT explicitly."
+                )
     else:
         dataset = GRPOGSM8KDataset(
             tokenizer=tokenizer, split=split, max_prompt_length=max_prompt_length
@@ -405,6 +510,7 @@ def create_grpo_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=grpo_collate,
+        generator=generator,
         pin_memory=True,
         num_workers=worker_count,
         prefetch_factor=prefetch_factor if worker_count > 0 else None,

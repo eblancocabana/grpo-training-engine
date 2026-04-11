@@ -17,6 +17,7 @@ import argparse
 import logging
 import json
 import hashlib
+from contextlib import contextmanager
 
 from src.utils.logging_utils import get_logger, TRACE, log_tensor_meta
 
@@ -24,7 +25,7 @@ from src.utils.logging_utils import get_logger, TRACE, log_tensor_meta
 logger = get_logger("trainer")
 
 from src.core.model_loader import load_4bit_engine
-from src.core.lora import inject_lora_layers, get_lora_parameters
+from src.core.lora import inject_lora_layers, get_lora_parameters, lora_disabled
 from src.core.memory_manager import MemoryManager, print_model_memory_usage
 from src.grpo.algorithm import GRPOTrainer, GroupSampler
 from src.grpo.verifier import RuleBasedVerifier
@@ -96,13 +97,17 @@ class GRPOTrainerLoop:
         self.current_step = 0
         self.current_epoch = 0
         self.global_step = 0
+        self.optimizer_step = 0
+        self._accumulation_batches = 0
         self._gen_micro_batch = 4
         self._train_micro_batch = 4
         self._oom_backoff_count = 0
+        self._post_oom_success_batches = 0
         self._wandb_run = None
         self._step_start_time = None
         self._resume_step = None
         self._resume_epoch = None
+        self._dataloader_seed = int(torch.initial_seed() % (2**31))
         self._profiler_hooks: ProfilerHooks | None = None
         self._metrics_jsonl_path: Optional[str] = None
 
@@ -142,18 +147,11 @@ class GRPOTrainerLoop:
             weight_decay=self.config.training.weight_decay,
             betas=(0.9, 0.999),
         )
+        self._initialize_optimizer_state()
 
-        # Setup scheduler: linear warmup then cosine decay
-        total_steps = self.config.training.num_epochs * 1000
-        warmup_steps = self.config.training.warmup_steps
-
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return step / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+        # Setup scheduler with a placeholder budget; it is recalibrated once the
+        # dataloader size is known so the cosine schedule matches the real run.
+        self.scheduler = self._create_scheduler(total_optimizer_steps=1)
 
         # Setup memory manager
         self.memory_manager = MemoryManager(
@@ -223,6 +221,12 @@ class GRPOTrainerLoop:
             dataset_split="test",
             num_samples=50,
             device=self.device,
+            generate_fn=self.generate_responses,
+            max_new_tokens=self.config.training.max_response_length,
+            max_prompt_length=self.config.training.max_prompt_length,
+            do_sample=self.config.training.generation_do_sample,
+            temperature=self.config.training.generation_temperature,
+            top_p=self.config.training.generation_top_p,
         )
 
         # Setup WandB
@@ -434,6 +438,251 @@ class GRPOTrainerLoop:
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+    def _create_scheduler(self, total_optimizer_steps: int) -> LambdaLR:
+        """Create the LR scheduler using the real optimizer-step budget."""
+        warmup_steps = self.config.training.warmup_steps
+        total_steps = max(1, total_optimizer_steps)
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = min(
+                1.0,
+                (step - warmup_steps) / max(1, total_steps - warmup_steps),
+            )
+            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return LambdaLR(self.optimizer, lr_lambda)
+
+    def _estimate_total_optimizer_steps(
+        self, steps_per_epoch: int, num_epochs: int
+    ) -> int:
+        """Estimate optimizer steps when partial accumulation flushes at epoch end."""
+        accum_steps = max(1, self.config.training.gradient_accumulation_steps)
+        max_batches = self.config.training.max_steps
+        remaining_batches = (
+            max_batches if max_batches is not None else steps_per_epoch * num_epochs
+        )
+        total_optimizer_steps = 0
+
+        for _ in range(num_epochs):
+            if remaining_batches <= 0:
+                break
+            epoch_batches = min(steps_per_epoch, remaining_batches)
+            total_optimizer_steps += math.ceil(epoch_batches / accum_steps)
+            remaining_batches -= epoch_batches
+
+        return max(1, total_optimizer_steps)
+
+    def _configure_scheduler(self, steps_per_epoch: int, num_epochs: int) -> None:
+        """Rebuild the scheduler once the true run length is known."""
+        if self.optimizer is None:
+            return
+
+        total_optimizer_steps = self._estimate_total_optimizer_steps(
+            steps_per_epoch, num_epochs
+        )
+        previous_state = self.scheduler.state_dict() if self.scheduler is not None else None
+        self.scheduler = self._create_scheduler(total_optimizer_steps=total_optimizer_steps)
+        if previous_state is not None:
+            self.scheduler.load_state_dict(previous_state)
+
+    def _optimizer_step_due(self) -> bool:
+        return (
+            self._accumulation_batches
+            >= self.config.training.gradient_accumulation_steps
+        )
+
+    def _flush_accumulated_gradients(self) -> bool:
+        """Apply any pending gradients and advance the optimizer once."""
+        if self.optimizer is None or self._accumulation_batches <= 0:
+            return False
+
+        grad_scale = (
+            self.config.training.gradient_accumulation_steps
+            / max(1, self._accumulation_batches)
+        )
+        if grad_scale != 1.0:
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(grad_scale)
+
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.config.training.max_grad_norm
+        )
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_step += 1
+        self._accumulation_batches = 0
+        return True
+
+    @contextmanager
+    def _temporary_eval_mode(self):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            yield
+        finally:
+            self.model.train(was_training)
+
+    def _should_use_triton_generation(self) -> bool:
+        if not getattr(self.config.training, "use_triton_kernels", False):
+            return False
+        if not TRITON_AVAILABLE:
+            return False
+        if getattr(self.config.training, "generation_do_sample", False):
+            return False
+
+        model_config = getattr(self.model, "config", None)
+        num_heads = getattr(model_config, "num_attention_heads", None)
+        num_kv_heads = getattr(model_config, "num_key_value_heads", num_heads)
+        if (
+            num_heads is not None
+            and num_kv_heads is not None
+            and num_heads != num_kv_heads
+        ):
+            return False
+
+        return True
+
+    def _create_train_dataloader(self, sent_stage: int, epoch: int):
+        use_sent = self.config.sent.enabled
+        do_shuffle = not use_sent
+        generator = None
+        if do_shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self._dataloader_seed + epoch)
+
+        dataloader = create_grpo_dataloader(
+            tokenizer=self.tokenizer,
+            split="train",
+            batch_size=self.config.training.batch_size,
+            max_prompt_length=self.config.training.max_prompt_length,
+            shuffle=do_shuffle,
+            use_sent=use_sent,
+            sent_config=self.config.sent,
+            num_stages=self.config.sent.curriculum_stages,
+            cache_path=self.config.sent.cache_path,
+            model_id=self.config.model.model_id,
+            generator=generator,
+        )
+
+        if use_sent and hasattr(dataloader.dataset, "set_stage"):
+            dataloader.dataset.set_stage(sent_stage)
+            stage_info = dataloader.dataset.get_stage_info()
+            logger.info(
+                "[SENT] Training on stage %d/%d (samples %d-%d)",
+                sent_stage,
+                stage_info["num_stages"],
+                stage_info["stage_start_idx"],
+                stage_info["stage_end_idx"],
+            )
+
+        return dataloader
+
+    def _initialize_optimizer_state(self) -> None:
+        """Pre-allocate AdamW state so the first real optimizer step is not a surprise OOM."""
+        if not isinstance(self.optimizer, AdamW):
+            return
+
+        for group in self.optimizer.param_groups:
+            amsgrad = bool(group.get("amsgrad", False))
+            for param in group["params"]:
+                if param is None or not param.requires_grad:
+                    continue
+                state = self.optimizer.state[param]
+                if state:
+                    continue
+                state["step"] = torch.zeros((), dtype=torch.float32, device=param.device)
+                state["exp_avg"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                if amsgrad:
+                    state["max_exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+
+    def _compute_truncation_mask(
+        self, response_ids: torch.Tensor, response_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mark completions that should contribute gradient signal."""
+        truncation_mask = torch.ones(
+            response_ids.shape[0], dtype=torch.float32, device=self.device
+        )
+        if not self.config.grpo.mask_truncated_completions:
+            return truncation_mask
+
+        eos_id = self.tokenizer.eos_token_id
+        for idx in range(response_ids.shape[0]):
+            resp_tokens = response_ids[idx][response_mask[idx].bool()]
+            if resp_tokens.numel() >= self.config.training.max_response_length:
+                if eos_id not in resp_tokens:
+                    truncation_mask[idx] = 0.0
+        return truncation_mask
+
+    def _calculate_masked_group_advantages(
+        self, rewards: torch.Tensor, sample_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Center rewards within each prompt group while excluding masked samples."""
+        group_size = self.config.grpo.group_size
+        grouped_rewards = rewards.view(-1, group_size)
+        grouped_mask = sample_mask.view(-1, group_size)
+        valid_counts = grouped_mask.sum(dim=1, keepdim=True)
+        safe_counts = torch.clamp(valid_counts, min=1.0)
+        mean_rewards = (grouped_rewards * grouped_mask).sum(dim=1, keepdim=True) / safe_counts
+        advantages = (grouped_rewards - mean_rewards) * grouped_mask
+        advantages = torch.where(valid_counts > 0, advantages, torch.zeros_like(advantages))
+        return advantages.view(-1)
+
+    def _responses_from_output_tokens(
+        self, output_ids: torch.Tensor
+    ) -> tuple[list[str], torch.Tensor]:
+        """Decode response-only token tensors and build an exact rollout mask."""
+        if output_ids.ndim != 2:
+            raise ValueError(
+                f"Expected response token tensor of shape [batch, seq], got {output_ids.shape}."
+            )
+
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        response_mask = torch.zeros_like(output_ids, dtype=torch.long)
+        decoded_rows: list[torch.Tensor] = []
+
+        for row_idx in range(output_ids.shape[0]):
+            row = output_ids[row_idx]
+            valid_len = row.shape[0]
+            found_eos = False
+
+            if eos_token_id is not None:
+                eos_positions = (row == eos_token_id).nonzero(as_tuple=False)
+                if eos_positions.numel() > 0:
+                    valid_len = int(eos_positions[0].item()) + 1
+                    found_eos = True
+            if pad_token_id is not None and not found_eos:
+                non_pad_positions = (row != pad_token_id).nonzero(as_tuple=False)
+                valid_len = (
+                    int(non_pad_positions[-1].item()) + 1
+                    if non_pad_positions.numel() > 0
+                    else 0
+                )
+
+            if valid_len > 0:
+                response_mask[row_idx, :valid_len] = 1
+                decoded_rows.append(row[:valid_len].detach().cpu())
+            else:
+                decoded_rows.append(row[:0].detach().cpu())
+
+        generated_texts = self.tokenizer.batch_decode(
+            decoded_rows,
+            skip_special_tokens=True,
+        )
+        return generated_texts, response_mask
+
     def _generate_with_expanded_prefix_cache(
         self,
         real_ids: torch.Tensor,
@@ -512,9 +761,9 @@ class GRPOTrainerLoop:
         del mb_cache, current_input_ids, current_attention_mask, unfinished, pad_tokens
         return generated_ids[:, :generated_steps]
 
-    def generate_responses(
+    def _generate_responses_with_tokens(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> List[str]:
+    ) -> tuple[List[str], torch.Tensor, torch.Tensor]:
         """
         Generate responses for GRPO group sampling with KV-cache prefix sharing.
 
@@ -534,11 +783,13 @@ class GRPOTrainerLoop:
             attention_mask: Attention mask [batch, seq_len]
 
         Returns:
-            List of generated text strings (batch * group_size total)
+            Tuple of decoded strings, response token ids, and response mask.
         """
+        was_training = self.model.training
         self.model.eval()
 
         generated_texts = []
+        response_batches: list[torch.Tensor] = []
         group_size = self.group_sampler.group_size
         batch_size = input_ids.shape[0]
         micro_batch_size = self._gen_micro_batch
@@ -554,9 +805,7 @@ class GRPOTrainerLoop:
                 real_mask = single_mask[:, first_real:]
                 prompt_len = real_ids.shape[1]
 
-                use_triton_kernels = getattr(
-                    self.config.training, "use_triton_kernels", False
-                )
+                use_triton_kernels = self._should_use_triton_generation()
 
                 if use_triton_kernels:
                     prefix_cache = None
@@ -568,6 +817,7 @@ class GRPOTrainerLoop:
                 for g_start in range(0, group_size, micro_batch_size):
                     g_end = min(g_start + micro_batch_size, group_size)
                     current_micro = g_end - g_start
+                    outputs_are_response_only = True
 
                     if use_triton_kernels:
                         if TRITON_AVAILABLE:
@@ -601,6 +851,26 @@ class GRPOTrainerLoop:
                                     eos_token_id=self.tokenizer.eos_token_id,
                                     use_cache=True,
                                 )
+                                outputs_are_response_only = False
+                            except (RuntimeError, ValueError) as exc:
+                                if "out of memory" in str(exc).lower():
+                                    raise
+                                logger.warning(
+                                    "Falling back from Triton paged_kv_decode to model.generate(): %s",
+                                    exc,
+                                )
+                                outputs = self.model.generate(
+                                    input_ids=real_ids.expand(current_micro, -1),
+                                    attention_mask=real_mask.expand(current_micro, -1),
+                                    max_new_tokens=self.config.training.max_response_length,
+                                    do_sample=self.config.training.generation_do_sample,
+                                    temperature=self.config.training.generation_temperature,
+                                    top_p=self.config.training.generation_top_p,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    eos_token_id=self.tokenizer.eos_token_id,
+                                    use_cache=True,
+                                )
+                                outputs_are_response_only = False
                         else:
                             outputs = self.model.generate(
                                 input_ids=real_ids.expand(current_micro, -1),
@@ -613,6 +883,7 @@ class GRPOTrainerLoop:
                                 eos_token_id=self.tokenizer.eos_token_id,
                                 use_cache=True,
                             )
+                            outputs_are_response_only = False
                     else:
                         outputs = self._generate_with_expanded_prefix_cache(
                             real_ids=real_ids,
@@ -621,17 +892,13 @@ class GRPOTrainerLoop:
                             current_micro=current_micro,
                         )
 
-                    # CPU offload outputs before decoding to reduce GPU sync
-                    if use_triton_kernels:
-                        outputs_cpu = outputs[:, prompt_len:].detach().cpu()
-                    else:
-                        outputs_cpu = outputs.detach().cpu()
+                    if not outputs_are_response_only:
+                        outputs = outputs[:, prompt_len:]
 
-                    # Batch decode all responses at once for efficiency
-                    decoded_batch = self.tokenizer.batch_decode(
-                        outputs_cpu, skip_special_tokens=True
-                    )
+                    outputs_cpu = outputs.detach().cpu()
+                    decoded_batch, _ = self._responses_from_output_tokens(outputs_cpu)
                     generated_texts.extend(decoded_batch)
+                    response_batches.append(outputs_cpu)
 
                     if use_triton_kernels:
                         del outputs
@@ -646,6 +913,43 @@ class GRPOTrainerLoop:
                 else:
                     del single_ids, single_mask, real_ids, real_mask, prefix_cache
 
+        try:
+            if response_batches:
+                max_response_width = max(batch.shape[1] for batch in response_batches)
+                pad_token_id = self.tokenizer.pad_token_id
+                if pad_token_id is None:
+                    pad_token_id = self.tokenizer.eos_token_id
+                if pad_token_id is None:
+                    pad_token_id = 0
+                padded_batches = []
+                for batch in response_batches:
+                    if batch.shape[1] == max_response_width:
+                        padded_batches.append(batch)
+                        continue
+                    padded = torch.full(
+                        (batch.shape[0], max_response_width),
+                        pad_token_id,
+                        dtype=batch.dtype,
+                    )
+                    padded[:, : batch.shape[1]] = batch
+                    padded_batches.append(padded)
+                response_ids = torch.cat(padded_batches, dim=0)
+                _, response_mask = self._responses_from_output_tokens(response_ids)
+            else:
+                response_ids = torch.empty((0, 0), dtype=input_ids.dtype)
+                response_mask = torch.empty((0, 0), dtype=torch.long)
+            return generated_texts, response_ids.to(self.device), response_mask.to(
+                self.device
+            )
+        finally:
+            self.model.train(was_training)
+
+    def generate_responses(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> List[str]:
+        generated_texts, _, _ = self._generate_responses_with_tokens(
+            input_ids, attention_mask
+        )
         return generated_texts
 
     @staticmethod
@@ -769,15 +1073,13 @@ class GRPOTrainerLoop:
         """
         self._step_start_time = time.time()
         self.model.train()
-
-        self.memory_manager.maybe_update_checkpointing(
-            self.model, step=self.global_step
-        )
+        if hasattr(self.memory_manager, "reset_peak_stats"):
+            self.memory_manager.reset_peak_stats()
 
         if self._profiler_hooks:
             self._profiler_hooks.on_step_start(self.global_step, self.current_epoch)
 
-        if self.global_step % self.config.training.gradient_accumulation_steps == 0:
+        if self._accumulation_batches == 0:
             self.optimizer.zero_grad(set_to_none=True)
 
         # Get batch data
@@ -791,22 +1093,12 @@ class GRPOTrainerLoop:
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_start("generation", step=self.global_step)
 
-        generated_texts = self.generate_responses(input_ids, attention_mask)
+        generated_texts, response_ids, response_mask = self._generate_responses_with_tokens(
+            input_ids, attention_mask
+        )
 
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_end("generation", step=self.global_step)
-
-        # Tokenize responses (without prompt) early for length penalty
-        gen_encodings = self.tokenizer(
-            generated_texts,
-            truncation=True,
-            max_length=self.config.training.max_response_length,
-            padding="longest",
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        response_ids = gen_encodings["input_ids"].to(self.device)
-        response_mask = gen_encodings["attention_mask"].to(self.device)
 
         # Calculate lengths for penalty
         response_lengths = response_mask.sum(dim=1).float()
@@ -895,8 +1187,8 @@ class GRPOTrainerLoop:
             logger.debug("=" * 40)
         # -------------------
 
-        # Calculate advantages
-        advantages = self.grpo_trainer.calculate_advantages(rewards)
+        truncation_mask = self._compute_truncation_mask(response_ids, response_mask)
+        advantages = self._calculate_masked_group_advantages(rewards, truncation_mask)
 
         # TRACE-level logging for tensor metadata
         log_tensor_meta(logger, "Advantages", advantages, level=TRACE)
@@ -914,25 +1206,7 @@ class GRPOTrainerLoop:
 
         num_samples = response_ids.shape[0]
 
-        # Mask truncated completions: zero out loss for responses that hit max_response_length
-        # without producing an EOS token (truncated mid-thought → noisy gradient signal)
-        if self.config.grpo.mask_truncated_completions:
-            eos_id = self.tokenizer.eos_token_id
-            truncation_mask = torch.ones(
-                num_samples, dtype=torch.float32, device=self.device
-            )
-            for idx in range(num_samples):
-                resp_tokens = response_ids[idx][response_mask[idx].bool()]
-                if resp_tokens.numel() >= self.config.training.max_response_length:
-                    if eos_id not in resp_tokens:
-                        truncation_mask[idx] = 0.0
-
-            if truncation_mask.sum() == 0:
-                truncation_mask[:] = 1.0
-
-            advantages = advantages * truncation_mask
-
-        del generated_texts, gen_encodings
+        del generated_texts
 
         # Concatenate prompt + response for each sample
         # This matches grpo_zero: batch_token_ids = prefix_token_ids + generated_token_ids
@@ -973,7 +1247,7 @@ class GRPOTrainerLoop:
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_start("old_log_probs", step=self.global_step)
 
-        with torch.no_grad():
+        with self._temporary_eval_mode(), torch.no_grad():
             all_old_log_probs = self._compute_old_log_probs_with_prompt_cache(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -987,6 +1261,7 @@ class GRPOTrainerLoop:
 
         # Re-enable gradients for training phase
         self.memory_manager.optimize_for_training()
+        self.model.train()
 
         training_micro_batch = self._train_micro_batch
 
@@ -1003,6 +1278,19 @@ class GRPOTrainerLoop:
             ]  # Response-only mask
             batch_advantages = advantages[start_idx:end_idx]
             batch_old_log_probs = all_old_log_probs[start_idx:end_idx]
+
+            reference_logits = None
+            if self.config.grpo.use_kl:
+                with self._temporary_eval_mode(), torch.no_grad(), lora_disabled(
+                    self.model
+                ):
+                    reference_outputs = self.model(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                        use_cache=False,
+                    )
+                reference_logits = reference_outputs.logits[:, :-1, :].detach()
+                del reference_outputs
 
             # Forward pass (model sees full prompt+response context)
             outputs = self.model(
@@ -1048,6 +1336,7 @@ class GRPOTrainerLoop:
                 target_ids=batch_input_ids[:, 1:],
                 attention_mask=batch_response_mask[:, 1:],
                 entropy_mask=entropy_mask if entropy_mask is not None else None,
+                reference_logits=reference_logits,
             )
 
             # Scale loss for gradient accumulation
@@ -1064,19 +1353,18 @@ class GRPOTrainerLoop:
 
         del all_input_ids, all_attention_mask, response_only_mask, all_old_log_probs
 
-        # Optimizer step (only after accumulation)
-        if (
-            self.global_step + 1
-        ) % self.config.training.gradient_accumulation_steps == 0:
-            # Clip gradients only at the accumulation boundary, not every step.
-            # Clipping every step destroys accumulated gradients by repeatedly
-            # capping them to max_norm before the full effective batch is gathered.
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.training.max_grad_norm
+        self._accumulation_batches += 1
+        if self._optimizer_step_due():
+            self._flush_accumulated_gradients()
+        if hasattr(self.memory_manager, "maybe_update_checkpointing"):
+            peak_stats = None
+            if hasattr(self.memory_manager, "get_peak_memory_stats"):
+                peak_stats = self.memory_manager.get_peak_memory_stats()
+            self.memory_manager.maybe_update_checkpointing(
+                self.model,
+                step=self.global_step,
+                memory_stats=peak_stats,
             )
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
 
         # Aggregate metrics
         avg_metrics = {
@@ -1129,6 +1417,7 @@ class GRPOTrainerLoop:
         avg_metrics["gen_micro_batch"] = float(self._gen_micro_batch)
         avg_metrics["train_micro_batch"] = float(self._train_micro_batch)
         avg_metrics["oom_backoff_count"] = float(self._oom_backoff_count)
+        avg_metrics["optimizer_step"] = float(self.optimizer_step)
 
         self.global_step += 1
         self.memory_manager.step()
@@ -1156,6 +1445,41 @@ class GRPOTrainerLoop:
     def _max_steps_reached(self) -> bool:
         max_steps = self.config.training.max_steps
         return max_steps is not None and self.global_step >= max_steps
+
+    def _capture_optimizer_grad_snapshot(self) -> Dict[int, torch.Tensor]:
+        """Clone current gradients so an OOM retry can restore accumulation state."""
+        if self.optimizer is None:
+            return {}
+
+        snapshot: Dict[int, torch.Tensor] = {}
+        seen: set[int] = set()
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                if param.grad is not None:
+                    snapshot[id(param)] = param.grad.detach().clone()
+        return snapshot
+
+    def _restore_optimizer_grad_snapshot(
+        self, snapshot: Dict[int, torch.Tensor]
+    ) -> None:
+        """Restore gradients captured before a failed training-step attempt."""
+        if self.optimizer is None:
+            return
+
+        seen: set[int] = set()
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                grad = snapshot.get(id(param))
+                if grad is None:
+                    param.grad = None
+                else:
+                    param.grad = grad.to(device=param.device, dtype=param.dtype)
 
     def train_epoch_with_skip(self, dataloader, epoch: int, skip_steps: int = 0):
         self.model.train()
@@ -1198,61 +1522,15 @@ class GRPOTrainerLoop:
                 logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
                 reached_max_steps = True
                 break
-            try:
-                metrics = self.training_step(batch)
-                epoch_metrics.append(metrics)
-
-                if self._oom_backoff_count > 0 and batch_idx % 50 == 0:
-                    self._gen_micro_batch = min(4, self._gen_micro_batch + 1)
-                    self._train_micro_batch = min(4, self._train_micro_batch + 1)
-                    self._oom_backoff_count = max(0, self._oom_backoff_count - 1)
-
-                vram_info = self.memory_manager.get_memory_stats()
-                vram_str = (
-                    f"{vram_info['reserved_gb']:.1f}GB"
-                    if "reserved_gb" in vram_info
-                    else "N/A"
-                )
-
-                pbar.set_postfix(
-                    {
-                        "loss": f"{metrics['loss']:.4f}",
-                        "reward": f"{metrics['avg_reward']:.3f}",
-                        "tokens_per_sec": f"{metrics['tokens_per_sec']:.3f}",
-                        "vram": vram_str,
-                        "step": self.global_step,
-                    }
-                )
-
-                # Logging
-                if self.global_step % self.config.training.log_interval == 0:
-                    self.memory_manager.print_memory_stats(f"[Step {self.global_step}]")
-
-                # Benchmark evaluation every 100 steps
-                if self.global_step % 100 == 0:
-                    try:
-                        if self._profiler_hooks:
-                            self._profiler_hooks.annotate_step(
-                                self.global_step, "benchmark"
-                            )
-                        self.benchmark.run(self.global_step)
-                    except Exception as e:
-                        logger.info(
-                            "[Benchmark] Failed at step %s: %s", self.global_step, e
-                        )
-
-                # Save checkpoint
-                if self.global_step % self.config.training.save_interval == 0:
-                    if self._profiler_hooks:
-                        self._profiler_hooks.annotate_step(
-                            self.global_step,
-                            "checkpoint",
-                            {"suffix": ""},
-                        )
-                    self.save_checkpoint()
-
-            except RuntimeError as e:
-                if "out of memory" in str(e):
+            while True:
+                grad_snapshot = self._capture_optimizer_grad_snapshot()
+                try:
+                    metrics = self.training_step(batch)
+                    break
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    self._restore_optimizer_grad_snapshot(grad_snapshot)
                     if self._profiler_hooks:
                         self._profiler_hooks.on_oom(
                             self.global_step,
@@ -1262,18 +1540,98 @@ class GRPOTrainerLoop:
                                 "epoch": epoch,
                             },
                         )
+                    next_gen_micro = max(1, self._gen_micro_batch // 2)
+                    next_train_micro = max(1, self._train_micro_batch // 2)
+                    if (
+                        next_gen_micro == self._gen_micro_batch
+                        and next_train_micro == self._train_micro_batch
+                    ):
+                        logger.info(
+                            "\n[OOM] Unable to recover at minimum micro-batches (gen=%s, train=%s).",
+                            self._gen_micro_batch,
+                            self._train_micro_batch,
+                        )
+                        self.memory_manager.clear_cache(aggressive=True)
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        raise
                     self._oom_backoff_count += 1
-                    self._gen_micro_batch = max(1, self._gen_micro_batch // 2)
-                    self._train_micro_batch = max(1, self._train_micro_batch // 2)
+                    self._post_oom_success_batches = 0
+                    self._gen_micro_batch = next_gen_micro
+                    self._train_micro_batch = next_train_micro
+                    if hasattr(self.memory_manager, "enable_checkpointing"):
+                        self.memory_manager.enable_checkpointing(self.model)
                     logger.info(
                         f"\n[OOM] Backoff #{self._oom_backoff_count}: gen_batch={self._gen_micro_batch}, train_batch={self._train_micro_batch}"
                     )
                     self.memory_manager.clear_cache(aggressive=True)
                     torch.cuda.empty_cache()
                     gc.collect()
-                    continue
-                else:
-                    raise e
+
+            epoch_metrics.append(metrics)
+
+            if self._oom_backoff_count > 0:
+                self._post_oom_success_batches += 1
+                if self._post_oom_success_batches >= 50:
+                    self._gen_micro_batch = min(4, self._gen_micro_batch + 1)
+                    self._train_micro_batch = min(4, self._train_micro_batch + 1)
+                    self._oom_backoff_count = max(0, self._oom_backoff_count - 1)
+                    self._post_oom_success_batches = 0
+
+            vram_info = self.memory_manager.get_memory_stats()
+            vram_str = (
+                f"{vram_info['reserved_gb']:.1f}GB"
+                if "reserved_gb" in vram_info
+                else "N/A"
+            )
+
+            pbar.set_postfix(
+                {
+                    "loss": f"{metrics['loss']:.4f}",
+                    "reward": f"{metrics['avg_reward']:.3f}",
+                    "tokens_per_sec": f"{metrics['tokens_per_sec']:.3f}",
+                    "vram": vram_str,
+                    "step": self.global_step,
+                }
+            )
+
+            # Logging
+            if self.global_step % self.config.training.log_interval == 0:
+                self.memory_manager.print_memory_stats(f"[Step {self.global_step}]")
+
+            # Benchmark evaluation every 100 steps
+            if self.global_step % 100 == 0:
+                try:
+                    if self._profiler_hooks:
+                        self._profiler_hooks.annotate_step(
+                            self.global_step, "benchmark"
+                        )
+                    self.benchmark.run(self.global_step)
+                except Exception as e:
+                    logger.info(
+                        "[Benchmark] Failed at step %s: %s", self.global_step, e
+                    )
+
+            # Save checkpoint
+            if (
+                self.global_step % self.config.training.save_interval == 0
+                and self._accumulation_batches == 0
+            ):
+                if self._profiler_hooks:
+                    self._profiler_hooks.annotate_step(
+                        self.global_step,
+                        "checkpoint",
+                        {"suffix": ""},
+                    )
+                self.save_checkpoint()
+
+        if self._accumulation_batches > 0:
+            logger.info(
+                "[Train] Flushing partial accumulation window (%d/%d batches).",
+                self._accumulation_batches,
+                self.config.training.gradient_accumulation_steps,
+            )
+            self._flush_accumulated_gradients()
 
         # Epoch summary
         if not epoch_metrics:
@@ -1320,36 +1678,9 @@ class GRPOTrainerLoop:
         if num_epochs is None:
             num_epochs = self.config.training.num_epochs
 
-        # Create dataloader
         logger.info("\n[Train] Creating dataloader...")
-        # Determine shuffle based on SENT
-        # If SENT is enabled, we MUST NOT shuffle (curriculum depends on order)
         use_sent = self.config.sent.enabled
-        do_shuffle = not use_sent
-
-        dataloader = create_grpo_dataloader(
-            tokenizer=self.tokenizer,
-            split="train",
-            batch_size=self.config.training.batch_size,
-            max_prompt_length=self.config.training.max_prompt_length,
-            shuffle=do_shuffle,
-            use_sent=use_sent,
-            sent_config=self.config.sent,
-            num_stages=self.config.sent.curriculum_stages,
-            cache_path=self.config.sent.cache_path,
-        )
-
-        # Set curriculum stage if SENT is enabled
-        if use_sent and hasattr(dataloader.dataset, "set_stage"):
-            dataloader.dataset.set_stage(sent_stage)
-            stage_info = dataloader.dataset.get_stage_info()
-            logger.info(
-                "[SENT] Training on stage %d/%d (samples %d-%d)",
-                sent_stage,
-                stage_info["num_stages"],
-                stage_info["stage_start_idx"],
-                stage_info["stage_end_idx"],
-            )
+        dataloader = self._create_train_dataloader(sent_stage=sent_stage, epoch=0)
 
         logger.info("[Train] Starting training for %s epochs...", num_epochs)
         logger.info("[Train] Steps per epoch: ~%s", len(dataloader))
@@ -1359,6 +1690,7 @@ class GRPOTrainerLoop:
         logger.info(
             f"[Train] Effective batch size: {self.config.training.batch_size * self.config.training.gradient_accumulation_steps}"
         )
+        self._configure_scheduler(len(dataloader), num_epochs)
 
         if (
             self.config.training.max_steps is not None
@@ -1530,6 +1862,11 @@ class GRPOTrainerLoop:
                 )
                 break
             self.current_epoch = epoch
+            if not use_sent:
+                dataloader = self._create_train_dataloader(
+                    sent_stage=sent_stage,
+                    epoch=epoch,
+                )
             epoch_skip = resume_skip_steps if epoch == resume_epoch else 0
             if self._profiler_hooks:
                 self._profiler_hooks.annotate_step(
@@ -1579,12 +1916,28 @@ class GRPOTrainerLoop:
             scheduler=self.scheduler,
             strict=strict,
         )
+        if self.optimizer is not None:
+            self.checkpoint_manager.move_optimizer_state_to_model_device(
+                self.optimizer,
+                self.model,
+            )
 
         self.global_step = info.get("step", 0)
         self.current_step = self.global_step
         self.current_epoch = info.get("epoch", 0)
+        self.optimizer_step = info.get("optimizer_step", 0)
+        saved_accumulation_batches = info.get("accumulation_batches", 0)
+        self._accumulation_batches = 0
+        self._dataloader_seed = info.get("dataloader_seed", self._dataloader_seed)
         self._resume_step = self.global_step
         self._resume_epoch = self.current_epoch
+        if saved_accumulation_batches:
+            logger.warning(
+                "[Resume] Discarding %d partially accumulated batches because gradient buffers are not checkpointed.",
+                saved_accumulation_batches,
+            )
+            if self.optimizer is not None:
+                self.optimizer.zero_grad(set_to_none=True)
 
         logger.info(
             "[Resume] Loaded checkpoint at step %d, epoch %d.",
@@ -1607,6 +1960,11 @@ class GRPOTrainerLoop:
             step=self.global_step,
             epoch=self.current_epoch,
             checkpoint_name=checkpoint_name,
+            extra_state={
+                "optimizer_step": self.optimizer_step,
+                "accumulation_batches": self._accumulation_batches,
+                "dataloader_seed": self._dataloader_seed,
+            },
         )
 
     def save_lora_weights(self, suffix: str = ""):

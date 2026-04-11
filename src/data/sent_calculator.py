@@ -15,13 +15,14 @@ import time
 import json
 import math
 import hashlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from src.grpo.verifier import RuleBasedVerifier
 from src.core.memory_manager import MemoryManager
 from src.utils.config import Config
+from src.data.gsm8k_loader import format_grpo_prompt, _make_sent_cache_key
 
 
 def cluster_by_answer(
@@ -96,7 +97,13 @@ def load_sent_cache(path: str) -> Dict[str, Any]:
         return torch.load(path, weights_only=False)
 
 
-def make_sent_metadata(config, status: str = "in_progress", backend: str = "hf") -> Dict[str, Any]:
+def make_sent_metadata(
+    config,
+    status: str = "in_progress",
+    backend: str = "hf",
+    tokenizer: Optional[object] = None,
+    max_prompt_length: Optional[int] = None,
+) -> Dict[str, Any]:
     """Create metadata block for cache files."""
     cfg = config.to_dict() if hasattr(config, "to_dict") else {}
     cfg_ser = json.dumps(cfg, sort_keys=True)
@@ -104,6 +111,16 @@ def make_sent_metadata(config, status: str = "in_progress", backend: str = "hf")
     return {
         "version": "sent_v1",
         "config_hash": cfg_hash,
+        "sent_cache_key": _make_sent_cache_key(
+            getattr(config, "sent", None),
+            tokenizer=tokenizer,
+            max_prompt_length=(
+                max_prompt_length
+                if max_prompt_length is not None
+                else getattr(getattr(config, "training", None), "max_prompt_length", None)
+            ),
+            model_id=getattr(getattr(config, "model", None), "model_id", None),
+        ),
         "created_at": time.time(),
         "status": status,
         "model_id": getattr(config.model, "model_id", None),
@@ -151,9 +168,14 @@ class SemanticEntropyCalculator:
         # Prepare prompt/tokenize
         self.model.eval()
 
-        prompt = question
+        prompt = format_grpo_prompt(self.tokenizer, question)
         # Use tokenizer to prepare input ids
-        enc = self.tokenizer([prompt], return_tensors="pt", truncation=True)
+        enc = self.tokenizer(
+            [prompt],
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.config.training.max_prompt_length,
+        )
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
 
@@ -230,7 +252,14 @@ class SemanticEntropyCalculator:
         self.model.eval()
 
         # Tokenize batch
-        enc = self.tokenizer(questions, return_tensors="pt", padding=True, truncation=True)
+        prompts = [format_grpo_prompt(self.tokenizer, question) for question in questions]
+        enc = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.config.training.max_prompt_length,
+        )
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
         
@@ -432,4 +461,10 @@ class SemanticEntropyCalculator:
 
     def _make_metadata(self, status: str = "in_progress") -> Dict[str, Any]:
         """Delegate to module-level make_sent_metadata."""
-        return make_sent_metadata(self.config, status, backend="hf")
+        return make_sent_metadata(
+            self.config,
+            status,
+            backend="hf",
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.config.training.max_prompt_length,
+        )

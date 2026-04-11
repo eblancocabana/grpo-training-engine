@@ -35,7 +35,7 @@ class LoRAConfig:
     rank: int = 16
     alpha: int = 32
     dropout: float = 0.0
-    adapter_quantization: str = "8bit"
+    adapter_quantization: str = "none"
     target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
@@ -235,7 +235,7 @@ def get_8gb_vram_config() -> Config:
 
     config.lora.rank = 16
     config.lora.alpha = 32
-    config.lora.adapter_quantization = "8bit"
+    config.lora.adapter_quantization = "none"
     config.lora.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
     config.grpo.group_size = 4

@@ -1,6 +1,6 @@
 import torch
 import random
-from typing import Dict, Any
+from typing import Callable, Dict, Any, Optional
 from tqdm import tqdm
 import wandb
 
@@ -26,19 +26,35 @@ class GSM8KBenchmark:
         dataset_split: str = "test",
         num_samples: int = 50,
         device: str = "cuda",
+        generate_fn: Optional[Callable[[torch.Tensor, torch.Tensor], list[str]]] = None,
+        max_new_tokens: int = 512,
+        max_prompt_length: int = 512,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: Optional[float] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.memory_manager = memory_manager
         self.device = device
         self.num_samples = num_samples
+        self.generate_fn = generate_fn
+        self.max_new_tokens = max_new_tokens
+        self.max_prompt_length = max_prompt_length
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_p = top_p
 
         # Initialize verifier
         self.verifier = RuleBasedVerifier()
 
         # Load dataset
         logger.info(f"Loading GSM8K {dataset_split} split for benchmark...")
-        full_dataset = GRPOGSM8KDataset(tokenizer=tokenizer, split=dataset_split)
+        full_dataset = GRPOGSM8KDataset(
+            tokenizer=tokenizer,
+            split=dataset_split,
+            max_prompt_length=max_prompt_length,
+        )
 
         # Select fixed subset
         random.seed(42)
@@ -82,28 +98,39 @@ class GSM8KBenchmark:
             ground_truth = item["answer"]
             question = item["question"]
 
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=512,
-                    do_sample=False,
-                    temperature=1.0,
-                    top_p=None,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
+            if self.generate_fn is not None:
+                full_text = self.generate_fn(input_ids, attention_mask)[0]
+                generated_len = len(
+                    self.tokenizer(
+                        full_text,
+                        add_special_tokens=False,
+                        truncation=False,
+                    )["input_ids"]
                 )
+            else:
+                with torch.no_grad():
+                    generated_ids = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=self.max_new_tokens,
+                        do_sample=self.do_sample,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
 
-            response_ids = generated_ids[0, input_ids.shape[1] :]
-            full_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                response_ids = generated_ids[0, input_ids.shape[1] :]
+                full_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                generated_len = len(response_ids)
             reward, info = self.verifier.verify(full_text, ground_truth)
 
             is_correct = reward == 1.0
             metrics["correct_count"] += int(is_correct)
-            metrics["total_len"] += len(generated_ids[0]) - len(input_ids[0])
+            metrics["total_len"] += generated_len
 
             # Format check
-            has_think = "<think>" in full_text and "</think>" in full_text
+            has_think = "</think>" in full_text
             has_answer = "<answer>" in full_text or "\\boxed{" in full_text
             format_ok = has_think and has_answer
 

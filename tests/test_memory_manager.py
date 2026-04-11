@@ -159,7 +159,103 @@ class TestMemoryManager:
         assert model.layers["block.0"].gradient_checkpointing is True
         assert model.layers["block.1"].gradient_checkpointing is True
 
-        mm.get_memory_stats = lambda: {"usage_fraction": 0.55}
+        mm.get_peak_memory_stats = lambda: {
+            "usage_fraction": 0.55,
+            "peak_usage_fraction": 0.55,
+        }
         mm.maybe_update_checkpointing(model, step=2)
         assert model.layers["block.0"].gradient_checkpointing is False
         assert model.layers["block.1"].gradient_checkpointing is False
+
+    def test_vram_auto_starts_enabled_until_peak_data_is_observed(self):
+        from src.core.memory_manager import MemoryManager
+
+        class DummyModule:
+            def __init__(self):
+                self.gradient_checkpointing = False
+
+        class DummyModel:
+            def __init__(self):
+                self.layers = {"block.0": DummyModule()}
+
+            def named_modules(self):
+                for name, module in self.layers.items():
+                    yield name, module
+
+            def gradient_checkpointing_enable(self):
+                pass
+
+            def gradient_checkpointing_disable(self):
+                pass
+
+            def get_input_embeddings(self):
+                class DummyEmb:
+                    def register_forward_hook(self, hook):
+                        return None
+
+                return DummyEmb()
+
+        model = DummyModel()
+        mm = MemoryManager(checkpointing_strategy="vram_auto")
+        mm.enable_checkpointing(model)
+
+        assert model.layers["block.0"].gradient_checkpointing is True
+
+    def test_input_grad_hook_is_cleared_and_reregistered_on_reenable(self):
+        from src.core.memory_manager import MemoryManager
+
+        class DummyHandle:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
+        class DummyEmb:
+            def __init__(self):
+                self.hook_calls = 0
+                self.handles = []
+
+            def register_forward_hook(self, hook):
+                self.hook_calls += 1
+                handle = DummyHandle()
+                self.handles.append(handle)
+                return handle
+
+        class DummyModel:
+            def __init__(self):
+                self.embedding = DummyEmb()
+                self.gradient_checkpointing = False
+
+            def named_modules(self):
+                yield "layer", self
+
+            def gradient_checkpointing_enable(self):
+                pass
+
+            def gradient_checkpointing_disable(self):
+                pass
+
+            def get_input_embeddings(self):
+                return self.embedding
+
+        model = DummyModel()
+        mm = MemoryManager(
+            checkpointing_strategy="vram_auto",
+            checkpointing_vram_enable_threshold=0.8,
+            checkpointing_vram_disable_threshold=0.6,
+            checkpointing_update_interval_steps=1,
+        )
+        mm.get_memory_stats = lambda: {"usage_fraction": 0.85}
+        mm.enable_checkpointing(model)
+        mm.get_memory_stats = lambda: {"usage_fraction": 0.55}
+        mm.maybe_update_checkpointing(model, step=2)
+        first_handle = model.embedding.handles[0]
+        assert first_handle.removed is True
+        assert mm._input_grad_hook_handle is None
+        assert mm._input_grad_helper_enabled is False
+        mm.get_memory_stats = lambda: {"usage_fraction": 0.85}
+        mm.maybe_update_checkpointing(model, step=3)
+
+        assert model.embedding.hook_calls == 2
+        assert mm._input_grad_hook_handle is model.embedding.handles[1]

@@ -88,3 +88,45 @@ class TestEdgeCases:
             assert "optimizer_state_dict" in loaded
             assert loaded["step"] == 100
             os.unlink(f.name)
+
+    def test_checkpoint_load_moves_optimizer_state_to_model_device(self):
+        import tempfile
+
+        from src.utils.checkpoint import CheckpointManager
+
+        device = torch.device("cuda")
+        model = nn.Linear(4, 4).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        x = torch.randn(2, 4, device=device)
+        y = torch.randn(2, 4, device=device)
+        loss = F.mse_loss(model(x), y)
+        loss.backward()
+        optimizer.step()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            checkpoint_path = manager.save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=None,
+                step=3,
+                epoch=1,
+            )
+
+            new_model = nn.Linear(4, 4).to(device)
+            new_optimizer = torch.optim.Adam(new_model.parameters(), lr=0.01)
+            manager.load_checkpoint(
+                checkpoint_path,
+                model=new_model,
+                optimizer=new_optimizer,
+                scheduler=None,
+            )
+
+            state_tensors = [
+                value
+                for state in new_optimizer.state.values()
+                for value in state.values()
+                if torch.is_tensor(value)
+            ]
+            assert state_tensors
+            assert all(t.device.type == "cuda" for t in state_tensors)

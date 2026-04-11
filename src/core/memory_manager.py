@@ -5,7 +5,7 @@ Handles gradient checkpointing, cache clearing, and memory monitoring.
 
 import torch
 import gc
-from typing import Iterable, List, Tuple
+from typing import Any, Iterable, List, Tuple
 from src.utils.logging_utils import get_logger, TRACE
 
 logger = get_logger("core.memory_manager")
@@ -40,6 +40,8 @@ class MemoryManager:
         self._checkpointing_global_enabled = False
         self._checkpointing_active = False
         self._checkpointing_last_update_step = -1
+        self._input_grad_hook_handle: Any | None = None
+        self._input_grad_helper_enabled = False
         self.step_count = 0
 
     def clear_cache(self, aggressive: bool = False):
@@ -62,19 +64,12 @@ class MemoryManager:
             return
 
         if strategy == "vram_auto":
-            stats = self.get_memory_stats()
-            if "error" not in stats:
-                usage = stats.get("usage_fraction", 0.0)
-                if usage >= self.checkpointing_vram_enable_threshold:
-                    self._apply_checkpointing(model, enable=True, selective=True)
-                    self._checkpointing_active = True
-                else:
-                    self._apply_checkpointing(model, enable=False, reason="vram_auto")
-                    self._checkpointing_active = False
-            else:
-                self._apply_checkpointing(model, enable=True, selective=True)
-                self._checkpointing_active = True
+            # Safety-first: start with checkpointing enabled, then disable only after
+            # observed step peaks show enough VRAM headroom.
+            self._apply_checkpointing(model, enable=True, selective=True)
+            self._checkpointing_active = True
             self._checkpointing_last_update_step = 0
+            self.reset_peak_stats()
             return
 
         if strategy == "subset":
@@ -94,7 +89,12 @@ class MemoryManager:
         self._apply_checkpointing(model, enable=True, selective=False)
         self._checkpointing_active = True
 
-    def maybe_update_checkpointing(self, model: torch.nn.Module, step: int):
+    def maybe_update_checkpointing(
+        self,
+        model: torch.nn.Module,
+        step: int,
+        memory_stats: dict | None = None,
+    ):
         if not self.enable_gradient_checkpointing:
             return
 
@@ -107,11 +107,16 @@ class MemoryManager:
         ):
             return
 
-        stats = self.get_memory_stats()
+        stats = memory_stats or self.get_peak_memory_stats()
         if "error" in stats:
             return
 
-        usage = stats.get("usage_fraction", 0.0)
+        usage = max(
+            stats.get("usage_fraction", 0.0),
+            stats.get("peak_usage_fraction", 0.0),
+        )
+        current_usage = stats.get("usage_fraction", usage)
+        peak_usage = stats.get("peak_usage_fraction", usage)
         if (
             not self._checkpointing_active
             and usage >= self.checkpointing_vram_enable_threshold
@@ -120,12 +125,14 @@ class MemoryManager:
             self._checkpointing_active = True
         elif (
             self._checkpointing_active
-            and usage <= self.checkpointing_vram_disable_threshold
+            and current_usage <= self.checkpointing_vram_disable_threshold
+            and peak_usage <= self.checkpointing_vram_disable_threshold
         ):
             self._apply_checkpointing(model, enable=False, reason="vram_auto")
             self._checkpointing_active = False
 
         self._checkpointing_last_update_step = step
+        self.reset_peak_stats()
 
     def _apply_checkpointing(
         self,
@@ -154,6 +161,16 @@ class MemoryManager:
         else:
             if hasattr(model, "gradient_checkpointing_disable"):
                 model.gradient_checkpointing_disable()
+            self._checkpointing_global_enabled = False
+            if (
+                hasattr(model, "disable_input_require_grads")
+                and self._input_grad_helper_enabled
+            ):
+                model.disable_input_require_grads()
+            self._input_grad_helper_enabled = False
+            if self._input_grad_hook_handle is not None:
+                self._input_grad_hook_handle.remove()
+                self._input_grad_hook_handle = None
             checkpointable = list(self._iter_checkpointable_modules(model))
             self._apply_checkpointing_flags(checkpointable, enabled=False)
             if reason:
@@ -172,13 +189,19 @@ class MemoryManager:
         # CRITICAL: Enable input gradients to support checkpointing with frozen base layers
         # This prevents "element 0 of tensors does not require grad" error
         if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+            if not self._input_grad_helper_enabled:
+                model.enable_input_require_grads()
+                self._input_grad_helper_enabled = True
         else:
+            if self._input_grad_hook_handle is not None:
+                return
 
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
 
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+            self._input_grad_hook_handle = model.get_input_embeddings().register_forward_hook(
+                make_inputs_require_grad
+            )
 
     def _iter_checkpointable_modules(
         self, model: torch.nn.Module
@@ -236,6 +259,23 @@ class MemoryManager:
             "free_gb": round(actually_free, 2),
             "usage_fraction": (total - actually_free) / total,
         }
+
+    def get_peak_memory_stats(self) -> dict:
+        stats = self.get_memory_stats()
+        if "error" in stats:
+            return stats
+
+        if not torch.cuda.is_available():
+            return stats
+
+        device_id = 0 if self.device == "cuda" else int(self.device.split(":")[-1])
+        total_mem = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)
+        peak_allocated = torch.cuda.max_memory_allocated(device_id) / (1024**3)
+        peak_reserved = torch.cuda.max_memory_reserved(device_id) / (1024**3)
+        stats["peak_allocated_gb"] = round(peak_allocated, 2)
+        stats["peak_reserved_gb"] = round(peak_reserved, 2)
+        stats["peak_usage_fraction"] = min(1.0, peak_reserved / max(total_mem, 1e-9))
+        return stats
 
     def get_available_memory_gb(self) -> float:
         if not torch.cuda.is_available():

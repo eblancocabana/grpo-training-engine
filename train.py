@@ -83,8 +83,8 @@ def main():
         "--lora-adapter-quant",
         type=str,
         choices=["8bit", "4bit", "none"],
-        default="8bit",
-        help="Quantization for LoRA adapters (default: 8bit)",
+        default="none",
+        help="Quantization for LoRA adapters (default: none)",
     )
     parser.add_argument(
         "--learning-rate", type=float, default=1e-4, help="Learning rate"
@@ -134,13 +134,16 @@ def main():
         help="[DEPRECATED] Use -v instead. Enable debug mode to print generations",
     )
     parser.add_argument(
-        "--max-prompt-length", type=int, default=128, help="Maximum tokens for prompt"
+        "--max-prompt-length",
+        type=int,
+        default=None,
+        help="Maximum tokens for prompt (default: preset value)",
     )
     parser.add_argument(
         "--max-response-length",
         type=int,
-        default=1024,
-        help="Maximum tokens for response",
+        default=None,
+        help="Maximum tokens for response (default: preset value)",
     )
     parser.add_argument(
         "--epsilon-high",
@@ -324,8 +327,10 @@ def main():
     config.lora.adapter_quantization = args.lora_adapter_quant
     config.training.learning_rate = args.learning_rate
     config.entropy.use_entropy_mask = args.use_entropy_mask
-    config.training.max_prompt_length = args.max_prompt_length
-    config.training.max_response_length = args.max_response_length
+    if args.max_prompt_length is not None:
+        config.training.max_prompt_length = args.max_prompt_length
+    if args.max_response_length is not None:
+        config.training.max_response_length = args.max_response_length
     config.training.use_triton_kernels = args.use_triton and not args.no_triton
     config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
     config.training.profile_enabled = args.profile
@@ -360,6 +365,16 @@ def main():
 
     # Initial benchmark configuration
     config.training.skip_initial_benchmark = args.no_initial_benchmark
+    if (
+        args.max_steps is not None
+        and args.max_steps <= 5
+        and not config.training.skip_initial_benchmark
+    ):
+        logger.info(
+            "Auto-skipping initial benchmark for short verification run (max_steps=%d).",
+            args.max_steps,
+        )
+        config.training.skip_initial_benchmark = True
     
     # Checkpoint configuration
     if args.no_checkpoints:

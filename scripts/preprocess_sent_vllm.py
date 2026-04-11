@@ -36,8 +36,33 @@ from src.data.sent_calculator import (
     load_sent_cache,
     make_sent_metadata,
 )
+from src.data.gsm8k_loader import format_grpo_prompt
 
 logger = get_logger("preprocess_sent_vllm")
+
+
+def _assert_resume_cache_compatible(
+    cache_path: str,
+    expected_key: str,
+    model_id: str,
+) -> Dict[str, Any]:
+    data = load_sent_cache(cache_path)
+    metadata = data.get("metadata", {})
+    cached_key = metadata.get("sent_cache_key")
+    if not cached_key:
+        raise ValueError(
+            "Resume cache is missing a SENT compatibility key; regenerate it before resuming."
+        )
+    if cached_key != expected_key:
+        raise ValueError(
+            "Resume cache is incompatible with the current model/SENT settings."
+        )
+    cached_model_id = metadata.get("model_id")
+    if cached_model_id and cached_model_id != model_id:
+        raise ValueError(
+            f"Resume cache was generated for model '{cached_model_id}', not '{model_id}'."
+        )
+    return data
 
 
 def main():
@@ -80,6 +105,13 @@ def main():
 
     config = get_8gb_vram_config()
     model_id = args.model_id or config.model.model_id
+    config.model.model_id = model_id
+    config.sent.num_samples = args.M
+    config.sent.temperature = args.temperature
+    config.sent.cache_path = args.cache_path
+    config.sent.checkpoint_interval = args.checkpoint_interval
+    config.sent.seed = args.seed
+    config.training.max_prompt_length = args.max_model_len
 
     logger.info("Loading vLLM engine: %s ...", model_id)
     start_time = time.time()
@@ -109,6 +141,16 @@ def main():
     logger.info("vLLM engine loaded in %.1fs", load_time)
 
     verifier = RuleBasedVerifier()
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    expected_cache_key = make_sent_metadata(
+        config,
+        status="in_progress",
+        backend="vllm",
+        tokenizer=tokenizer,
+        max_prompt_length=config.training.max_prompt_length,
+    )["sent_cache_key"]
 
     logger.info("Loading GSM8K dataset...")
     gsm8k = load_dataset("gsm8k", "main", split="train")
@@ -126,7 +168,11 @@ def main():
 
     if args.resume and os.path.exists(args.cache_path):
         try:
-            data = load_sent_cache(args.cache_path)
+            data = _assert_resume_cache_compatible(
+                args.cache_path,
+                expected_key=expected_cache_key,
+                model_id=model_id,
+            )
             entropies = data.get("entropies", [])
             clusters_list = data.get("clusters", [])
             indices = data.get("indices", [])
@@ -161,7 +207,7 @@ def main():
             batch = remaining[batch_start:batch_end]
 
             # Build prompts for this batch
-            prompts = [ex["question"] for ex in batch]
+            prompts = [format_grpo_prompt(tokenizer, ex["question"]) for ex in batch]
 
             # vLLM generates n=M samples per prompt
             outputs = llm.generate(prompts, sampling_params)
@@ -201,7 +247,13 @@ def main():
             # Periodic checkpoint
             if (start_idx + batch_start + len(batch)) % args.checkpoint_interval < batch_size:
                 checkpoint = {
-                    "metadata": make_sent_metadata(config, status="in_progress", backend="vllm"),
+                    "metadata": make_sent_metadata(
+                        config,
+                        status="in_progress",
+                        backend="vllm",
+                        tokenizer=tokenizer,
+                        max_prompt_length=config.training.max_prompt_length,
+                    ),
                     "indices": indices,
                     "entropies": entropies,
                     "clusters": clusters_list,
@@ -215,7 +267,13 @@ def main():
     except KeyboardInterrupt:
         logger.warning("Interrupted by user. Saving partial progress...")
         partial = {
-            "metadata": make_sent_metadata(config, status="in_progress", backend="vllm"),
+            "metadata": make_sent_metadata(
+                config,
+                status="in_progress",
+                backend="vllm",
+                tokenizer=tokenizer,
+                max_prompt_length=config.training.max_prompt_length,
+            ),
             "indices": indices,
             "entropies": entropies,
             "clusters": clusters_list,
@@ -231,7 +289,13 @@ def main():
     paired_sorted = sorted(paired, key=lambda x: (math.isnan(x[1]), x[1]))
 
     final_cache = {
-        "metadata": make_sent_metadata(config, status="complete", backend="vllm"),
+        "metadata": make_sent_metadata(
+            config,
+            status="complete",
+            backend="vllm",
+            tokenizer=tokenizer,
+            max_prompt_length=config.training.max_prompt_length,
+        ),
         "indices": [p[0] for p in paired_sorted],
         "entropies": [p[1] for p in paired_sorted],
         "clusters": [p[2] for p in paired_sorted],

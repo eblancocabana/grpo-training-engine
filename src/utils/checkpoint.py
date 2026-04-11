@@ -35,7 +35,8 @@ class CheckpointManager:
         epoch: int,
         metrics: Optional[Dict[str, float]] = None,
         is_best: bool = False,
-        checkpoint_name: Optional[str] = None
+        checkpoint_name: Optional[str] = None,
+        extra_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Save a training checkpoint.
@@ -66,6 +67,8 @@ class CheckpointManager:
             'optimizer_state_dict': optimizer.state_dict(),
             'metrics': metrics or {},
         }
+        if extra_state:
+            checkpoint.update(extra_state)
         
         if scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
@@ -158,6 +161,7 @@ class CheckpointManager:
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.move_optimizer_state_to_model_device(optimizer, model)
         
         # Load scheduler state
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
@@ -168,10 +172,46 @@ class CheckpointManager:
             'epoch': checkpoint.get('epoch', 0),
             'metrics': checkpoint.get('metrics', {}),
         }
+        for key in ("optimizer_step", "accumulation_batches", "dataloader_seed"):
+            if key in checkpoint:
+                info[key] = checkpoint[key]
         
         logger.info("Loaded step %d, epoch %d", info['step'], info['epoch'])
         
         return info
+
+    @staticmethod
+    def _move_value_to_device(value: Any, device: torch.device) -> Any:
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {
+                key: CheckpointManager._move_value_to_device(val, device)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                CheckpointManager._move_value_to_device(item, device) for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                CheckpointManager._move_value_to_device(item, device) for item in value
+            )
+        return value
+
+    @classmethod
+    def move_optimizer_state_to_model_device(
+        cls,
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+    ) -> None:
+        param = next(model.parameters(), None)
+        if param is None:
+            return
+        device = param.device
+        for state in optimizer.state.values():
+            for key, value in list(state.items()):
+                state[key] = cls._move_value_to_device(value, device)
     
     def load_lora_weights(
         self,
