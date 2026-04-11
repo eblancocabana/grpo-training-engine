@@ -83,6 +83,10 @@ class BenchmarkConfig:
     enable_gradient_checkpointing: bool = True
     # Tuning
     triton_lora_prefer_base: bool = False
+    triton_generation: Optional[bool] = None
+    triton_grpo_loss: Optional[bool] = None
+    triton_entropy_mask: Optional[bool] = None
+    triton_lora: Optional[bool] = None
     # Profile
     profile: bool = False
     # Steps
@@ -135,6 +139,26 @@ class BenchmarkConfig:
             args.append("--use-triton")
         else:
             args.append("--no-triton")
+
+        if self.triton_generation is True:
+            args.append("--triton-generation")
+        elif self.triton_generation is False:
+            args.append("--no-triton-generation")
+
+        if self.triton_grpo_loss is True:
+            args.append("--triton-grpo-loss")
+        elif self.triton_grpo_loss is False:
+            args.append("--no-triton-grpo-loss")
+
+        if self.triton_entropy_mask is True:
+            args.append("--triton-entropy-mask")
+        elif self.triton_entropy_mask is False:
+            args.append("--no-triton-entropy-mask")
+
+        if self.triton_lora is True:
+            args.append("--triton-lora")
+        elif self.triton_lora is False:
+            args.append("--no-triton-lora")
         
         # Triton LoRA prefer base
         if self.triton and self.triton_lora_prefer_base:
@@ -194,6 +218,8 @@ class IngInfBenchmarkSuite:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.results: List[BenchmarkResult] = []
+        self.suite_name = "ING INF Benchmark Suite"
+        self.report_title = "ING INF Benchmark Report"
         
         # Find train.py
         self.train_script = Path(__file__).parent.parent / "train.py"
@@ -597,7 +623,7 @@ class IngInfBenchmarkSuite:
         est_hours = est_time_min / 60
         
         print(f"\n{'='*60}")
-        print(f"ING INF Benchmark Suite")
+        print(f"{self.suite_name}")
         print(f"{'='*60}")
         print(f"Total configs: {len(configs)}")
         print(f"Output directory: {self.output_dir}")
@@ -649,7 +675,7 @@ class IngInfBenchmarkSuite:
         report_path = self.output_dir / "report.md"
         
         lines = [
-            "# ING INF Benchmark Report",
+            f"# {self.report_title}",
             "",
             f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             f"Total runs: {len(self.results)}",
