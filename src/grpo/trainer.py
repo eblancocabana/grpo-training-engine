@@ -129,7 +129,10 @@ class GRPOTrainerLoop:
             rank=self.config.lora.rank,
             alpha=self.config.lora.alpha,
             dropout=self.config.lora.dropout,
-            use_triton=self.config.training.use_triton_kernels,
+            use_triton=(
+                self.config.training.use_triton_kernels
+                and self.config.training.use_triton_lora
+            ),
             prefer_base_layer=self.config.training.triton_lora_prefer_base,
             adapter_quantization=self.config.lora.adapter_quantization,
         )
@@ -190,7 +193,10 @@ class GRPOTrainerLoop:
             kl_coef=self.config.grpo.kl_coef,
             group_size=self.config.grpo.group_size,
             use_kl=self.config.grpo.use_kl,
-            use_triton_kernels=self.config.training.use_triton_kernels,
+            use_triton_kernels=(
+                self.config.training.use_triton_kernels
+                and self.config.training.use_triton_grpo_loss
+            ),
         )
 
         # QLoRA: Keep LayerNorms frozen - only LoRA adapters are trainable
@@ -529,6 +535,8 @@ class GRPOTrainerLoop:
 
     def _should_use_triton_generation(self) -> bool:
         if not getattr(self.config.training, "use_triton_kernels", False):
+            return False
+        if not getattr(self.config.training, "use_triton_generation", True):
             return False
         if not TRITON_AVAILABLE:
             return False
@@ -1312,7 +1320,10 @@ class GRPOTrainerLoop:
                     self.entropy_calculator.calculate_entropy_and_mask(
                         loss_logits,
                         attention_mask=loss_resp_mask,
-                        use_triton_kernels=self.config.training.use_triton_kernels,
+                        use_triton_kernels=(
+                            self.config.training.use_triton_kernels
+                            and self.config.training.use_triton_entropy_mask
+                        ),
                     )
                 )
 

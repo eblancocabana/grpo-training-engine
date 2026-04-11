@@ -246,6 +246,50 @@ def main():
         help="Prefer base-layer matmul in Triton LoRA forward",
     )
     parser.add_argument(
+        "--triton-generation",
+        action="store_true",
+        default=None,
+        help="Force-enable Triton generation when Triton kernels are enabled",
+    )
+    parser.add_argument(
+        "--no-triton-generation",
+        action="store_true",
+        help="Disable Triton generation while keeping other Triton kernels available",
+    )
+    parser.add_argument(
+        "--triton-grpo-loss",
+        action="store_true",
+        default=None,
+        help="Force-enable Triton GRPO loss when Triton kernels are enabled",
+    )
+    parser.add_argument(
+        "--no-triton-grpo-loss",
+        action="store_true",
+        help="Disable Triton GRPO loss while keeping other Triton kernels available",
+    )
+    parser.add_argument(
+        "--triton-entropy-mask",
+        action="store_true",
+        default=None,
+        help="Force-enable Triton entropy masking when Triton kernels are enabled",
+    )
+    parser.add_argument(
+        "--no-triton-entropy-mask",
+        action="store_true",
+        help="Disable Triton entropy masking while keeping other Triton kernels available",
+    )
+    parser.add_argument(
+        "--triton-lora",
+        action="store_true",
+        default=None,
+        help="Force-enable Triton LoRA forward when Triton kernels are enabled",
+    )
+    parser.add_argument(
+        "--no-triton-lora",
+        action="store_true",
+        help="Disable Triton LoRA forward while keeping other Triton kernels available",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -467,6 +511,35 @@ def main():
     if args.max_response_length is not None:
         config.training.max_response_length = args.max_response_length
     config.training.use_triton_kernels = args.use_triton and not args.no_triton
+    default_triton_enabled = config.training.use_triton_kernels
+    config.training.use_triton_generation = default_triton_enabled
+    config.training.use_triton_grpo_loss = default_triton_enabled
+    config.training.use_triton_entropy_mask = default_triton_enabled
+    config.training.use_triton_lora = default_triton_enabled
+    if args.triton_generation is not None:
+        config.training.use_triton_generation = (
+            default_triton_enabled and args.triton_generation
+        )
+    if args.no_triton_generation:
+        config.training.use_triton_generation = False
+    if args.triton_grpo_loss is not None:
+        config.training.use_triton_grpo_loss = (
+            default_triton_enabled and args.triton_grpo_loss
+        )
+    if args.no_triton_grpo_loss:
+        config.training.use_triton_grpo_loss = False
+    if args.triton_entropy_mask is not None:
+        config.training.use_triton_entropy_mask = (
+            default_triton_enabled and args.triton_entropy_mask
+        )
+    if args.no_triton_entropy_mask:
+        config.training.use_triton_entropy_mask = False
+    if args.triton_lora is not None:
+        config.training.use_triton_lora = (
+            default_triton_enabled and args.triton_lora
+        )
+    if args.no_triton_lora:
+        config.training.use_triton_lora = False
     config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
     config.training.profile_enabled = args.profile
     if args.clip_epsilon is not None:
@@ -529,7 +602,7 @@ def main():
     config.wandb.implementation = "python"
 
     # Create checkpoint directory only when checkpointing is enabled.
-    if config.training.checkpoint_dir is not None:
+    if config.training.checkpoint_dir:
         os.makedirs(config.training.checkpoint_dir, exist_ok=True)
 
     # Print configuration
@@ -553,6 +626,10 @@ def main():
     logger.info("  Entropy Percentile: %s", config.entropy.percentile)
     logger.info("  Entropy Min Tokens: %s", config.entropy.min_tokens)
     logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
+    logger.info("  Triton Generation: %s", config.training.use_triton_generation)
+    logger.info("  Triton GRPO Loss: %s", config.training.use_triton_grpo_loss)
+    logger.info("  Triton Entropy Mask: %s", config.training.use_triton_entropy_mask)
+    logger.info("  Triton LoRA: %s", config.training.use_triton_lora)
     logger.info("  Max Prompt Length: %s", config.training.max_prompt_length)
     logger.info("  Max Response Length: %s", config.training.max_response_length)
     logger.info("  Generation Temperature: %s", config.training.generation_temperature)

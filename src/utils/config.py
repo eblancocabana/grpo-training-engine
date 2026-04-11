@@ -145,6 +145,10 @@ class TrainingConfig:
     checkpointing_vram_disable_threshold: float = 0.72
     checkpointing_update_interval_steps: int = 10
     use_triton_kernels: bool = True
+    use_triton_generation: bool = True
+    use_triton_grpo_loss: bool = True
+    use_triton_entropy_mask: bool = True
+    use_triton_lora: bool = True
     triton_lora_prefer_base: bool = False
     clear_cache_frequency: int = 10
 
@@ -253,6 +257,10 @@ def get_8gb_vram_config() -> Config:
     config.training.checkpointing_vram_disable_threshold = 0.72
     config.training.checkpointing_update_interval_steps = 10
     config.training.use_triton_kernels = True
+    config.training.use_triton_generation = True
+    config.training.use_triton_grpo_loss = True
+    config.training.use_triton_entropy_mask = True
+    config.training.use_triton_lora = True
     config.training.max_prompt_length = 4096
     config.training.max_response_length = 384
     config.training.clear_cache_frequency = 50
