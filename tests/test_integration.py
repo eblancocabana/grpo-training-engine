@@ -854,6 +854,53 @@ class TestIntegration:
 
         assert loop.checkpoint_manager is None
 
+    def test_setup_passes_model_loading_knobs_from_config(self):
+        from src.grpo.trainer import GRPOTrainerLoop
+        from src.utils.config import get_8gb_vram_config
+
+        config = get_8gb_vram_config()
+        config.sent.enabled = False
+        config.wandb.enabled = False
+        config.model.model_id = "custom-model"
+        config.model.load_in_4bit = False
+        config.model.bnb_4bit_compute_dtype = "float16"
+        config.model.bnb_4bit_quant_type = "fp4"
+        config.model.bnb_4bit_use_double_quant = False
+        config.model.attn_implementation = "eager"
+        config.model.device_map = "cpu"
+
+        loop = GRPOTrainerLoop(config)
+        fake_model = nn.Linear(1, 1)
+        fake_tokenizer = object()
+
+        with patch("src.grpo.trainer.load_4bit_engine", return_value=(fake_model, fake_tokenizer)) as load_engine, patch(
+            "src.grpo.trainer.inject_lora_layers"
+        ), patch(
+            "src.grpo.trainer.print_model_memory_usage"
+        ), patch(
+            "src.grpo.trainer.get_lora_parameters",
+            return_value=list(fake_model.parameters()),
+        ), patch(
+            "src.grpo.trainer.MemoryManager"
+        ) as memory_manager_cls, patch(
+            "src.grpo.trainer.GSM8KBenchmark"
+        ):
+            memory_manager_cls.return_value = types.SimpleNamespace(
+                enable_checkpointing=lambda model: None,
+                print_memory_stats=lambda prefix: None,
+            )
+            loop.setup()
+
+        load_engine.assert_called_once_with(
+            "custom-model",
+            load_in_4bit=False,
+            bnb_4bit_compute_dtype="float16",
+            bnb_4bit_quant_type="fp4",
+            bnb_4bit_use_double_quant=False,
+            attn_implementation="eager",
+            device_map="cpu",
+        )
+
     def test_secondary_trainer_cli_debug_flag_sets_verbosity(self):
         import src.grpo.trainer as trainer_module
 

@@ -26,6 +26,7 @@ class ModelConfig:
     bnb_4bit_quant_type: str = "nf4"
     bnb_4bit_use_double_quant: bool = True
     attn_implementation: str = "sdpa"
+    device_map: str = "auto"
 
 
 @dataclass

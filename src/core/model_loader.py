@@ -10,24 +10,56 @@ from src.utils.logging_utils import get_logger
 logger = get_logger("core.model_loader")
 
 
-def load_4bit_engine(model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
+def _resolve_torch_dtype(dtype_name):
+    """Resolve a config dtype string into a torch dtype."""
+    if isinstance(dtype_name, torch.dtype):
+        return dtype_name
+
+    normalized = str(dtype_name).strip().lower()
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+
+    if normalized not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+    return dtype_map[normalized]
+
+
+def load_4bit_engine(
+    model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    *,
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype="bfloat16",
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    attn_implementation="sdpa",
+    device_map="auto",
+):
     logger.info("Loading model: %s...", model_id)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
+    compute_dtype = _resolve_torch_dtype(bnb_4bit_compute_dtype)
     bnb_config = None
-    if BitsAndBytesConfig is not None:
+    if load_in_4bit and BitsAndBytesConfig is not None:
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+            load_in_4bit=load_in_4bit,
+            bnb_4bit_quant_type=bnb_4bit_quant_type,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
         )
-    else:
+    elif load_in_4bit:
         logger.warning(
-            "bitsandbytes unavailable; loading model in BF16 without quantization."
+            "bitsandbytes unavailable; loading model with torch_dtype=%s without quantization.",
+            compute_dtype,
         )
 
     try:
@@ -37,10 +69,11 @@ def load_4bit_engine(model_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
         tokenizer.padding_side = "left"
 
         model_kwargs = {
-            "device_map": "auto",
-            "dtype": torch.bfloat16,
-            "attn_implementation": "sdpa",
+            "device_map": device_map,
+            "torch_dtype": compute_dtype,
         }
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
         if bnb_config is not None:
             model_kwargs["quantization_config"] = bnb_config
 

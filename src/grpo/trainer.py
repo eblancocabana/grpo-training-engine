@@ -122,7 +122,15 @@ class GRPOTrainerLoop:
         logger.info("\n[Setup] Loading model and tokenizer...")
 
         # Load model in 4-bit
-        self.model, self.tokenizer = load_4bit_engine(self.config.model.model_id)
+        self.model, self.tokenizer = load_4bit_engine(
+            self.config.model.model_id,
+            load_in_4bit=self.config.model.load_in_4bit,
+            bnb_4bit_compute_dtype=self.config.model.bnb_4bit_compute_dtype,
+            bnb_4bit_quant_type=self.config.model.bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=self.config.model.bnb_4bit_use_double_quant,
+            attn_implementation=self.config.model.attn_implementation,
+            device_map=self.config.model.device_map,
+        )
 
         if self.model is None:
             raise RuntimeError("Failed to load model")
