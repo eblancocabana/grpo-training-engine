@@ -2291,7 +2291,7 @@ def main():
         config.training.learning_rate = args.learning_rate
 
     if args.debug:
-        config.training.debug = True
+        config.training.verbosity = max(config.training.verbosity, 1)
 
     if args.epsilon_high is not None:
         config.grpo.epsilon_high = args.epsilon_high

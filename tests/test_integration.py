@@ -854,6 +854,30 @@ class TestIntegration:
 
         assert loop.checkpoint_manager is None
 
+    def test_secondary_trainer_cli_debug_flag_sets_verbosity(self):
+        import src.grpo.trainer as trainer_module
+
+        captured = {}
+
+        class DummyTrainer:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def setup(self):
+                captured["setup_called"] = True
+
+            def train(self, sent_stage=1):
+                captured["sent_stage"] = sent_stage
+
+        with patch.object(trainer_module, "GRPOTrainerLoop", DummyTrainer), patch(
+            "sys.argv", ["trainer.py", "--debug"]
+        ):
+            trainer_module.main()
+
+        assert captured["config"].training.verbosity >= 1
+        assert captured["setup_called"] is True
+        assert captured["sent_stage"] == 1
+
     def test_save_lora_weights_writes_final_artifact_without_checkpoint_manager(self, tmp_path):
         from src.grpo.trainer import GRPOTrainerLoop
         from src.utils.config import get_8gb_vram_config
