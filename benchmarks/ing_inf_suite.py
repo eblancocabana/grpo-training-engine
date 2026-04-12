@@ -81,8 +81,10 @@ class BenchmarkConfig:
     # Optimization params
     use_entropy_mask: bool = True
     enable_gradient_checkpointing: bool = True
+    disable_sent: bool = False
     # Tuning
     triton_lora_prefer_base: bool = False
+    triton_generation_mode: Optional[str] = None
     triton_generation: Optional[bool] = None
     triton_grpo_loss: Optional[bool] = None
     triton_entropy_mask: Optional[bool] = None
@@ -140,6 +142,9 @@ class BenchmarkConfig:
         else:
             args.append("--no-triton")
 
+        if self.triton_generation_mode is not None:
+            args.extend(["--triton-generation-mode", self.triton_generation_mode])
+
         if self.triton_generation is True:
             args.append("--triton-generation")
         elif self.triton_generation is False:
@@ -169,6 +174,9 @@ class BenchmarkConfig:
             args.append("--use-entropy-mask")
         else:
             args.append("--no-mask-truncated")
+
+        if self.disable_sent:
+            args.append("--no-sent")
         
         # Profile
         if self.profile:

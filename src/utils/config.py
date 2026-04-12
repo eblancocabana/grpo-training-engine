@@ -146,6 +146,7 @@ class TrainingConfig:
     checkpointing_update_interval_steps: int = 10
     use_triton_kernels: bool = True
     use_triton_generation: bool = True
+    triton_generation_mode: str = "auto"
     use_triton_grpo_loss: bool = True
     use_triton_entropy_mask: bool = True
     use_triton_lora: bool = True
@@ -258,6 +259,7 @@ def get_8gb_vram_config() -> Config:
     config.training.checkpointing_update_interval_steps = 10
     config.training.use_triton_kernels = True
     config.training.use_triton_generation = True
+    config.training.triton_generation_mode = "auto"
     config.training.use_triton_grpo_loss = True
     config.training.use_triton_entropy_mask = True
     config.training.use_triton_lora = True

@@ -232,6 +232,11 @@ def main():
         help="Use entropy-based selective backpropagation",
     )
     parser.add_argument(
+        "--no-sent",
+        action="store_true",
+        help="Disable SENT curriculum loading and use plain GSM8K ordering",
+    )
+    parser.add_argument(
         "--use-triton",
         action="store_true",
         default=True,
@@ -250,6 +255,13 @@ def main():
         action="store_true",
         default=None,
         help="Force-enable Triton generation when Triton kernels are enabled",
+    )
+    parser.add_argument(
+        "--triton-generation-mode",
+        type=str,
+        choices=["auto", "on", "off"],
+        default=None,
+        help="Set Triton generation routing policy: auto, on, or off",
     )
     parser.add_argument(
         "--no-triton-generation",
@@ -512,16 +524,27 @@ def main():
         config.training.max_response_length = args.max_response_length
     config.training.use_triton_kernels = args.use_triton and not args.no_triton
     default_triton_enabled = config.training.use_triton_kernels
+    config.training.triton_generation_mode = (
+        "auto" if default_triton_enabled else "off"
+    )
     config.training.use_triton_generation = default_triton_enabled
     config.training.use_triton_grpo_loss = default_triton_enabled
     config.training.use_triton_entropy_mask = default_triton_enabled
     config.training.use_triton_lora = default_triton_enabled
+    if args.triton_generation_mode is not None:
+        config.training.triton_generation_mode = (
+            args.triton_generation_mode if default_triton_enabled else "off"
+        )
     if args.triton_generation is not None:
-        config.training.use_triton_generation = (
-            default_triton_enabled and args.triton_generation
+        config.training.triton_generation_mode = (
+            "on" if default_triton_enabled and args.triton_generation else "off"
         )
     if args.no_triton_generation:
-        config.training.use_triton_generation = False
+        config.training.triton_generation_mode = "off"
+    config.training.use_triton_generation = (
+        default_triton_enabled
+        and config.training.triton_generation_mode != "off"
+    )
     if args.triton_grpo_loss is not None:
         config.training.use_triton_grpo_loss = (
             default_triton_enabled and args.triton_grpo_loss
@@ -565,6 +588,8 @@ def main():
         config.entropy.percentile = args.entropy_percentile
     if args.entropy_min_tokens is not None:
         config.entropy.min_tokens = args.entropy_min_tokens
+    if args.no_sent:
+        config.sent.enabled = False
 
     if args.max_steps is not None:
         config.training.max_steps = args.max_steps
@@ -625,8 +650,12 @@ def main():
     logger.info("  Entropy Mask: %s", config.entropy.use_entropy_mask)
     logger.info("  Entropy Percentile: %s", config.entropy.percentile)
     logger.info("  Entropy Min Tokens: %s", config.entropy.min_tokens)
+    logger.info("  SENT Enabled: %s", config.sent.enabled)
     logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
     logger.info("  Triton Generation: %s", config.training.use_triton_generation)
+    logger.info(
+        "  Triton Generation Mode: %s", config.training.triton_generation_mode
+    )
     logger.info("  Triton GRPO Loss: %s", config.training.use_triton_grpo_loss)
     logger.info("  Triton Entropy Mask: %s", config.training.use_triton_entropy_mask)
     logger.info("  Triton LoRA: %s", config.training.use_triton_lora)
