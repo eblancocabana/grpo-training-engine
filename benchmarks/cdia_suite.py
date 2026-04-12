@@ -82,12 +82,20 @@ class SuiteConfig:
         resolved.update(self.overrides)
         return resolved
 
-    def train_args(self, output_root: Path, trainer_steps: int, use_wandb: bool) -> list[str]:
+    def train_args(
+        self,
+        output_root: Path,
+        trainer_steps: int,
+        use_wandb: bool,
+        run_prefix: str = "cdia",
+    ) -> list[str]:
         if not self.runnable:
             raise ValueError(f"{self.name} is blocked: {self.blocked_reason}")
 
         resolved = self.resolved()
-        run_dir = output_root / self.name
+        normalized_prefix = run_prefix.strip().strip("_-")
+        run_name = f"{normalized_prefix}_{self.name}" if normalized_prefix else self.name
+        run_dir = output_root / run_name
         args = [
             sys.executable,
             str(TRAIN_SCRIPT),
@@ -142,7 +150,7 @@ class SuiteConfig:
                     "--wandb-project",
                     "grpo-training",
                     "--wandb-run-name",
-                    self.name,
+                    run_name,
                     "--wandb-tags",
                     "cdia",
                     "quick-screen",
@@ -388,12 +396,23 @@ def write_plan(configs: list[SuiteConfig], output_path: Path, trainer_steps: int
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def run_suite(configs: list[SuiteConfig], output_root: Path, trainer_steps: int, use_wandb: bool) -> int:
+def run_suite(
+    configs: list[SuiteConfig],
+    output_root: Path,
+    trainer_steps: int,
+    use_wandb: bool,
+    run_prefix: str,
+) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     runnable = [cfg for cfg in configs if cfg.runnable]
     failures = 0
     for cfg in runnable:
-        cmd = cfg.train_args(output_root=output_root, trainer_steps=trainer_steps, use_wandb=use_wandb)
+        cmd = cfg.train_args(
+            output_root=output_root,
+            trainer_steps=trainer_steps,
+            use_wandb=use_wandb,
+            run_prefix=run_prefix,
+        )
         print(f"[RUN] {cfg.name}")
         print("      " + " ".join(cmd))
         completed = subprocess.run(cmd, cwd=str(REPO_ROOT))
@@ -440,6 +459,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the generated plan as JSON instead of a readable summary.",
     )
+    parser.add_argument(
+        "--run-prefix",
+        type=str,
+        default="cdia",
+        help="Prefix for per-run output directories and WandB run names.",
+    )
     return parser.parse_args()
 
 
@@ -449,7 +474,11 @@ def main() -> int:
         raise FileNotFoundError(f"train.py not found at {TRAIN_SCRIPT}")
 
     configs = build_suite()
-    plan_path = args.plan_path or (args.output_root / "cdia_suite_plan.json")
+    normalized_prefix = args.run_prefix.strip().strip("_-")
+    default_plan_name = (
+        f"{normalized_prefix}_suite_plan.json" if normalized_prefix else "cdia_suite_plan.json"
+    )
+    plan_path = args.plan_path or (args.output_root / default_plan_name)
     write_plan(configs, plan_path, trainer_steps=args.steps)
 
     if args.json:
@@ -466,6 +495,7 @@ def main() -> int:
         output_root=args.output_root,
         trainer_steps=args.steps,
         use_wandb=args.wandb,
+        run_prefix=args.run_prefix,
     )
     return 1 if failures else 0
 

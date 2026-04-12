@@ -222,17 +222,31 @@ class BenchmarkResult:
 class IngInfBenchmarkSuite:
     """Benchmark suite for ING INF PFG."""
     
-    def __init__(self, output_dir: str = "./benchmarks/output/ing_inf"):
+    def __init__(self, output_dir: str = "./benchmarks/output/ing_inf", run_prefix: str = "ing_inf"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.results: List[BenchmarkResult] = []
         self.suite_name = "ING INF Benchmark Suite"
         self.report_title = "ING INF Benchmark Report"
+        self.run_prefix = self._normalize_prefix(run_prefix)
         
         # Find train.py
         self.train_script = Path(__file__).parent.parent / "train.py"
         if not self.train_script.exists():
             raise FileNotFoundError(f"train.py not found at {self.train_script}")
+
+    def _normalize_prefix(self, prefix: Optional[str]) -> str:
+        """Normalize a prefix for output directories and WandB run names."""
+        if prefix is None:
+            return ""
+        normalized = prefix.strip().strip("_-")
+        return normalized
+
+    def _prefixed_name(self, name: str) -> str:
+        """Apply the suite prefix to a config/run name."""
+        if not self.run_prefix:
+            return name
+        return f"{self.run_prefix}_{name}"
     
     def _parse_log(self, log_path: Path) -> Dict[str, Any]:
         """Parse training log for metrics."""
@@ -333,7 +347,8 @@ class IngInfBenchmarkSuite:
         
         note_cleanup_moved()
         
-        run_dir = self.output_dir / config.name.replace(" ", "_").replace("/", "_")
+        run_name = self._prefixed_name(config.name)
+        run_dir = self.output_dir / run_name.replace(" ", "_").replace("/", "_")
         run_dir.mkdir(parents=True, exist_ok=True)
         
         log_path = run_dir / "train.log"
@@ -341,7 +356,7 @@ class IngInfBenchmarkSuite:
         # Set WandB run name if not set
         if config.use_wandb and not config.wandb_run_name:
             # Clear, concise name with key params
-            config.wandb_run_name = f"INF-{config.name}"
+            config.wandb_run_name = self._prefixed_name(f"INF-{config.name}")
             base_tags = config.tags or []
             config.wandb_tags = base_tags + ["ing_inf", "benchmark"]
         
@@ -742,11 +757,17 @@ def main():
         help="Comma-separated list of config names to run",
     )
     parser.add_argument("--output-dir", type=str, default="./benchmarks/output/ing_inf")
+    parser.add_argument(
+        "--run-prefix",
+        type=str,
+        default="ing_inf",
+        help="Prefix for per-run output directories and WandB run names.",
+    )
     parser.add_argument("--list", action="store_true", help="List all test configs")
     
     args = parser.parse_args()
     
-    suite = IngInfBenchmarkSuite(output_dir=args.output_dir)
+    suite = IngInfBenchmarkSuite(output_dir=args.output_dir, run_prefix=args.run_prefix)
     
     filter_configs = None
     if args.filter_configs:

@@ -17,8 +17,12 @@ from ing_inf_suite import BenchmarkConfig, IngInfBenchmarkSuite
 class TritonMatrixBenchmarkSuite(IngInfBenchmarkSuite):
     """Per-kernel Triton ablation suite for the default training configuration."""
 
-    def __init__(self, output_dir: str = "./benchmarks/output/triton_matrix"):
-        super().__init__(output_dir=output_dir)
+    def __init__(
+        self,
+        output_dir: str = "./benchmarks/output/triton_matrix",
+        run_prefix: str = "triton_matrix",
+    ):
+        super().__init__(output_dir=output_dir, run_prefix=run_prefix)
         self.suite_name = "Triton Matrix Benchmark Suite"
         self.report_title = "Triton Matrix Benchmark Report"
 
@@ -177,11 +181,20 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=str, default="./benchmarks/output/triton_matrix"
     )
+    parser.add_argument(
+        "--run-prefix",
+        type=str,
+        default="triton_matrix",
+        help="Prefix for per-run output directories and WandB run names.",
+    )
     parser.add_argument("--list", action="store_true", help="List all test configs")
 
     args = parser.parse_args()
 
-    suite = TritonMatrixBenchmarkSuite(output_dir=args.output_dir)
+    suite = TritonMatrixBenchmarkSuite(
+        output_dir=args.output_dir,
+        run_prefix=args.run_prefix,
+    )
 
     filter_configs = None
     if args.filter_configs:
