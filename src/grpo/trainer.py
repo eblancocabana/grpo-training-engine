@@ -31,7 +31,12 @@ from src.grpo.algorithm import GRPOTrainer, GroupSampler
 from src.grpo.verifier import RuleBasedVerifier
 
 from src.selective.entropy_mask import EntropyCalculator
-from src.triton_kernels import paged_kv_decode, TRITON_AVAILABLE
+from src.triton_kernels import TRITON_AVAILABLE
+from src.triton_kernels.paged_kv import (
+    decode_from_paged_kv_cache,
+    expand_paged_kv_cache_state,
+    prefill_paged_kv_cache,
+)
 
 from src.data.gsm8k_loader import create_grpo_dataloader
 from src.grpo.benchmark import GSM8KBenchmark
@@ -110,6 +115,7 @@ class GRPOTrainerLoop:
         self._dataloader_seed = int(torch.initial_seed() % (2**31))
         self._profiler_hooks: ProfilerHooks | None = None
         self._metrics_jsonl_path: Optional[str] = None
+        self._triton_generation_policy_logged = False
 
     def setup(self):
         """Setup model, tokenizer, and training components."""
@@ -392,10 +398,10 @@ class GRPOTrainerLoop:
         """Run a single forward pass on the prompt to build the KV cache.
 
         Returns a DynamicCache with ``prompt_len - 1`` positions filled
-        (i.e. the last token is *not* cached).  This is exactly what
-        ``generate()`` expects: it receives the full ``input_ids`` and
-        discovers via ``cache_position`` that only the last token still
-        needs a forward pass.
+        (i.e. the last token is *not* cached).  This cache must come from a
+        true prefix-only forward on ``real_ids[:, :-1]``. Cropping a cache that
+        was built from the full prompt is not equivalent on the Qwen2/DeepSeek
+        decode path and can shift the next-token logits.
 
         Args:
             real_ids:  [1, prompt_len] – token ids (no padding)
@@ -405,13 +411,23 @@ class GRPOTrainerLoop:
             past_key_values: DynamicCache for the prompt (prompt_len-1 positions).
         """
         prompt_len = real_ids.shape[1]
+        if prompt_len <= 1:
+            outputs = self.model(
+                input_ids=real_ids,
+                attention_mask=real_mask,
+                use_cache=True,
+            )
+            past_kv = outputs.past_key_values
+            past_kv.crop(0)
+            del outputs
+            return past_kv
+
         outputs = self.model(
-            input_ids=real_ids,
-            attention_mask=real_mask,
+            input_ids=real_ids[:, :-1],
+            attention_mask=real_mask[:, :-1],
             use_cache=True,
         )
-        past_kv = outputs.past_key_values  # DynamicCache, seq_len = prompt_len
-        past_kv.crop(prompt_len - 1)  # keep [0 .. prompt_len-2]
+        past_kv = outputs.past_key_values  # DynamicCache, seq_len = prompt_len - 1
         del outputs
         return past_kv
 
@@ -533,13 +549,20 @@ class GRPOTrainerLoop:
         finally:
             self.model.train(was_training)
 
-    def _should_use_triton_generation(self) -> bool:
+    def _get_triton_generation_mode(self) -> str:
+        mode = getattr(self.config.training, "triton_generation_mode", None)
+        if mode in {"auto", "on", "off"}:
+            return mode
+        return "on" if getattr(self.config.training, "use_triton_generation", True) else "off"
+
+    def _resolve_triton_generation_decision(self) -> tuple[bool, str]:
         if not getattr(self.config.training, "use_triton_kernels", False):
-            return False
-        if not getattr(self.config.training, "use_triton_generation", True):
-            return False
+            return False, "global Triton kernels disabled"
+        mode = self._get_triton_generation_mode()
+        if mode == "off" or not getattr(self.config.training, "use_triton_generation", True):
+            return False, "generation mode is off"
         if not TRITON_AVAILABLE:
-            return False
+            return False, "Triton runtime unavailable"
 
         model_config = getattr(self.model, "config", None)
         num_heads = getattr(model_config, "num_attention_heads", None)
@@ -549,9 +572,31 @@ class GRPOTrainerLoop:
             and num_kv_heads is not None
             and num_heads % num_kv_heads != 0
         ):
-            return False
+            return False, "attention head layout is not divisible for GQA paged decode"
 
-        return True
+        if mode == "auto":
+            model_type = str(getattr(model_config, "model_type", "") or "").lower()
+            model_id = str(getattr(self.config.model, "model_id", "") or "").lower()
+            is_qwen_family = "qwen" in model_type or "qwen" in model_id or "deepseek-r1-distill-qwen" in model_id
+            if self.config.training.generation_do_sample and is_qwen_family:
+                return (
+                    False,
+                    "auto policy routes sampled DeepSeek/Qwen generation to the torch prefix-cache path because it benchmarks faster than Triton paged-KV on the RTX 3060 Ti target",
+                )
+
+        return True, "Triton paged-KV generation enabled"
+
+    def _should_use_triton_generation(self) -> bool:
+        enabled, reason = self._resolve_triton_generation_decision()
+        if not self._triton_generation_policy_logged:
+            logger.info(
+                "[TritonGen] mode=%s enabled=%s reason=%s",
+                self._get_triton_generation_mode(),
+                enabled,
+                reason,
+            )
+            self._triton_generation_policy_logged = True
+        return enabled
 
     def _create_train_dataloader(self, sent_stage: int, epoch: int):
         use_sent = self.config.sent.enabled
@@ -689,6 +734,41 @@ class GRPOTrainerLoop:
         )
         return generated_texts, response_mask
 
+    def _prefill_triton_prompt_cache(
+        self, real_ids: torch.Tensor, real_mask: torch.Tensor
+    ):
+        """Build a reusable Triton paged-KV prompt cache for grouped responses."""
+        return prefill_paged_kv_cache(
+            self.model,
+            real_ids,
+            real_mask,
+            max_new_tokens=self.config.training.max_response_length,
+            block_size=16,
+        )
+
+    def _generate_with_triton_paged_prefix_cache(
+        self,
+        prefix_state,
+        current_micro: int,
+    ) -> torch.Tensor:
+        """Decode grouped responses from a shared Triton paged-KV prompt cache."""
+        decode_state = expand_paged_kv_cache_state(prefix_state, current_micro)
+        return decode_from_paged_kv_cache(
+            self.model,
+            decode_state,
+            max_new_tokens=self.config.training.max_response_length,
+            do_sample=self.config.training.generation_do_sample,
+            temperature=self.config.training.generation_temperature,
+            top_p=self.config.training.generation_top_p,
+            pad_token_id=(
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else (self.tokenizer.eos_token_id or 0)
+            ),
+            eos_token_id=self.tokenizer.eos_token_id,
+            seed=None,
+        )
+
     def _generate_with_expanded_prefix_cache(
         self,
         real_ids: torch.Tensor,
@@ -814,7 +894,23 @@ class GRPOTrainerLoop:
                 use_triton_kernels = self._should_use_triton_generation()
 
                 if use_triton_kernels:
-                    prefix_cache = None
+                    try:
+                        prefix_cache = self._prefill_triton_prompt_cache(
+                            real_ids, real_mask
+                        )
+                    except ImportError:
+                        prefix_cache = None
+                        use_triton_kernels = False
+                    except (AttributeError, RuntimeError, ValueError) as exc:
+                        if "out of memory" in str(exc).lower():
+                            raise
+                        logger.warning(
+                            "Falling back from Triton paged-KV prefill to torch prefix cache: %s",
+                            exc,
+                        )
+                        prefix_cache = None
+                        use_triton_kernels = False
+                        prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
                 else:
                     # --- Prefill: compute prompt KV cache once ---
                     prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
@@ -828,22 +924,9 @@ class GRPOTrainerLoop:
                     if use_triton_kernels:
                         if TRITON_AVAILABLE:
                             try:
-                                # Ensure model is on the correct device
-                                model_device = next(self.model.parameters()).device
-                                input_ids_device = real_ids.device
-                                if model_device != input_ids_device:
-                                    self.model = self.model.to(input_ids_device)
-                                outputs = paged_kv_decode(
-                                    self.model,
-                                    input_ids=real_ids.expand(current_micro, -1),
-                                    attention_mask=real_mask.expand(current_micro, -1),
-                                    max_new_tokens=self.config.training.max_response_length,
-                                    do_sample=self.config.training.generation_do_sample,
-                                    temperature=self.config.training.generation_temperature,
-                                    top_p=self.config.training.generation_top_p,
-                                    pad_token_id=self.tokenizer.pad_token_id,
-                                    eos_token_id=self.tokenizer.eos_token_id,
-                                    use_cache=True,
+                                outputs = self._generate_with_triton_paged_prefix_cache(
+                                    prefix_state=prefix_cache,
+                                    current_micro=current_micro,
                                 )
                             except ImportError:
                                 outputs = self.model.generate(
@@ -915,7 +998,7 @@ class GRPOTrainerLoop:
                         self.memory_manager.clear_cache()
 
                 if use_triton_kernels:
-                    del single_ids, single_mask, real_ids, real_mask
+                    del single_ids, single_mask, real_ids, real_mask, prefix_cache
                 else:
                     del single_ids, single_mask, real_ids, real_mask, prefix_cache
 

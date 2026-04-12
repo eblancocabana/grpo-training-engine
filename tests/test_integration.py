@@ -156,9 +156,24 @@ class TestIntegration:
         loop.device = "cpu"
 
         fake_outputs = torch.tensor([[101, 102, 0], [201, 202, 0]], dtype=torch.long)
+        fake_state = types.SimpleNamespace(
+            k_cache=torch.zeros((1, 1, 1, 1, 1)),
+            v_cache=torch.zeros((1, 1, 1, 1, 1)),
+            block_tables=torch.zeros((1, 1), dtype=torch.int32),
+            context_lens=torch.zeros((1,), dtype=torch.int32),
+            last_tokens=torch.tensor([12], dtype=torch.long),
+            max_context=8,
+            block_size=1,
+        )
 
         with patch("src.grpo.trainer.TRITON_AVAILABLE", True), patch(
-            "src.grpo.trainer.paged_kv_decode",
+            "src.grpo.trainer.prefill_paged_kv_cache",
+            return_value=fake_state,
+        ), patch(
+            "src.grpo.trainer.expand_paged_kv_cache_state",
+            return_value=fake_state,
+        ), patch(
+            "src.grpo.trainer.decode_from_paged_kv_cache",
             return_value=fake_outputs,
         ):
             generated = loop.generate_responses(
@@ -268,9 +283,24 @@ class TestIntegration:
         loop.device = "cpu"
 
         fake_outputs = torch.tensor([[101, 9, 0], [201, 202, 0]], dtype=torch.long)
+        fake_state = types.SimpleNamespace(
+            k_cache=torch.zeros((1, 1, 1, 1, 1)),
+            v_cache=torch.zeros((1, 1, 1, 1, 1)),
+            block_tables=torch.zeros((1, 1), dtype=torch.int32),
+            context_lens=torch.zeros((1,), dtype=torch.int32),
+            last_tokens=torch.tensor([12], dtype=torch.long),
+            max_context=8,
+            block_size=1,
+        )
 
         with patch("src.grpo.trainer.TRITON_AVAILABLE", True), patch(
-            "src.grpo.trainer.paged_kv_decode",
+            "src.grpo.trainer.prefill_paged_kv_cache",
+            return_value=fake_state,
+        ), patch(
+            "src.grpo.trainer.expand_paged_kv_cache_state",
+            return_value=fake_state,
+        ), patch(
+            "src.grpo.trainer.decode_from_paged_kv_cache",
             return_value=fake_outputs,
         ):
             texts, response_ids, response_mask = loop._generate_responses_with_tokens(
@@ -279,7 +309,10 @@ class TestIntegration:
             )
 
         assert texts == ["101 9", "201 202"]
-        assert torch.equal(response_ids.cpu(), fake_outputs)
+        assert torch.equal(
+            response_ids.cpu(),
+            torch.tensor([[101, 9, 0], [201, 202, 0]], dtype=torch.long),
+        )
         assert torch.equal(
             response_mask.cpu(),
             torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.long),

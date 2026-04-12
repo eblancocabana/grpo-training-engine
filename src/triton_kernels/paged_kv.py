@@ -22,16 +22,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, TYPE_CHECKING, Protocol, cast
 import math
 
 import torch
-
-from src.triton_kernels.fused_ops import (
-    fused_qkv_rope,
-    fused_rmsnorm,
-    fused_mlp,
-)
 
 triton = None
 tl = None
@@ -54,6 +49,19 @@ if TYPE_CHECKING:
 class _TritonKernel(Protocol):
     def __getitem__(self, grid: Tuple[int, ...]) -> Callable[..., None]:
         ...
+
+
+@dataclass
+class PagedKVCacheState:
+    """Reusable paged KV prompt cache for grouped decode."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
+    last_tokens: torch.Tensor
+    max_context: int
+    block_size: int
 
 
 if TRITON_AVAILABLE:
@@ -586,31 +594,311 @@ def _prefill_paged_cache(
     if past_kv is None:
         return
 
-    seq_len = input_ids.shape[1]
-    batch_size = input_ids.shape[0]
+    token_slots = attention_mask.to(dtype=torch.int32).cumsum(dim=1) - 1
+    valid_mask = attention_mask.bool()
+    block_idx = torch.where(valid_mask, token_slots // block_size, 0)
+    block_off = torch.where(valid_mask, token_slots % block_size, 0)
+    block_ids = torch.gather(block_tables, 1, block_idx.clamp(min=0))
+
     for layer_idx in range(len(past_kv)):
         k_layer, v_layer = past_kv[layer_idx]
-        for b in range(batch_size):
-            valid_positions = attention_mask[b].bool().nonzero(as_tuple=False).flatten()
-            for cache_pos, pos in enumerate(valid_positions.tolist()):
-                block_idx = cache_pos // block_size
-                block_off = cache_pos % block_size
-                block_id = int(block_tables[b, block_idx].item())
-                k_cache[layer_idx, block_id, :, block_off, :] = k_layer[
-                    b, :, pos, :
-                ]
-                v_cache[layer_idx, block_id, :, block_off, :] = v_layer[
-                    b, :, pos, :
-                ]
+        k_valid = k_layer.permute(0, 2, 1, 3)[valid_mask].to(dtype=torch.bfloat16)
+        v_valid = v_layer.permute(0, 2, 1, 3)[valid_mask].to(dtype=torch.bfloat16)
+        valid_block_ids = block_ids[valid_mask]
+        valid_block_offs = block_off[valid_mask]
+
+        k_slots = k_cache[layer_idx].permute(0, 2, 1, 3)
+        v_slots = v_cache[layer_idx].permute(0, 2, 1, 3)
+        k_slots[valid_block_ids, valid_block_offs] = k_valid
+        v_slots[valid_block_ids, valid_block_offs] = v_valid
+
+
+def _build_block_tables(
+    batch_size: int, max_blocks: int, device: torch.device
+) -> torch.Tensor:
+    block_offsets = (
+        torch.arange(batch_size, device=device, dtype=torch.int32) * max_blocks
+    ).unsqueeze(1)
+    return block_offsets + torch.arange(
+        max_blocks, device=device, dtype=torch.int32
+    ).unsqueeze(0)
+
+
+def _clone_paged_cache_state(
+    state: PagedKVCacheState, repeats: int
+) -> PagedKVCacheState:
+    if repeats <= 0:
+        raise ValueError(f"repeats must be > 0, got {repeats}.")
+
+    base_batch = state.block_tables.shape[0]
+    max_blocks = state.block_tables.shape[1]
+    total_batch = base_batch * repeats
+    num_layers, _, num_kv_heads, block_size, head_dim = state.k_cache.shape
+    device = state.k_cache.device
+
+    # The trainer expands one prefetched prompt at a time. In that case we can
+    # share immutable full prefix blocks across grouped responses and only
+    # allocate private blocks for the mutable tail. This avoids cloning the
+    # entire prompt cache for every grouped sample.
+    if base_batch == 1 and repeats > 1:
+        prefix_ctx = int(state.context_lens[0].item())
+        shared_full_blocks = min(prefix_ctx // block_size, max_blocks)
+        has_partial_block = (prefix_ctx % block_size) != 0
+        private_blocks_per_row = max_blocks - shared_full_blocks
+
+        if private_blocks_per_row <= 0:
+            return PagedKVCacheState(
+                k_cache=state.k_cache.clone(),
+                v_cache=state.v_cache.clone(),
+                block_tables=state.block_tables.repeat(repeats, 1).clone(),
+                context_lens=state.context_lens.repeat(repeats).clone(),
+                last_tokens=state.last_tokens.repeat(repeats).clone(),
+                max_context=state.max_context,
+                block_size=state.block_size,
+            )
+
+        total_blocks = shared_full_blocks + repeats * private_blocks_per_row
+        expanded_k = torch.zeros(
+            (num_layers, total_blocks, num_kv_heads, block_size, head_dim),
+            device=device,
+            dtype=state.k_cache.dtype,
+        )
+        expanded_v = torch.zeros_like(expanded_k)
+
+        block_tables = torch.empty(
+            (repeats, max_blocks), device=device, dtype=torch.int32
+        )
+
+        if shared_full_blocks > 0:
+            shared_source_ids = state.block_tables[0, :shared_full_blocks].to(torch.long)
+            expanded_k[:, :shared_full_blocks].copy_(state.k_cache.index_select(1, shared_source_ids))
+            expanded_v[:, :shared_full_blocks].copy_(state.v_cache.index_select(1, shared_source_ids))
+            shared_ids = torch.arange(
+                shared_full_blocks, device=device, dtype=torch.int32
+            )
+            block_tables[:, :shared_full_blocks] = shared_ids.unsqueeze(0)
+
+        partial_source_block = None
+        if has_partial_block:
+            partial_source_block = int(state.block_tables[0, shared_full_blocks].item())
+
+        row_private_ids = torch.arange(
+            private_blocks_per_row, device=device, dtype=torch.int32
+        )
+        for row in range(repeats):
+            row_private_start = shared_full_blocks + row * private_blocks_per_row
+            private_ids = row_private_start + row_private_ids
+            block_tables[row, shared_full_blocks:] = private_ids
+            if partial_source_block is not None:
+                expanded_k[:, row_private_start].copy_(state.k_cache[:, partial_source_block])
+                expanded_v[:, row_private_start].copy_(state.v_cache[:, partial_source_block])
+
+        return PagedKVCacheState(
+            k_cache=expanded_k,
+            v_cache=expanded_v,
+            block_tables=block_tables,
+            context_lens=state.context_lens.repeat(repeats).clone(),
+            last_tokens=state.last_tokens.repeat(repeats).clone(),
+            max_context=state.max_context,
+            block_size=state.block_size,
+        )
+
+    base_k = state.k_cache.view(num_layers, base_batch, max_blocks, num_kv_heads, block_size, head_dim)
+    base_v = state.v_cache.view(num_layers, base_batch, max_blocks, num_kv_heads, block_size, head_dim)
+    expanded_k = (
+        base_k.repeat(1, repeats, 1, 1, 1, 1)
+        .reshape(num_layers, total_batch * max_blocks, num_kv_heads, block_size, head_dim)
+        .contiguous()
+    )
+    expanded_v = (
+        base_v.repeat(1, repeats, 1, 1, 1, 1)
+        .reshape(num_layers, total_batch * max_blocks, num_kv_heads, block_size, head_dim)
+        .contiguous()
+    )
+
+    return PagedKVCacheState(
+        k_cache=expanded_k,
+        v_cache=expanded_v,
+        block_tables=_build_block_tables(total_batch, max_blocks, state.k_cache.device),
+        context_lens=state.context_lens.repeat(repeats).clone(),
+        last_tokens=state.last_tokens.repeat(repeats).clone(),
+        max_context=state.max_context,
+        block_size=state.block_size,
+    )
 
 
 @torch.no_grad()
-def paged_kv_decode_model(
+def prefill_paged_kv_cache(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    *,
     max_new_tokens: int,
+    block_size: int = 16,
+) -> PagedKVCacheState:
+    """Prefill a reusable paged prompt cache excluding the prompt's last token."""
+    if not TRITON_AVAILABLE:
+        raise ImportError("Triton is not available for paged_kv_decode.")
+    if max_new_tokens <= 0:
+        raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
+    if input_ids.ndim != 2 or attention_mask.ndim != 2:
+        raise ValueError("input_ids and attention_mask must be rank-2 tensors.")
+    if input_ids.shape != attention_mask.shape:
+        raise ValueError("input_ids and attention_mask must have the same shape.")
+    if input_ids.shape[1] == 0:
+        raise ValueError("input_ids must have at least 1 token.")
+
+    (
+        _embeddings,
+        layers,
+        _norm,
+        _rotary_emb,
+        _lm_head,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        _hidden_size,
+    ) = _get_model_components(model)
+
+    prompt_lens = attention_mask.sum(dim=1).to(dtype=torch.int32)
+    if torch.any(prompt_lens <= 0):
+        raise ValueError("Each prompt must contain at least one unmasked token.")
+    max_prompt_len = int(prompt_lens.max().item())
+    max_context_needed = max(max_prompt_len - 1 + max_new_tokens + 1, 1)
+    max_blocks = math.ceil(max_context_needed / block_size)
+    total_blocks = input_ids.shape[0] * max_blocks
+
+    k_cache = torch.zeros(
+        (len(layers), total_blocks, num_kv_heads, block_size, head_dim),
+        device=input_ids.device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = _build_block_tables(input_ids.shape[0], max_blocks, input_ids.device)
+    context_lens = torch.clamp(prompt_lens - 1, min=0)
+
+    if max_prompt_len > 1:
+        _prefill_paged_cache(
+            model,
+            input_ids[:, :-1],
+            attention_mask[:, :-1],
+            k_cache,
+            v_cache,
+            block_tables,
+            block_size,
+            num_heads,
+            num_kv_heads,
+        )
+
+    last_token_positions = (
+        attention_mask.shape[1]
+        - 1
+        - attention_mask.flip(dims=(1,)).to(dtype=torch.int64).argmax(dim=1)
+    )
+    last_tokens = input_ids.gather(1, last_token_positions.unsqueeze(1)).squeeze(1)
+
+    return PagedKVCacheState(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        last_tokens=last_tokens,
+        max_context=max_context_needed,
+        block_size=block_size,
+    )
+
+
+def expand_paged_kv_cache_state(
+    state: PagedKVCacheState, repeats: int
+) -> PagedKVCacheState:
+    """Expand a single prefetched prompt cache into independent grouped copies."""
+    return _clone_paged_cache_state(state, repeats)
+
+
+def _append_kv_to_paged_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
     block_size: int,
+) -> None:
+    block_idx = torch.div(context_lens, block_size, rounding_mode="floor")
+    block_off = torch.remainder(context_lens, block_size)
+    block_ids = torch.gather(block_tables, 1, block_idx.unsqueeze(1)).squeeze(1)
+
+    k_slots = k_cache.permute(0, 2, 1, 3)
+    v_slots = v_cache.permute(0, 2, 1, 3)
+    k_slots[block_ids, block_off] = k_new
+    v_slots[block_ids, block_off] = v_new
+
+
+def _torch_paged_attention_decode(
+    attn_module: torch.nn.Module,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    from transformers.models.qwen2.modeling_qwen2 import (
+        ALL_ATTENTION_FUNCTIONS,
+        eager_attention_forward,
+    )
+
+    batch_size, _num_heads, head_dim = q.shape
+    max_context = int(context_lens.max().item())
+    positions = torch.arange(max_context, device=q.device, dtype=torch.int32)
+    block_idx = torch.div(positions, block_size, rounding_mode="floor").unsqueeze(0)
+    block_idx = block_idx.expand(batch_size, -1)
+    block_off = torch.remainder(positions, block_size).unsqueeze(0).expand(batch_size, -1)
+    block_ids = torch.gather(block_tables, 1, block_idx)
+
+    k_seq = k_cache[block_ids, :, block_off].permute(0, 2, 1, 3)
+    v_seq = v_cache[block_ids, :, block_off].permute(0, 2, 1, 3)
+    mask = positions.unsqueeze(0) >= context_lens.unsqueeze(1)
+    attention_mask = None
+    if mask.any():
+        attention_mask = torch.zeros(
+            (batch_size, 1, 1, max_context),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        attention_mask = attention_mask.masked_fill(
+            mask[:, None, None, :],
+            torch.finfo(attention_mask.dtype).min,
+        )
+
+    attn_impl = getattr(getattr(attn_module, "config", None), "_attn_implementation", None)
+    get_interface = getattr(ALL_ATTENTION_FUNCTIONS, "get_interface", None)
+    if callable(get_interface):
+        attention_interface = get_interface(attn_impl, eager_attention_forward)
+    elif attn_impl == "eager" or attn_impl is None:
+        attention_interface = eager_attention_forward
+    else:
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get(attn_impl, eager_attention_forward)
+    attn_out, _ = attention_interface(
+        attn_module,
+        q.unsqueeze(2),
+        k_seq,
+        v_seq,
+        attention_mask,
+        dropout=0.0,
+        scaling=getattr(attn_module, "scaling", 1.0 / math.sqrt(head_dim)),
+        is_causal=False,
+        sliding_window=getattr(attn_module, "sliding_window", None),
+    )
+    return attn_out.squeeze(1)
+
+
+@torch.no_grad()
+def decode_from_paged_kv_cache(
+    model: torch.nn.Module,
+    state: PagedKVCacheState,
+    *,
+    max_new_tokens: int,
     do_sample: bool,
     temperature: float,
     top_p: float,
@@ -618,10 +906,12 @@ def paged_kv_decode_model(
     eos_token_id: Optional[int],
     seed: Optional[int],
 ) -> torch.Tensor:
+    """Decode from a prefetched paged KV cache state."""
     if not TRITON_AVAILABLE:
         raise ImportError("Triton is not available for paged_kv_decode.")
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}.")
+
     (
         embeddings,
         layers,
@@ -631,87 +921,34 @@ def paged_kv_decode_model(
         num_heads,
         num_kv_heads,
         head_dim,
-        _,
+        _hidden_size,
     ) = _get_model_components(model)
-    num_layers = len(layers)
 
-    batch_size = input_ids.shape[0]
-    prompt_len = input_ids.shape[1]
-    if prompt_len == 0:
-        raise ValueError("input_ids must have at least 1 token.")
-    prompt_lens = attention_mask.sum(dim=1).to(dtype=torch.int32)
-    if torch.any(prompt_lens <= 0):
-        raise ValueError("Each prompt must contain at least one unmasked token.")
-    max_prompt_len = int(prompt_lens.max().item())
-
-    max_context_needed = max(max_prompt_len - 1 + max_new_tokens + 1, 1)
-    max_blocks = math.ceil(max_context_needed / block_size)
-    total_blocks = batch_size * max_blocks
-
-    kv_group_size = num_heads // num_kv_heads
-
-    k_cache = torch.zeros(
-        (num_layers, total_blocks, num_kv_heads, block_size, head_dim),
-        device=input_ids.device,
-        dtype=torch.bfloat16,
-    )
-    v_cache = torch.zeros_like(k_cache)
-    block_offsets = (
-        torch.arange(batch_size, device=input_ids.device, dtype=torch.int32) * max_blocks
-    ).unsqueeze(1)
-    block_tables = block_offsets + torch.arange(
-        max_blocks, device=input_ids.device, dtype=torch.int32
-    ).unsqueeze(0)
-
-    context_lens = torch.clamp(prompt_lens - 1, min=0)
-
-    if max_prompt_len > 1:
-        prefill_ids = input_ids[:, :-1]
-        prefill_mask = attention_mask[:, :-1]
-        _prefill_paged_cache(
-            model,
-            prefill_ids,
-            prefill_mask,
-            k_cache,
-            v_cache,
-            block_tables,
-            block_size,
-            num_heads,
-            num_kv_heads,
-        )
+    batch_size = state.block_tables.shape[0]
+    if torch.any(state.context_lens + max_new_tokens > state.max_context):
+        raise ValueError("Requested decode exceeds block table capacity.")
 
     generated = torch.full(
         (batch_size, max_new_tokens),
         pad_token_id,
-        device=input_ids.device,
-        dtype=input_ids.dtype,
+        device=state.k_cache.device,
+        dtype=state.last_tokens.dtype,
     )
     generator = None
     if seed is not None:
-        generator = torch.Generator(device=input_ids.device)
+        generator = torch.Generator(device=state.k_cache.device)
         generator.manual_seed(seed)
 
-    last_token_positions = (
-        attention_mask.shape[1]
-        - 1
-        - attention_mask.flip(dims=(1,)).to(dtype=torch.int64).argmax(dim=1)
-    )
-    last_tokens = input_ids.gather(1, last_token_positions.unsqueeze(1)).squeeze(1)
-    finished = torch.zeros(batch_size, device=input_ids.device, dtype=torch.bool)
-
-    block_ctx = _select_block_ctx(max_context_needed)
+    context_lens = state.context_lens.clone()
+    last_tokens = state.last_tokens.clone()
+    finished = torch.zeros(batch_size, device=state.k_cache.device, dtype=torch.bool)
+    update_kernel = cast(_TritonKernel, _paged_kv_update_kernel)
     block_d = _select_block_d(head_dim)
     update_warps = _select_num_warps_update(head_dim)
-    decode_warps = _select_num_warps_decode(block_d, block_ctx)
-    decode_stages = _select_num_stages_decode(max_context_needed)
-    scale = 1.0 / math.sqrt(head_dim)
-
-    update_kernel = cast(_TritonKernel, _paged_kv_update_kernel)
-    decode_kernel = cast(_TritonKernel, _paged_attention_decode_kernel)
-    use_cuda_graph = False
-    graph = None
 
     def _step() -> tuple[torch.Tensor, torch.Tensor]:
+        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
         hidden_states = cast(torch.Tensor, embeddings(last_tokens))
         if hidden_states.ndim == 2:
             hidden_states = hidden_states.unsqueeze(1)
@@ -728,44 +965,44 @@ def paged_kv_decode_model(
             mlp = cast(torch.nn.Module, getattr(layer_typed, "mlp"))
 
             residual = hidden_states
-            hidden_states = fused_rmsnorm(
-                hidden_states,
-                cast(torch.Tensor, getattr(input_norm, "weight")),
-                cast(float, getattr(input_norm, "variance_epsilon")),
+            hidden_states = cast(torch.Tensor, input_norm(hidden_states))
+            q_states = cast(
+                torch.Tensor,
+                cast(torch.nn.Module, getattr(attn, "q_proj"))(hidden_states),
             )
-            q_states, k_states, v_states = fused_qkv_rope(
-                hidden_states,
-                cast(torch.nn.Module, getattr(attn, "q_proj")),
-                cast(torch.nn.Module, getattr(attn, "k_proj")),
-                cast(torch.nn.Module, getattr(attn, "v_proj")),
-                cos,
-                sin,
-                num_heads,
-                num_kv_heads,
-                head_dim,
+            k_states = cast(
+                torch.Tensor,
+                cast(torch.nn.Module, getattr(attn, "k_proj"))(hidden_states),
             )
-            q = q_states[:, :, 0, :].to(dtype=torch.bfloat16)
-            k_new = k_states[:, :, 0, :].to(dtype=torch.bfloat16)
-            v_new = v_states[:, :, 0, :].to(dtype=torch.bfloat16)
+            v_states = cast(
+                torch.Tensor,
+                cast(torch.nn.Module, getattr(attn, "v_proj"))(hidden_states),
+            )
+            q_states = q_states.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
+            k_states = k_states.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
+            v_states = v_states.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
+            q_states, k_states = apply_rotary_pos_emb(q_states, k_states, cos, sin)
+            q = q_states[:, :, 0, :].to(dtype=torch.bfloat16).contiguous()
+            k_new = k_states[:, :, 0, :].to(dtype=torch.bfloat16).contiguous()
+            v_new = v_states[:, :, 0, :].to(dtype=torch.bfloat16).contiguous()
 
-            update_grid = (batch_size, num_kv_heads)
-            update_kernel[update_grid](
+            update_kernel[(batch_size, num_kv_heads)](
                 k_new,
                 v_new,
-                k_cache[layer_idx],
-                v_cache[layer_idx],
-                block_tables,
+                state.k_cache[layer_idx],
+                state.v_cache[layer_idx],
+                state.block_tables,
                 context_lens,
                 k_new.stride(0),
                 k_new.stride(1),
                 k_new.stride(2),
-                k_cache[layer_idx].stride(0),
-                k_cache[layer_idx].stride(1),
-                k_cache[layer_idx].stride(2),
-                k_cache[layer_idx].stride(3),
-                block_tables.stride(0),
-                block_tables.stride(1),
-                block_size,
+                state.k_cache[layer_idx].stride(0),
+                state.k_cache[layer_idx].stride(1),
+                state.k_cache[layer_idx].stride(2),
+                state.k_cache[layer_idx].stride(3),
+                state.block_tables.stride(0),
+                state.block_tables.stride(1),
+                state.block_size,
                 num_kv_heads,
                 D=head_dim,
                 BLOCK_D=block_d,
@@ -773,38 +1010,15 @@ def paged_kv_decode_model(
                 num_stages=1,
             )
 
-            attn_out = torch.empty_like(q, dtype=torch.float32)
-            attn_grid = (batch_size, num_heads)
-            decode_kernel[attn_grid](
+            attn_out = _torch_paged_attention_decode(
+                attn,
                 q,
-                k_cache[layer_idx],
-                v_cache[layer_idx],
-                block_tables,
+                state.k_cache[layer_idx],
+                state.v_cache[layer_idx],
+                state.block_tables,
                 new_context_lens,
-                attn_out,
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                k_cache[layer_idx].stride(0),
-                k_cache[layer_idx].stride(1),
-                k_cache[layer_idx].stride(2),
-                k_cache[layer_idx].stride(3),
-                block_tables.stride(0),
-                block_tables.stride(1),
-                attn_out.stride(0),
-                attn_out.stride(1),
-                attn_out.stride(2),
-                block_size,
-                kv_group_size,
-                scale,
-                D=head_dim,
-                BLOCK_CTX=block_ctx,
-                BLOCK_D=block_d,
-                MAX_CONTEXT=max_context_needed,
-                num_warps=decode_warps,
-                num_stages=decode_stages,
+                state.block_size,
             )
-
             attn_out = attn_out.to(hidden_states.dtype)
             attn_out = attn_out.reshape(batch_size, 1, num_heads * head_dim)
             attn_out = cast(
@@ -814,20 +1028,8 @@ def paged_kv_decode_model(
             hidden_states = residual + attn_out
 
             residual = hidden_states
-            hidden_states = fused_rmsnorm(
-                hidden_states,
-                cast(torch.Tensor, getattr(post_norm, "weight")),
-                cast(float, getattr(post_norm, "variance_epsilon")),
-            )
-            hidden_states = cast(
-                torch.Tensor,
-                fused_mlp(
-                    hidden_states,
-                    cast(torch.nn.Module, getattr(mlp, "gate_proj")),
-                    cast(torch.nn.Module, getattr(mlp, "up_proj")),
-                    cast(torch.nn.Module, getattr(mlp, "down_proj")),
-                ),
-            )
+            hidden_states = cast(torch.Tensor, post_norm(hidden_states))
+            hidden_states = cast(torch.Tensor, mlp(hidden_states))
             hidden_states = residual + hidden_states
 
         hidden_states = norm(hidden_states)
@@ -857,6 +1059,40 @@ def paged_kv_decode_model(
         context_lens = new_context_lens
 
     return generated
+
+
+@torch.no_grad()
+def paged_kv_decode_model(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int,
+    block_size: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    pad_token_id: int,
+    eos_token_id: Optional[int],
+    seed: Optional[int],
+) -> torch.Tensor:
+    prefix_state = prefill_paged_kv_cache(
+        model,
+        input_ids,
+        attention_mask,
+        max_new_tokens=max_new_tokens,
+        block_size=block_size,
+    )
+    return decode_from_paged_kv_cache(
+        model,
+        prefix_state,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        seed=seed,
+    )
 
 
 @torch.no_grad()
@@ -1030,4 +1266,11 @@ def paged_kv_decode(
     return generated
 
 
-__all__ = ["paged_kv_decode"]
+__all__ = [
+    "PagedKVCacheState",
+    "decode_from_paged_kv_cache",
+    "expand_paged_kv_cache_state",
+    "paged_kv_decode",
+    "paged_kv_decode_model",
+    "prefill_paged_kv_cache",
+]
