@@ -2,7 +2,14 @@ import torch
 import random
 from typing import Callable, Dict, Any, Optional
 from tqdm import tqdm
-import wandb
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
 
 from src.utils.logging_utils import get_logger
 from src.core.memory_manager import MemoryManager
@@ -160,7 +167,7 @@ class GSM8KBenchmark:
 
         logger.info(f"Benchmark Results: Acc={final_metrics['val/acc']:.2f}")
 
-        if wandb.run is not None:
+        if WANDB_AVAILABLE and wandb.run is not None:
             wandb.log(final_metrics, step=step)
             columns = [
                 "Step",
