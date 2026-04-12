@@ -218,9 +218,13 @@ class GRPOTrainerLoop:
         self.group_sampler = GroupSampler(group_size=self.config.grpo.group_size)
 
         # Setup checkpoint manager
-        if self.config.training.checkpoint_dir is not None:
+        checkpoint_dir = self.config.training.checkpoint_dir
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = checkpoint_dir.strip() or None
+
+        if checkpoint_dir is not None:
             self.checkpoint_manager = CheckpointManager(
-                checkpoint_dir=self.config.training.checkpoint_dir
+                checkpoint_dir=checkpoint_dir
             )
         else:
             self.checkpoint_manager = None

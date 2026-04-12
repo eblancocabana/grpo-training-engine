@@ -814,6 +814,40 @@ class TestIntegration:
         assert restored._accumulation_batches == 0
         assert restored._dataloader_seed == 123
 
+    def test_setup_disables_checkpoint_manager_when_checkpoint_dir_is_empty(self):
+        from src.grpo.trainer import GRPOTrainerLoop
+        from src.utils.config import get_8gb_vram_config
+
+        config = get_8gb_vram_config()
+        config.training.checkpoint_dir = ""
+        config.sent.enabled = False
+        config.wandb.enabled = False
+
+        loop = GRPOTrainerLoop(config)
+
+        fake_model = nn.Linear(1, 1)
+        fake_tokenizer = object()
+
+        with patch("src.grpo.trainer.load_4bit_engine", return_value=(fake_model, fake_tokenizer)), patch(
+            "src.grpo.trainer.inject_lora_layers"
+        ), patch(
+            "src.grpo.trainer.print_model_memory_usage"
+        ), patch(
+            "src.grpo.trainer.get_lora_parameters",
+            return_value=list(fake_model.parameters()),
+        ), patch(
+            "src.grpo.trainer.MemoryManager"
+        ) as memory_manager_cls, patch(
+            "src.grpo.trainer.GSM8KBenchmark"
+        ):
+            memory_manager_cls.return_value = types.SimpleNamespace(
+                enable_checkpointing=lambda model: None,
+                print_memory_stats=lambda prefix: None,
+            )
+            loop.setup()
+
+        assert loop.checkpoint_manager is None
+
     def test_train_epoch_retries_oom_without_leaking_grads(self):
         from src.grpo.trainer import GRPOTrainerLoop
         from src.utils.config import get_8gb_vram_config

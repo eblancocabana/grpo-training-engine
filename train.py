@@ -611,7 +611,7 @@ def main():
     
     # Checkpoint configuration
     if args.no_checkpoints:
-        config.training.checkpoint_dir = ""
+        config.training.checkpoint_dir = None
 
     # WandB configuration
     config.wandb.enabled = args.wandb and not args.no_wandb
