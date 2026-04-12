@@ -758,14 +758,22 @@ class TestIntegration:
             [[5, 9]], dtype=torch.long
         )
 
-        with patch("src.grpo.trainer.paged_kv_decode") as paged_decode:
-            paged_decode.return_value = torch.tensor([[5, 9]], dtype=torch.long)
+        with patch.object(
+            loop,
+            "_prefill_triton_prompt_cache",
+            return_value=object(),
+        ) as triton_prefill, patch.object(
+            loop,
+            "_generate_with_triton_paged_prefix_cache",
+            return_value=torch.tensor([[5, 9]], dtype=torch.long),
+        ) as triton_decode:
             generated = loop.generate_responses(
                 input_ids=torch.tensor([[7, 8]], dtype=torch.long),
                 attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
             )
 
-        paged_decode.assert_called_once()
+        triton_prefill.assert_called_once()
+        triton_decode.assert_called_once()
         assert generated == ["5 9"]
 
     def test_load_checkpoint_discards_partial_accumulation_state(self, tmp_path):
