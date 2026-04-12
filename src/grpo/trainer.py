@@ -641,12 +641,10 @@ class GRPOTrainerLoop:
         return enabled
 
     def _create_train_dataloader(self, sent_stage: int, epoch: int):
-        use_sent = self.config.sent.enabled
-        do_shuffle = not use_sent
-        generator = None
-        if do_shuffle:
-            generator = torch.Generator()
-            generator.manual_seed(self._dataloader_seed + epoch)
+        requested_use_sent = self.config.sent.enabled
+        do_shuffle = not requested_use_sent
+        generator = torch.Generator()
+        generator.manual_seed(self._dataloader_seed + epoch)
 
         dataloader = create_grpo_dataloader(
             tokenizer=self.tokenizer,
@@ -654,7 +652,7 @@ class GRPOTrainerLoop:
             batch_size=self.config.training.batch_size,
             max_prompt_length=self.config.training.max_prompt_length,
             shuffle=do_shuffle,
-            use_sent=use_sent,
+            use_sent=requested_use_sent,
             sent_config=self.config.sent,
             num_stages=self.config.sent.curriculum_stages,
             cache_path=self.config.sent.cache_path,
@@ -662,9 +660,35 @@ class GRPOTrainerLoop:
             generator=generator,
         )
 
-        if use_sent and hasattr(dataloader.dataset, "set_stage"):
-            dataloader.dataset.set_stage(sent_stage)
-            stage_info = dataloader.dataset.get_stage_info()
+        if self._dataloader_uses_sent(dataloader):
+            self._apply_sent_stage(dataloader, sent_stage)
+
+        return dataloader
+
+    @staticmethod
+    def _dataloader_uses_sent(dataloader: Any) -> bool:
+        return bool(getattr(dataloader, "uses_sent_curriculum", False))
+
+    def _resolve_sent_stage_for_epoch(
+        self, epoch: int, sent_stage: Optional[int], use_sent: bool
+    ) -> int:
+        if not use_sent:
+            return 1
+        if sent_stage is not None:
+            return sent_stage
+        return min(epoch + 1, self.config.sent.curriculum_stages)
+
+    def _apply_sent_stage(self, dataloader: Any, sent_stage: int) -> None:
+        dataset = getattr(dataloader, "dataset", None)
+        if dataset is None or not hasattr(dataset, "set_stage"):
+            return
+        current_stage = getattr(dataset, "current_stage", None)
+        if current_stage == sent_stage:
+            return
+        dataset.set_stage(sent_stage)
+        dataloader.current_sent_stage = sent_stage
+        if hasattr(dataset, "get_stage_info"):
+            stage_info = dataset.get_stage_info()
             logger.info(
                 "[SENT] Training on stage %d/%d (samples %d-%d)",
                 sent_stage,
@@ -672,8 +696,8 @@ class GRPOTrainerLoop:
                 stage_info["stage_start_idx"],
                 stage_info["stage_end_idx"],
             )
-
-        return dataloader
+        else:
+            logger.info("[SENT] Training on stage %d", sent_stage)
 
     def _initialize_optimizer_state(self) -> None:
         """Pre-allocate AdamW state so the first real optimizer step is not a surprise OOM."""
@@ -1814,20 +1838,28 @@ class GRPOTrainerLoop:
 
         return reached_max_steps
 
-    def train(self, num_epochs: Optional[int] = None, sent_stage: int = 1):
+    def train(self, num_epochs: Optional[int] = None, sent_stage: Optional[int] = None):
         """
         Main training loop.
 
         Args:
             num_epochs: Number of epochs (uses config if None)
-            sent_stage: Curriculum stage to train on (1-indexed, default=1 = easiest)
+            sent_stage: Fixed curriculum stage to train on. If None, advance
+                automatically from stage 1 toward the configured maximum.
         """
         if num_epochs is None:
             num_epochs = self.config.training.num_epochs
 
         logger.info("\n[Train] Creating dataloader...")
-        use_sent = self.config.sent.enabled
-        dataloader = self._create_train_dataloader(sent_stage=sent_stage, epoch=0)
+        initial_sent_stage = self._resolve_sent_stage_for_epoch(
+            epoch=0, sent_stage=sent_stage, use_sent=self.config.sent.enabled
+        )
+        dataloader = self._create_train_dataloader(sent_stage=initial_sent_stage, epoch=0)
+        use_sent = self._dataloader_uses_sent(dataloader)
+        if self.config.sent.enabled and not use_sent:
+            logger.warning(
+                "[SENT] Requested but inactive for this run; trainer will use standard GSM8K epoch semantics."
+            )
 
         logger.info("[Train] Starting training for %s epochs...", num_epochs)
         logger.info("[Train] Steps per epoch: ~%s", len(dataloader))
@@ -2009,20 +2041,28 @@ class GRPOTrainerLoop:
                 )
                 break
             self.current_epoch = epoch
+            current_sent_stage = self._resolve_sent_stage_for_epoch(
+                epoch=epoch,
+                sent_stage=sent_stage,
+                use_sent=use_sent,
+            )
             if not use_sent:
                 dataloader = self._create_train_dataloader(
-                    sent_stage=sent_stage,
+                    sent_stage=current_sent_stage,
                     epoch=epoch,
                 )
+            else:
+                self._apply_sent_stage(dataloader, current_sent_stage)
             epoch_skip = resume_skip_steps if epoch == resume_epoch else 0
             if self._profiler_hooks:
                 self._profiler_hooks.annotate_step(
                     self.global_step,
                     "sent_stage",
                     {
-                        "stage": sent_stage,
+                        "stage": current_sent_stage,
                         "epoch": epoch,
                         "num_stages": self.config.sent.curriculum_stages,
+                        "enabled": use_sent,
                     },
                 )
             should_stop_training = self.train_epoch_with_skip(
@@ -2116,14 +2156,15 @@ class GRPOTrainerLoop:
 
     def save_lora_weights(self, suffix: str = ""):
         """Save only LoRa weights."""
-        if self.checkpoint_manager is None:
-            return
-        
         save_path = os.path.join(
             self.config.training.output_dir, f"lora_weights{suffix}.pt"
         )
+        os.makedirs(self.config.training.output_dir, exist_ok=True)
+        manager = self.checkpoint_manager or CheckpointManager(
+            self.config.training.output_dir
+        )
 
-        self.checkpoint_manager.save_lora_weights(
+        manager.save_lora_weights(
             model=self.model,
             save_path=save_path,
             metadata={

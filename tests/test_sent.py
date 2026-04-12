@@ -704,6 +704,35 @@ class TestDataloaderCompatibility:
             assert "input_ids" in batch
             assert "questions" in batch
 
+    def test_create_grpo_dataloader_fallback_restores_standard_shuffle_semantics(self):
+        """Missing SENT cache should behave like plain GSM8K training."""
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
+        mock_tokenizer.apply_chat_template.return_value = "formatted"
+        mock_tokenizer.return_value = {"input_ids": [1, 2], "attention_mask": [1, 1]}
+
+        fake_loader = type("FakeLoader", (), {})()
+
+        with patch("src.data.gsm8k_loader.load_dataset") as mock_load, patch(
+            "src.data.gsm8k_loader.DataLoader", return_value=fake_loader
+        ) as dataloader_cls:
+            mock_load.return_value = [
+                {"question": f"Q{i}?", "answer": f"#### {i}"} for i in range(4)
+            ]
+
+            dl = create_grpo_dataloader(
+                tokenizer=mock_tokenizer,
+                use_sent=True,
+                batch_size=2,
+                cache_path="/tmp/does-not-exist.json",
+                max_prompt_length=2,
+                sent_config=SENTConfig(),
+                shuffle=False,
+            )
+
+        assert dl is fake_loader
+        assert dataloader_cls.call_args.kwargs["shuffle"] is True
+        assert getattr(dl, "uses_sent_curriculum") is False
+
 
 class TestEndToEndPreprocess:
     """End-to-end test with mocked model (no GPU required)."""

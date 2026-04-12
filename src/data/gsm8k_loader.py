@@ -191,6 +191,8 @@ class GRPOGSM8KDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
         self.requested_max_prompt_length = max_prompt_length
+        self.use_sent = False
+        self.num_stages = 1
 
         # Load dataset
         logger.info("Loading GSM8K %s split for GRPO...", split)
@@ -396,6 +398,8 @@ def create_grpo_dataloader(
         else tokenizer_model_id if isinstance(tokenizer_model_id, str) else None
     )
 
+    requested_use_sent = use_sent
+
     if use_sent:
         is_valid, msg = _validate_cache(
             cache_path,
@@ -505,15 +509,26 @@ def create_grpo_dataloader(
     if worker_count > 0 and "unittest.mock" in type(tokenizer).__module__:
         worker_count = 0
 
+    effective_shuffle = shuffle
+    if requested_use_sent and not use_sent:
+        effective_shuffle = True
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=effective_shuffle,
         collate_fn=grpo_collate,
         generator=generator,
         pin_memory=True,
         num_workers=worker_count,
         prefetch_factor=prefetch_factor if worker_count > 0 else None,
+    )
+
+    dataloader.uses_sent_curriculum = bool(
+        use_sent and getattr(dataset, "use_sent", False) and hasattr(dataset, "set_stage")
+    )
+    dataloader.sent_num_stages = (
+        int(getattr(dataset, "num_stages", 1)) if dataloader.uses_sent_curriculum else 1
     )
 
     return dataloader

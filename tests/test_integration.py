@@ -738,24 +738,24 @@ class TestIntegration:
                 del kwargs
                 self.generate_calls += 1
                 return torch.cat(
-                    [input_ids, torch.tensor([[5, 9]], dtype=torch.long)], dim=1
+                    [input_ids, torch.tensor([[5, 9], [6, 9]], dtype=torch.long)], dim=1
                 )
 
         config = get_8gb_vram_config()
         config.training.use_triton_kernels = True
         config.training.generation_do_sample = True
-        config.grpo.group_size = 1
+        config.grpo.group_size = 2
         loop = GRPOTrainerLoop(config)
         loop.model = DummyModel()
         loop.tokenizer = DummyTokenizer()
         loop.memory_manager = DummyMemoryManager()
-        loop.group_sampler = types.SimpleNamespace(group_size=1)
-        loop._gen_micro_batch = 1
+        loop.group_sampler = types.SimpleNamespace(group_size=2)
+        loop._gen_micro_batch = 2
         loop.device = "cpu"
         loop._prefill_prompt_cache = lambda *args, **kwargs: object()
         loop._expand_prefix_cache = staticmethod(lambda cache, repeats: cache)
         loop._generate_with_expanded_prefix_cache = lambda **kwargs: torch.tensor(
-            [[5, 9]], dtype=torch.long
+            [[5, 9], [6, 9]], dtype=torch.long
         )
 
         with patch.object(
@@ -765,7 +765,7 @@ class TestIntegration:
         ) as triton_prefill, patch.object(
             loop,
             "_generate_with_triton_paged_prefix_cache",
-            return_value=torch.tensor([[5, 9]], dtype=torch.long),
+            return_value=torch.tensor([[5, 9], [6, 9]], dtype=torch.long),
         ) as triton_decode:
             generated = loop.generate_responses(
                 input_ids=torch.tensor([[7, 8]], dtype=torch.long),
@@ -774,7 +774,7 @@ class TestIntegration:
 
         triton_prefill.assert_called_once()
         triton_decode.assert_called_once()
-        assert generated == ["5 9"]
+        assert generated == ["5 9", "6 9"]
 
     def test_load_checkpoint_discards_partial_accumulation_state(self, tmp_path):
         from src.grpo.trainer import GRPOTrainerLoop
@@ -847,6 +847,128 @@ class TestIntegration:
             loop.setup()
 
         assert loop.checkpoint_manager is None
+
+    def test_save_lora_weights_writes_final_artifact_without_checkpoint_manager(self, tmp_path):
+        from src.grpo.trainer import GRPOTrainerLoop
+        from src.utils.config import get_8gb_vram_config
+
+        class TinyLoRAModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lora_A = nn.Parameter(torch.ones(2, 2))
+                self.lora_B = nn.Parameter(torch.ones(2, 2) * 2)
+
+        config = get_8gb_vram_config()
+        config.training.output_dir = str(tmp_path)
+        config.training.checkpoint_dir = None
+        loop = GRPOTrainerLoop(config)
+        loop.model = TinyLoRAModule()
+        loop.global_step = 7
+        loop.current_epoch = 2
+        loop.checkpoint_manager = None
+
+        loop.save_lora_weights(suffix="_final")
+
+        saved = torch.load(tmp_path / "lora_weights_final.pt", map_location="cpu")
+        assert "lora_weights" in saved
+        assert "lora_A" in saved["lora_weights"]
+        assert "lora_B" in saved["lora_weights"]
+        assert saved["metadata"]["step"] == 7
+        assert saved["metadata"]["epoch"] == 2
+
+    def test_train_auto_advances_sent_stage(self, tmp_path):
+        from src.grpo.trainer import GRPOTrainerLoop
+        from src.utils.config import get_8gb_vram_config
+
+        class FakeSentDataset:
+            def __init__(self):
+                self.use_sent = True
+                self.num_stages = 2
+                self.current_stage = 0
+                self.stage_history = []
+
+            def set_stage(self, stage):
+                self.current_stage = stage
+                self.stage_history.append(stage)
+
+            def get_stage_info(self):
+                return {
+                    "num_stages": self.num_stages,
+                    "stage_start_idx": (self.current_stage - 1) * 10,
+                    "stage_end_idx": self.current_stage * 10,
+                }
+
+        class FakeLoader(list):
+            pass
+
+        config = get_8gb_vram_config()
+        config.training.output_dir = str(tmp_path)
+        config.training.checkpoint_dir = None
+        config.training.num_epochs = 3
+        config.training.skip_initial_benchmark = True
+        config.training.max_steps = None
+        config.sent.enabled = True
+        config.sent.curriculum_stages = 2
+        config.wandb.enabled = False
+
+        loop = GRPOTrainerLoop(config)
+        loop.tokenizer = object()
+
+        dataset = FakeSentDataset()
+        loader = FakeLoader([{"dummy": 1}])
+        loader.dataset = dataset
+        loader.uses_sent_curriculum = True
+        loader.sent_num_stages = 2
+
+        with patch("src.grpo.trainer.create_grpo_dataloader", return_value=loader):
+            loop._configure_scheduler = lambda *args, **kwargs: None
+            loop.train_epoch_with_skip = lambda *args, **kwargs: False
+            loop.save_checkpoint = lambda *args, **kwargs: None
+            loop.save_lora_weights = lambda *args, **kwargs: None
+            loop._finish_wandb = lambda *args, **kwargs: None
+            loop.train()
+
+        assert dataset.stage_history == [1, 2]
+
+    def test_train_uses_plain_epoch_semantics_when_sent_falls_back(self, tmp_path):
+        from src.grpo.trainer import GRPOTrainerLoop
+        from src.utils.config import get_8gb_vram_config
+
+        class FakeLoader(list):
+            pass
+
+        config = get_8gb_vram_config()
+        config.training.output_dir = str(tmp_path)
+        config.training.checkpoint_dir = None
+        config.training.num_epochs = 2
+        config.training.skip_initial_benchmark = True
+        config.training.max_steps = None
+        config.sent.enabled = True
+        config.wandb.enabled = False
+
+        loop = GRPOTrainerLoop(config)
+        loop.tokenizer = object()
+
+        created_epochs = []
+
+        def fake_create(sent_stage, epoch):
+            created_epochs.append(epoch)
+            loader = FakeLoader([{"dummy": 1}])
+            loader.dataset = object()
+            loader.uses_sent_curriculum = False
+            loader.sent_num_stages = 1
+            return loader
+
+        loop._create_train_dataloader = fake_create
+        loop._configure_scheduler = lambda *args, **kwargs: None
+        loop.train_epoch_with_skip = lambda *args, **kwargs: False
+        loop.save_checkpoint = lambda *args, **kwargs: None
+        loop.save_lora_weights = lambda *args, **kwargs: None
+        loop._finish_wandb = lambda *args, **kwargs: None
+
+        loop.train()
+
+        assert created_epochs == [0, 0, 1]
 
     def test_train_epoch_retries_oom_without_leaking_grads(self):
         from src.grpo.trainer import GRPOTrainerLoop
