@@ -48,6 +48,17 @@ class TestMemoryManager:
             assert key in stats
             assert isinstance(stats[key], float)
 
+    def test_cpu_device_memory_stats_return_error_on_cuda_host(self, monkeypatch):
+        from src.core.memory_manager import MemoryManager
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        mm = MemoryManager(device="cpu")
+
+        stats = mm.get_memory_stats()
+
+        assert stats == {"error": "CUDA stats unavailable for non-CUDA device"}
+        assert mm.get_available_memory_gb() == 0.0
+
     def test_memory_warning_threshold(self):
         from src.core.memory_manager import MemoryManager
 

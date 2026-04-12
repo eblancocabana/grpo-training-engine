@@ -44,6 +44,15 @@ class MemoryManager:
         self._input_grad_helper_enabled = False
         self.step_count = 0
 
+    def _get_cuda_device_id(self) -> int | None:
+        if not torch.cuda.is_available():
+            return None
+        if self.device == "cuda":
+            return 0
+        if isinstance(self.device, str) and self.device.startswith("cuda:"):
+            return int(self.device.split(":")[-1])
+        return None
+
     def clear_cache(self, aggressive: bool = False):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -238,10 +247,9 @@ class MemoryManager:
             module.gradient_checkpointing = enabled
 
     def get_memory_stats(self) -> dict:
-        if not torch.cuda.is_available():
-            return {"error": "CUDA not available"}
-
-        device_id = 0 if self.device == "cuda" else int(self.device.split(":")[-1])
+        device_id = self._get_cuda_device_id()
+        if device_id is None:
+            return {"error": "CUDA stats unavailable for non-CUDA device"}
 
         allocated = torch.cuda.memory_allocated(device_id) / (1024**3)
         reserved = torch.cuda.memory_reserved(device_id) / (1024**3)
@@ -265,10 +273,9 @@ class MemoryManager:
         if "error" in stats:
             return stats
 
-        if not torch.cuda.is_available():
+        device_id = self._get_cuda_device_id()
+        if device_id is None:
             return stats
-
-        device_id = 0 if self.device == "cuda" else int(self.device.split(":")[-1])
         total_mem = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)
         peak_allocated = torch.cuda.max_memory_allocated(device_id) / (1024**3)
         peak_reserved = torch.cuda.max_memory_reserved(device_id) / (1024**3)
@@ -278,9 +285,9 @@ class MemoryManager:
         return stats
 
     def get_available_memory_gb(self) -> float:
-        if not torch.cuda.is_available():
+        device_id = self._get_cuda_device_id()
+        if device_id is None:
             return 0.0
-        device_id = 0 if self.device == "cuda" else int(self.device.split(":")[-1])
         free_mem, _ = torch.cuda.mem_get_info(device_id)
         return free_mem / (1024**3)
 
