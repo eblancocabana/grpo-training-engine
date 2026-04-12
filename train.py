@@ -225,11 +225,19 @@ def main():
         default=None,
         help="Lower PPO/GRPO clip bound epsilon (default: config value)",
     )
-    parser.add_argument(
+    entropy_group = parser.add_mutually_exclusive_group()
+    entropy_group.add_argument(
         "--use-entropy-mask",
+        dest="use_entropy_mask",
         action="store_true",
-        default=True,
+        default=None,
         help="Use entropy-based selective backpropagation",
+    )
+    entropy_group.add_argument(
+        "--no-entropy-mask",
+        dest="use_entropy_mask",
+        action="store_false",
+        help="Disable entropy-based selective backpropagation",
     )
     parser.add_argument(
         "--no-sent",
@@ -517,7 +525,8 @@ def main():
     config.lora.rank = args.lora_rank
     config.lora.adapter_quantization = args.lora_adapter_quant
     config.training.learning_rate = args.learning_rate
-    config.entropy.use_entropy_mask = args.use_entropy_mask
+    if args.use_entropy_mask is not None:
+        config.entropy.use_entropy_mask = args.use_entropy_mask
     if args.max_prompt_length is not None:
         config.training.max_prompt_length = args.max_prompt_length
     if args.max_response_length is not None:
