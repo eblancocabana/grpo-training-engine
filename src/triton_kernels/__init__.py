@@ -321,7 +321,14 @@ def paged_kv_decode(
             eos_token_id=cast(int | None, kwargs.pop("eos_token_id", None)),
             seed=cast(int | None, kwargs.pop("seed", None)),
         )
-    raise ImportError("Triton is not available for paged_kv_decode.")
+    _warn_fallback("paged_kv_decode")
+    return _paged_kv_decode_torch(
+        model,
+        input_ids_t,
+        attention_mask=attention_mask_t,
+        max_new_tokens=max_new_tokens,
+        **kwargs,
+    )
 
 
 def fused_grpo_loss(*args: object, **kwargs: object) -> object:

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from unittest.mock import Mock, patch
 
 
 class TestEdgeCases:
@@ -130,3 +131,20 @@ class TestEdgeCases:
             ]
             assert state_tensors
             assert all(t.device.type == "cuda" for t in state_tensors)
+
+    def test_paged_kv_decode_wrapper_falls_back_without_triton(self):
+        import src.triton_kernels as triton_kernels
+
+        model = Mock()
+        model.generate.return_value = torch.tensor([[1, 2, 3]])
+
+        with patch.object(triton_kernels, "TRITON_AVAILABLE", False):
+            generated = triton_kernels.paged_kv_decode(
+                model=model,
+                input_ids=torch.tensor([[1, 2]]),
+                attention_mask=torch.tensor([[1, 1]]),
+                max_new_tokens=3,
+            )
+
+        model.generate.assert_called_once()
+        assert torch.equal(generated, torch.tensor([[1, 2, 3]]))
