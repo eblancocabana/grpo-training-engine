@@ -164,7 +164,8 @@ def main():
     start_idx = 0
     entropies: List[float] = []
     clusters_list: List[Any] = []
-    indices: List[Any] = []
+    indices: List[int] = []
+    example_ids: List[Any] = []
 
     if args.resume and os.path.exists(args.cache_path):
         try:
@@ -176,6 +177,10 @@ def main():
             entropies = data.get("entropies", [])
             clusters_list = data.get("clusters", [])
             indices = data.get("indices", [])
+            example_ids = data.get("example_ids", [])
+            if not example_ids and len(indices) == len(entropies):
+                example_ids = list(indices)
+                indices = list(range(len(entropies)))
             start_idx = len(entropies)
             logger.info("Resumed from checkpoint: %d entries already processed", start_idx)
         except Exception as e:
@@ -234,7 +239,8 @@ def main():
                     }
                     for c in clusters
                 ])
-                indices.append(ex.get("id", global_idx))
+                indices.append(global_idx)
+                example_ids.append(ex.get("id", global_idx))
 
             pbar.update(len(batch))
 
@@ -255,6 +261,7 @@ def main():
                         max_prompt_length=config.training.max_prompt_length,
                     ),
                     "indices": indices,
+                    "example_ids": example_ids,
                     "entropies": entropies,
                     "clusters": clusters_list,
                 }
@@ -275,6 +282,7 @@ def main():
                 max_prompt_length=config.training.max_prompt_length,
             ),
             "indices": indices,
+            "example_ids": example_ids,
             "entropies": entropies,
             "clusters": clusters_list,
         }
@@ -285,8 +293,8 @@ def main():
 
     pbar.close()
 
-    paired = list(zip(indices, entropies, clusters_list))
-    paired_sorted = sorted(paired, key=lambda x: (math.isnan(x[1]), x[1]))
+    paired = list(zip(indices, example_ids, entropies, clusters_list))
+    paired_sorted = sorted(paired, key=lambda x: (math.isnan(x[2]), x[2]))
 
     final_cache = {
         "metadata": make_sent_metadata(
@@ -297,8 +305,9 @@ def main():
             max_prompt_length=config.training.max_prompt_length,
         ),
         "indices": [p[0] for p in paired_sorted],
-        "entropies": [p[1] for p in paired_sorted],
-        "clusters": [p[2] for p in paired_sorted],
+        "example_ids": [p[1] for p in paired_sorted],
+        "entropies": [p[2] for p in paired_sorted],
+        "clusters": [p[3] for p in paired_sorted],
     }
 
     save_sent_cache(args.cache_path, final_cache)

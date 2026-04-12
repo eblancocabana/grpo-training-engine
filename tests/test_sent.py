@@ -800,5 +800,99 @@ class TestEndToEndPreprocess:
                 assert "question" in sample
 
 
+class TestSentCacheIndexContract:
+    def test_process_dataset_stores_positional_indices_and_example_ids(self):
+        verifier = RuleBasedVerifier()
+        mock_model = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
+        config = get_8gb_vram_config()
+
+        calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
+        calc.compute_entropy_for_batch = lambda questions, num_samples=4: [
+            (0.1 + idx, {"clusters": []}) for idx, _ in enumerate(questions)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            dataset = [
+                {"id": "sample-a", "question": "Q0?"},
+                {"id": "sample-b", "question": "Q1?"},
+            ]
+
+            calc.process_dataset(dataset, cache_path, resume=False)
+            loaded = calc.load_cache(cache_path)
+
+        assert loaded["indices"] == [0, 1]
+        assert loaded["example_ids"] == ["sample-a", "sample-b"]
+
+    def test_process_dataset_resume_migrates_legacy_ids_to_example_ids(self):
+        verifier = RuleBasedVerifier()
+        mock_model = Mock()
+        mock_tokenizer = _configure_mock_tokenizer(Mock())
+        config = get_8gb_vram_config()
+
+        calc = SemanticEntropyCalculator(mock_model, mock_tokenizer, verifier, config)
+        calc.compute_entropy_for_batch = lambda questions, num_samples=4: [
+            (0.2, {"clusters": []}) for _ in questions
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            with open(cache_path, "w") as f:
+                json.dump(
+                    {
+                        "metadata": {"status": "in_progress", "version": "sent_v1"},
+                        "indices": ["sample-a"],
+                        "entropies": [0.1],
+                        "clusters": [[]],
+                    },
+                    f,
+                )
+
+            dataset = [
+                {"id": "sample-a", "question": "Q0?"},
+                {"id": "sample-b", "question": "Q1?"},
+            ]
+            calc.process_dataset(dataset, cache_path, resume=True)
+            loaded = calc.load_cache(cache_path)
+
+        assert loaded["indices"] == [0, 1]
+        assert loaded["example_ids"] == ["sample-a", "sample-b"]
+
+    def test_sent_dataset_rejects_non_positional_indices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "cache.json")
+            sent_config = SENTConfig()
+            mock_tokenizer = _configure_mock_tokenizer(Mock())
+
+            cache_data = {
+                "metadata": _sent_metadata_for(sent_config, mock_tokenizer, 2),
+                "indices": ["sample-a"],
+                "example_ids": ["sample-a"],
+                "entropies": [0.1],
+                "clusters": [[]],
+            }
+
+            with open(cache_path, "w") as f:
+                json.dump(cache_data, f)
+
+            with patch("src.data.gsm8k_loader.load_dataset") as mock_load:
+                mock_load.return_value = [{"question": "Q0?", "answer": "#### 0"}]
+                mock_tokenizer.apply_chat_template.return_value = "formatted"
+                mock_tokenizer.return_value = {
+                    "input_ids": [1, 2],
+                    "attention_mask": [1, 1],
+                }
+
+                with pytest.raises(ValueError, match="positional dataset indices"):
+                    SENTGSM8KDataset(
+                        tokenizer=mock_tokenizer,
+                        use_sent=True,
+                        cache_path=cache_path,
+                        max_prompt_length=2,
+                        num_stages=1,
+                    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

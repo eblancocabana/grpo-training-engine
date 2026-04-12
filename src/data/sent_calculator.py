@@ -336,7 +336,8 @@ class SemanticEntropyCalculator:
         start_idx = 0
         entropies: List[float] = []
         clusters_list: List[Any] = []
-        indices: List[Any] = []
+        indices: List[int] = []
+        example_ids: List[Any] = []
 
         # Try resume
         if resume and os.path.exists(cache_path):
@@ -345,6 +346,10 @@ class SemanticEntropyCalculator:
                 entropies = data.get("entropies", [])
                 clusters_list = data.get("clusters", [])
                 indices = data.get("indices", [])
+                example_ids = data.get("example_ids", [])
+                if not example_ids and len(indices) == len(entropies):
+                    example_ids = list(indices)
+                    indices = list(range(len(entropies)))
                 start_idx = len(entropies)
             except Exception:
                 start_idx = 0
@@ -414,7 +419,8 @@ class SemanticEntropyCalculator:
                     entropies.append(float('nan'))
                     clusters_list.append([])
                 
-                indices.append(ex.get("id", global_idx))
+                indices.append(global_idx)
+                example_ids.append(ex.get("id", global_idx))
 
             if progress_callback is not None:
                 progress_callback(i + len(batch), total)
@@ -424,21 +430,23 @@ class SemanticEntropyCalculator:
                 cache = {
                     "metadata": self._make_metadata(status="in_progress"),
                     "indices": indices,
+                    "example_ids": example_ids,
                     "entropies": entropies,
                     "clusters": clusters_list,
                 }
                 self.save_cache(cache_path, cache)
 
         # Finalize: sort by entropy and save
-        paired = list(zip(indices, entropies, clusters_list))
+        paired = list(zip(indices, example_ids, entropies, clusters_list))
         # Sort increasing entropy (easy -> hard), but keep NaNs at end
-        paired_sorted = sorted(paired, key=lambda x: (math.isnan(x[1]), x[1]))
+        paired_sorted = sorted(paired, key=lambda x: (math.isnan(x[2]), x[2]))
 
         final_cache = {
             "metadata": self._make_metadata(status="complete"),
             "indices": [p[0] for p in paired_sorted],
-            "entropies": [p[1] for p in paired_sorted],
-            "clusters": [p[2] for p in paired_sorted],
+            "example_ids": [p[1] for p in paired_sorted],
+            "entropies": [p[2] for p in paired_sorted],
+            "clusters": [p[3] for p in paired_sorted],
         }
 
         self.save_cache(cache_path, final_cache)

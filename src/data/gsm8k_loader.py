@@ -300,6 +300,14 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
                 cache_data = torch.load(self.cache_path, weights_only=False)
             self.sorted_indices = cache_data.get("indices", [])
             self.entropies = cache_data.get("entropies", [])
+            if any(
+                not isinstance(idx, int) or idx < 0 or idx >= len(self.dataset)
+                for idx in self.sorted_indices
+            ):
+                raise ValueError(
+                    "SENT cache indices must be positional dataset indices. "
+                    "Regenerate the cache with the current preprocessing scripts."
+                )
 
             self._compute_stage_boundaries()
             self.set_stage(1)
