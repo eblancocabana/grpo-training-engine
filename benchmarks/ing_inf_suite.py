@@ -450,6 +450,7 @@ class IngInfBenchmarkSuite:
             triton=True,
             gradient_accumulation_steps=4,
             group_size=4,
+            disable_sent=True,
             steps=20,
             tags=["baseline", "triton_on", "frontier"],
         ))
@@ -460,6 +461,7 @@ class IngInfBenchmarkSuite:
             triton=True,
             gradient_accumulation_steps=16,
             group_size=4,
+            disable_sent=True,
             steps=20,
             tags=["baseline", "triton_on", "current"],
         ))
@@ -470,6 +472,7 @@ class IngInfBenchmarkSuite:
             triton=False,
             gradient_accumulation_steps=4,
             group_size=4,
+            disable_sent=True,
             steps=20,
             tags=["baseline", "triton_off"],
         ))
@@ -480,6 +483,7 @@ class IngInfBenchmarkSuite:
             triton=False,
             gradient_accumulation_steps=16,
             group_size=4,
+            disable_sent=True,
             steps=20,
             tags=["baseline", "triton_off"],
         ))
@@ -492,6 +496,7 @@ class IngInfBenchmarkSuite:
                 triton=True,
                 gradient_accumulation_steps=ga,
                 group_size=4,
+                disable_sent=True,
                 steps=20,
                 tags=["sweep", "grad_accum", "triton_on"],
             ))
@@ -502,6 +507,7 @@ class IngInfBenchmarkSuite:
                 triton=False,
                 gradient_accumulation_steps=ga,
                 group_size=4,
+                disable_sent=True,
                 steps=20,
                 tags=["sweep", "grad_accum", "triton_off"],
             ))
@@ -514,6 +520,7 @@ class IngInfBenchmarkSuite:
                 triton=True,
                 gradient_accumulation_steps=4,
                 group_size=gs,
+                disable_sent=True,
                 steps=20,
                 tags=["sweep", "group_size", "triton_on"],
             ))
@@ -527,6 +534,7 @@ class IngInfBenchmarkSuite:
                 gradient_accumulation_steps=4,
                 group_size=4,
                 lora_rank=rank,
+                disable_sent=True,
                 steps=20,
                 tags=["sweep", "lora_rank", "triton_on"],
             ))
@@ -540,6 +548,7 @@ class IngInfBenchmarkSuite:
                 gradient_accumulation_steps=4,
                 group_size=4,
                 max_response_length=max_len,
+                disable_sent=True,
                 steps=20,
                 tags=["sweep", "response_length", "triton_on"],
             ))
@@ -552,6 +561,7 @@ class IngInfBenchmarkSuite:
             gradient_accumulation_steps=4,
             group_size=4,
             use_entropy_mask=True,
+            disable_sent=True,
             steps=20,
             tags=["feature", "entropy_mask", "triton_on"],
         ))
@@ -563,6 +573,7 @@ class IngInfBenchmarkSuite:
             gradient_accumulation_steps=4,
             group_size=4,
             use_entropy_mask=False,
+            disable_sent=True,
             steps=20,
             tags=["feature", "entropy_mask", "triton_on"],
         ))
@@ -575,6 +586,7 @@ class IngInfBenchmarkSuite:
             gradient_accumulation_steps=4,
             group_size=4,
             enable_gradient_checkpointing=True,
+            disable_sent=True,
             steps=20,
             tags=["feature", "checkpointing", "triton_on"],
         ))
@@ -586,6 +598,7 @@ class IngInfBenchmarkSuite:
             gradient_accumulation_steps=4,
             group_size=4,
             enable_gradient_checkpointing=False,
+            disable_sent=True,
             steps=20,
             tags=["feature", "checkpointing", "triton_on"],
         ))
@@ -599,6 +612,7 @@ class IngInfBenchmarkSuite:
                 gradient_accumulation_steps=4,
                 group_size=4,
                 lora_adapter_quant=quant,
+                disable_sent=True,
                 steps=20,
                 tags=["feature", "lora_quant", "triton_on"],
             ))
@@ -611,6 +625,7 @@ class IngInfBenchmarkSuite:
             gradient_accumulation_steps=4,
             group_size=4,
             profile=True,
+            disable_sent=True,
             steps=20,
             tags=["profile", "triton_on"],
         ))
