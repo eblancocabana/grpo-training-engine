@@ -866,7 +866,7 @@ class TestIntegration:
             def setup(self):
                 captured["setup_called"] = True
 
-            def train(self, sent_stage=1):
+            def train(self, sent_stage=None):
                 captured["sent_stage"] = sent_stage
 
         with patch.object(trainer_module, "GRPOTrainerLoop", DummyTrainer), patch(
@@ -876,7 +876,7 @@ class TestIntegration:
 
         assert captured["config"].training.verbosity >= 1
         assert captured["setup_called"] is True
-        assert captured["sent_stage"] == 1
+        assert captured["sent_stage"] is None
 
     def test_save_lora_weights_writes_final_artifact_without_checkpoint_manager(self, tmp_path):
         from src.grpo.trainer import GRPOTrainerLoop

@@ -2230,8 +2230,8 @@ def main():
     parser.add_argument(
         "--sent-stage",
         type=int,
-        default=1,
-        help="Curriculum stage to train on (1=easiest, default: 1)",
+        default=None,
+        help="Fixed curriculum stage to train on; omit for automatic stage progression",
     )
 
     parser.add_argument(
