@@ -237,7 +237,7 @@ class GRPOTrainerLoop:
             dataset_split="test",
             num_samples=50,
             device=self.device,
-            generate_fn=self.generate_responses,
+            generate_fn=self.generate_benchmark_responses,
             max_new_tokens=self.config.training.max_response_length,
             max_prompt_length=self.config.training.max_prompt_length,
             do_sample=self.config.training.generation_do_sample,
@@ -914,7 +914,10 @@ class GRPOTrainerLoop:
         return generated_ids[:, :generated_steps]
 
     def _generate_responses_with_tokens(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        group_size_override: int | None = None,
     ) -> tuple[List[str], torch.Tensor, torch.Tensor]:
         """
         Generate responses for GRPO group sampling with KV-cache prefix sharing.
@@ -942,7 +945,11 @@ class GRPOTrainerLoop:
 
         generated_texts = []
         response_batches: list[torch.Tensor] = []
-        group_size = self.group_sampler.group_size
+        group_size = (
+            group_size_override
+            if group_size_override is not None
+            else self.group_sampler.group_size
+        )
         batch_size = input_ids.shape[0]
         micro_batch_size = self._gen_micro_batch
         use_triton_generation, triton_generation_reason = (
@@ -1117,6 +1124,14 @@ class GRPOTrainerLoop:
     ) -> List[str]:
         generated_texts, _, _ = self._generate_responses_with_tokens(
             input_ids, attention_mask
+        )
+        return generated_texts
+
+    def generate_benchmark_responses(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> List[str]:
+        generated_texts, _, _ = self._generate_responses_with_tokens(
+            input_ids, attention_mask, group_size_override=1
         )
         return generated_texts
 

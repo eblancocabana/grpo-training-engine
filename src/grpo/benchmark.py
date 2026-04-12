@@ -106,7 +106,15 @@ class GSM8KBenchmark:
             question = item["question"]
 
             if self.generate_fn is not None:
-                full_text = self.generate_fn(input_ids, attention_mask)[0]
+                generated = self.generate_fn(input_ids, attention_mask)
+                if isinstance(generated, str):
+                    full_text = generated
+                else:
+                    if len(generated) != 1:
+                        raise ValueError(
+                            "Benchmark generate_fn must return exactly one response per prompt."
+                        )
+                    full_text = generated[0]
                 generated_len = len(
                     self.tokenizer(
                         full_text,
