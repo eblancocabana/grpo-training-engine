@@ -792,6 +792,9 @@ class TestIntegration:
         loop.checkpoint_manager = __import__(
             "src.utils.checkpoint", fromlist=["CheckpointManager"]
         ).CheckpointManager(config.training.checkpoint_dir)
+        loop.global_step = 5
+        loop.current_step = 5
+        loop.current_epoch = 1
         loop.optimizer_step = 3
         loop._accumulation_batches = 2
         loop._dataloader_seed = 123
@@ -813,6 +816,9 @@ class TestIntegration:
 
         assert restored._accumulation_batches == 0
         assert restored._dataloader_seed == 123
+        assert restored.global_step == 3
+        assert restored.current_step == 3
+        assert restored._resume_step == 3
 
     def test_setup_disables_checkpoint_manager_when_checkpoint_dir_is_empty(self):
         from src.grpo.trainer import GRPOTrainerLoop

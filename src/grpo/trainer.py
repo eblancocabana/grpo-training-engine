@@ -2109,7 +2109,8 @@ class GRPOTrainerLoop:
                 self.model,
             )
 
-        self.global_step = info.get("step", 0)
+        loaded_step = info.get("step", 0)
+        self.global_step = loaded_step
         self.current_step = self.global_step
         self.current_epoch = info.get("epoch", 0)
         self.optimizer_step = info.get("optimizer_step", 0)
@@ -2119,9 +2120,15 @@ class GRPOTrainerLoop:
         self._resume_step = self.global_step
         self._resume_epoch = self.current_epoch
         if saved_accumulation_batches:
+            replay_step = max(0, loaded_step - saved_accumulation_batches)
+            self.global_step = replay_step
+            self.current_step = replay_step
+            self._resume_step = replay_step
             logger.warning(
-                "[Resume] Discarding %d partially accumulated batches because gradient buffers are not checkpointed.",
+                "[Resume] Discarding %d partially accumulated batches because gradient buffers are not checkpointed; rewinding replay step from %d to %d.",
                 saved_accumulation_batches,
+                loaded_step,
+                replay_step,
             )
             if self.optimizer is not None:
                 self.optimizer.zero_grad(set_to_none=True)
