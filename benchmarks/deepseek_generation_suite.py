@@ -620,6 +620,10 @@ class DeepSeekGenerationSuite:
 
     def run(self) -> Dict[str, Any]:
         start = time.time()
+        previous_results = None
+        results_path = self.output_dir / "results.json"
+        if results_path.exists():
+            previous_results = json.loads(results_path.read_text(encoding="utf-8"))
         greedy_parity: Dict[str, Any]
         sampled_validation: Dict[str, Any]
         auto_policy: Dict[str, Any]
@@ -671,6 +675,20 @@ class DeepSeekGenerationSuite:
         else:
             training_matrix = self._load_phase_result("training_matrix.json")
         elapsed_s = time.time() - start
+        if (
+            self.skip_parity
+            and self.skip_sampled
+            and self.skip_training
+            and previous_results is not None
+        ):
+            previous_elapsed = float(previous_results.get("elapsed_s", 0.0))
+            if previous_elapsed > 1.0:
+                elapsed_s = previous_elapsed
+            else:
+                elapsed_s = sum(
+                    float(result.get("duration_s", 0.0))
+                    for result in training_matrix.get("results", [])
+                )
 
         payload = {
             "greedy_parity": greedy_parity,
