@@ -92,6 +92,79 @@ def test_triton_grpo_loss_matches_torch_grpo_loss() -> None:
         )
 
 
+def test_triton_grpo_loss_falls_back_for_fp16_logits() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    device = torch.device("cuda")
+    batch_size = 2
+    seq_len = 4
+    vocab_size = 16
+    group_size = 2
+
+    policy_logits = torch.randn(
+        batch_size, seq_len, vocab_size, device=device, dtype=torch.float16
+    )
+    old_policy_logits = torch.randn(
+        batch_size, seq_len, vocab_size, device=device, dtype=torch.float32
+    )
+    target_ids = torch.randint(
+        0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
+    )
+    advantages = torch.randn(batch_size, device=device, dtype=torch.float32)
+    old_log_probs = -F.cross_entropy(
+        old_policy_logits.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
+        reduction="none",
+    ).view(batch_size, seq_len)
+
+    loss_triton, metrics_triton = fused_grpo_loss(
+        policy_logits=policy_logits,
+        target_ids=target_ids,
+        old_log_probs=old_log_probs,
+        advantages=advantages,
+        clip_epsilon=0.2,
+        epsilon_high=0.3,
+        delta=1.5,
+        group_size=group_size,
+    )
+
+    trainer_torch = GRPOTrainer(
+        clip_epsilon=0.2,
+        epsilon_high=0.3,
+        delta=1.5,
+        group_size=group_size,
+        use_kl=False,
+        use_triton_kernels=False,
+    )
+    loss_torch, metrics_torch = trainer_torch.compute_grpo_loss(
+        policy_logits=policy_logits,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        target_ids=target_ids,
+    )
+
+    trainer_auto = GRPOTrainer(
+        clip_epsilon=0.2,
+        epsilon_high=0.3,
+        delta=1.5,
+        group_size=group_size,
+        use_kl=False,
+        use_triton_kernels=True,
+    )
+    loss_auto, metrics_auto = trainer_auto.compute_grpo_loss(
+        policy_logits=policy_logits,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        target_ids=target_ids,
+    )
+
+    torch.testing.assert_close(loss_triton, loss_torch, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(loss_auto, loss_torch, rtol=1e-3, atol=1e-3)
+    for key, value in metrics_torch.items():
+        assert metrics_triton[key] == pytest.approx(value, rel=5e-3, abs=5e-3)
+        assert metrics_auto[key] == pytest.approx(value, rel=5e-3, abs=5e-3)
+
+
 def test_triton_entropy_mask_matches_torch_entropy_mask() -> None:
     _skip_if_no_cuda_or_triton()
 

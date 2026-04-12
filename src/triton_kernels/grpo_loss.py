@@ -218,6 +218,25 @@ def _validate_inputs(
     return batch_size, seq_len, vocab_size
 
 
+def _supports_triton_inputs(
+    policy_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> bool:
+    return (
+        TRITON_AVAILABLE
+        and policy_logits.is_cuda
+        and target_ids.is_cuda
+        and old_log_probs.is_cuda
+        and advantages.is_cuda
+        and policy_logits.dtype == torch.bfloat16
+        and target_ids.dtype == torch.long
+        and old_log_probs.dtype == torch.float32
+        and advantages.dtype == torch.float32
+    )
+
+
 def _compute_metrics(
     policy_logits: torch.Tensor,
     target_ids: torch.Tensor,
@@ -580,10 +599,29 @@ def fused_grpo_loss(
     attention_mask: torch.Tensor | None = None,
     entropy_mask: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    if policy_logits.requires_grad:
-        loss: torch.Tensor = cast(
-            torch.Tensor,
-            _TritonGRPOLossFn.apply(
+    use_triton = _supports_triton_inputs(
+        policy_logits, target_ids, old_log_probs, advantages
+    )
+
+    if use_triton:
+        if policy_logits.requires_grad:
+            loss = cast(
+                torch.Tensor,
+                _TritonGRPOLossFn.apply(
+                    policy_logits,
+                    target_ids,
+                    old_log_probs,
+                    advantages,
+                    clip_epsilon,
+                    epsilon_high,
+                    delta,
+                    group_size,
+                    attention_mask,
+                    entropy_mask,
+                ),
+            )
+        else:
+            loss = _fused_grpo_loss_forward(
                 policy_logits,
                 target_ids,
                 old_log_probs,
@@ -594,10 +632,9 @@ def fused_grpo_loss(
                 group_size,
                 attention_mask,
                 entropy_mask,
-            ),
-        )
+            )
     else:
-        loss = _fused_grpo_loss_forward(
+        loss = _torch_grpo_loss(
             policy_logits,
             target_ids,
             old_log_probs,
