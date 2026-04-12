@@ -136,7 +136,15 @@ class RuleBasedVerifier:
         if answer:
             return answer
 
-        # Priority 2: Extract answer from <think> block
+        # Priority 2: Prefer an explicit final answer outside the closing think block.
+        # This prevents verification arithmetic inside <think> from outranking the
+        # actual final answer stated after reasoning.
+        post_think_text = text.rsplit("</think>", 1)[1] if "</think>" in text else text
+        match = self.final_answer_pattern.search(post_think_text)
+        if match:
+            return match.group(1).strip()
+
+        # Priority 3: Extract answer from <think> block
         # When the model performs verification ("let me check: 42 - 10 = 32"),
         # the last number is from verification, not the answer. Try explicit
         # answer patterns first, then equation patterns, then last number.
@@ -156,24 +164,24 @@ class RuleBasedVerifier:
             if numbers_in_think:
                 return numbers_in_think[-1].strip()
 
-        # Priority 3: Try "Final Answer:" / "The answer is" patterns
+        # Priority 4: Try "Final Answer:" / "The answer is" patterns anywhere.
         match = self.final_answer_pattern.search(text)
         if match:
             return match.group(1).strip()
 
-        # Priority 4: LAST number in last 150 chars of main text
+        # Priority 5: LAST number in last 150 chars of main text
         # Only if we don't have a think block
         last_section = text[-150:] if len(text) > 150 else text
         numbers = self.number_pattern.findall(last_section)
         if numbers:
             return numbers[-1].strip()
 
-        # Priority 5: Try equation patterns
+        # Priority 6: Try equation patterns
         equation_answer = self.extract_equation_answer(text)
         if equation_answer:
             return equation_answer
 
-        # Priority 6: Fall back to last number in full text
+        # Priority 7: Fall back to last number in full text
         numbers = self.number_pattern.findall(text)
         if numbers:
             return numbers[-1].strip()
@@ -273,4 +281,3 @@ class RuleBasedVerifier:
             infos.append(info)
         
         return rewards, infos
-

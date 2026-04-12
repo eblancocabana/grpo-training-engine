@@ -17,6 +17,14 @@ class TestVerifier:
         assert extracted is not None
         assert extracted.replace(",", "").replace(".", "").isdigit()
 
+    def test_extract_final_answer_prefers_post_think_answer(self):
+        verifier = RuleBasedVerifier()
+        text = (
+            "<think>Compute 2+2 = 4. Let me verify 4-1 = 3</think> Final Answer: 4"
+        )
+        extracted = verifier.extract_final_answer(text)
+        assert extracted == "4"
+
     def test_verify_exact_match(self):
         verifier = RuleBasedVerifier()
         response = "\\boxed{123}"
