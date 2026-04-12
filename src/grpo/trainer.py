@@ -555,6 +555,16 @@ class GRPOTrainerLoop:
             return mode
         return "on" if getattr(self.config.training, "use_triton_generation", True) else "off"
 
+    def _is_qwen_family_generation_model(self) -> bool:
+        model_config = getattr(self.model, "config", None)
+        model_type = str(getattr(model_config, "model_type", "") or "").lower()
+        model_id = str(getattr(self.config.model, "model_id", "") or "").lower()
+        return (
+            "qwen" in model_type
+            or "qwen" in model_id
+            or "deepseek-r1-distill-qwen" in model_id
+        )
+
     def _resolve_triton_generation_decision(self) -> tuple[bool, str]:
         if not getattr(self.config.training, "use_triton_kernels", False):
             return False, "global Triton kernels disabled"
@@ -575,16 +585,44 @@ class GRPOTrainerLoop:
             return False, "attention head layout is not divisible for GQA paged decode"
 
         if mode == "auto":
-            model_type = str(getattr(model_config, "model_type", "") or "").lower()
-            model_id = str(getattr(self.config.model, "model_id", "") or "").lower()
-            is_qwen_family = "qwen" in model_type or "qwen" in model_id or "deepseek-r1-distill-qwen" in model_id
-            if self.config.training.generation_do_sample and is_qwen_family:
+            if self.config.training.generation_do_sample and self._is_qwen_family_generation_model():
+                group_size = int(getattr(self.config.grpo, "group_size", 1) or 1)
+                if group_size <= 1:
+                    return (
+                        False,
+                        "auto policy routes sampled DeepSeek/Qwen generation with group_size=1 to the torch prefix-cache path because it remains closer to the reference and faster in elapsed time on the RTX 3060 Ti target",
+                    )
                 return (
-                    False,
-                    "auto policy routes sampled DeepSeek/Qwen generation to the torch prefix-cache path because it benchmarks faster than Triton paged-KV on the RTX 3060 Ti target",
+                    True,
+                    "auto policy routes sampled DeepSeek/Qwen generation with group_size>=2 to Triton paged-KV because it is exact on greedy parity, passes sampled validation for those group sizes, and benchmarks faster on the RTX 3060 Ti target",
                 )
 
         return True, "Triton paged-KV generation enabled"
+
+    def _resolve_triton_generation_runtime_decision(
+        self, *, group_size: int, micro_batch_size: int
+    ) -> tuple[bool, str]:
+        enabled, reason = self._resolve_triton_generation_decision()
+        if not enabled:
+            return enabled, reason
+
+        mode = self._get_triton_generation_mode()
+        if (
+            mode == "auto"
+            and self.config.training.generation_do_sample
+            and self._is_qwen_family_generation_model()
+        ):
+            chunk_sizes = [
+                min(g_start + micro_batch_size, group_size) - g_start
+                for g_start in range(0, group_size, micro_batch_size)
+            ]
+            if any(chunk_size == 1 for chunk_size in chunk_sizes):
+                return (
+                    False,
+                    "auto policy routes sampled DeepSeek/Qwen generation to the torch prefix-cache path because the effective generation microbatch schedule includes a batch of 1, which remains the unresolved sampled case on the RTX 3060 Ti target",
+                )
+
+        return enabled, reason
 
     def _should_use_triton_generation(self) -> bool:
         enabled, reason = self._resolve_triton_generation_decision()
@@ -879,6 +917,20 @@ class GRPOTrainerLoop:
         group_size = self.group_sampler.group_size
         batch_size = input_ids.shape[0]
         micro_batch_size = self._gen_micro_batch
+        use_triton_generation, triton_generation_reason = (
+            self._resolve_triton_generation_runtime_decision(
+                group_size=group_size,
+                micro_batch_size=micro_batch_size,
+            )
+        )
+        if not self._triton_generation_policy_logged:
+            logger.info(
+                "[TritonGen] mode=%s enabled=%s reason=%s",
+                self._get_triton_generation_mode(),
+                use_triton_generation,
+                triton_generation_reason,
+            )
+            self._triton_generation_policy_logged = True
 
         with torch.inference_mode():
             for prompt_idx in range(batch_size):
@@ -890,8 +942,7 @@ class GRPOTrainerLoop:
                 real_ids = single_ids[:, first_real:]
                 real_mask = single_mask[:, first_real:]
                 prompt_len = real_ids.shape[1]
-
-                use_triton_kernels = self._should_use_triton_generation()
+                use_triton_kernels = use_triton_generation
 
                 if use_triton_kernels:
                     try:

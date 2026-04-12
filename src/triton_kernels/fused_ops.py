@@ -71,8 +71,8 @@ if triton_available:
             )
             w = tl.load(w_ptr + cols * stride_w, mask=mask, other=0.0)
             x = tl.cast(x, tl.float32)
+            w = tl.cast(w, tl.float32)
             normed = x * inv_rms
-            normed = tl.cast(normed, tl.bfloat16)
             y = normed * w
             tl.store(y_ptr + pid * stride_yb + cols * stride_yd, y, mask=mask)
 
@@ -105,9 +105,8 @@ if triton_available:
                 other=0.0,
             )
             x = tl.cast(x, tl.float32)
+            y = tl.cast(y, tl.float32)
             silu = x * tl.sigmoid(x)
-            silu = tl.cast(silu, tl.bfloat16)
-            y = tl.cast(y, tl.bfloat16)
             out = silu * y
             tl.store(out_ptr + pid * stride_ob + cols * stride_od, out, mask=mask)
 
@@ -252,7 +251,7 @@ def fused_logits_sampling(
         return logits, next_tokens
 
     scaled = logits / max(temperature, 1e-6)
-    if top_p < 1.0:
+    if 0.0 < top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative = probs.cumsum(dim=-1)
