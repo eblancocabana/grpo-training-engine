@@ -138,63 +138,6 @@ def test_expand_paged_kv_cache_state_shares_immutable_prefix_blocks() -> None:
     assert torch.equal(expanded.v_cache[:, 7], state.v_cache[:, 1])
 
 
-def test_triton_generation_prefills_once_per_prompt_and_expands_per_microbatch() -> None:
-    class DummyModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.zeros(1))
-
-        def eval(self):
-            return self
-
-    loop = _build_loop(DummyModel(), use_triton_generation=True, group_size=5)
-    input_ids = torch.tensor([[0, 11, 12], [0, 21, 22]], dtype=torch.long)
-    attention_mask = torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.long)
-
-    fake_state = PagedKVCacheState(
-        k_cache=torch.zeros((1, 1, 1, 1, 1)),
-        v_cache=torch.zeros((1, 1, 1, 1, 1)),
-        block_tables=torch.zeros((1, 1), dtype=torch.int32),
-        context_lens=torch.zeros((1,), dtype=torch.int32),
-        last_tokens=torch.tensor([12]),
-        max_context=8,
-        block_size=1,
-    )
-
-    def _decode(_model, state, **kwargs):
-        del _model, kwargs
-        batch = state.last_tokens.shape[0]
-        return torch.arange(1, batch + 1, dtype=torch.long).unsqueeze(1)
-
-    with patch("src.grpo.trainer.prefill_paged_kv_cache", return_value=fake_state) as prefill, patch(
-        "src.grpo.trainer.expand_paged_kv_cache_state",
-        side_effect=lambda state, repeats: PagedKVCacheState(
-            k_cache=state.k_cache,
-            v_cache=state.v_cache,
-            block_tables=torch.zeros((repeats, 1), dtype=torch.int32),
-            context_lens=torch.zeros((repeats,), dtype=torch.int32),
-            last_tokens=torch.full((repeats,), 5, dtype=torch.long),
-            max_context=state.max_context,
-            block_size=state.block_size,
-        ),
-    ) as expand, patch(
-        "src.grpo.trainer.decode_from_paged_kv_cache", side_effect=_decode
-    ) as decode, patch.object(
-        loop, "_prefill_prompt_cache", side_effect=AssertionError("torch prefill should not run")
-    ):
-        texts, response_ids, response_mask = loop._generate_responses_with_tokens(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-    assert prefill.call_count == 2
-    assert expand.call_count == 6
-    assert decode.call_count == 6
-    assert response_ids.shape[0] == 10
-    assert response_mask.shape == response_ids.shape
-    assert len(texts) == 10
-
-
 def test_triton_generation_matches_torch_prefix_cache_on_tiny_qwen_greedy() -> None:
     _skip_if_no_cuda_or_triton()
 

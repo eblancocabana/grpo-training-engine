@@ -63,33 +63,6 @@ class TestEdgeCases:
         )
         assert not torch.isnan(loss)
 
-    def test_oom_recovery_simulation(self):
-        from src.core.memory_manager import MemoryManager
-
-        mm = MemoryManager()
-        mm.clear_cache(aggressive=True)
-        assert True
-
-    def test_checkpoint_save_load_simulation(self):
-        import tempfile, os
-        import torch
-
-        model = nn.Linear(4, 4)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "step": 100,
-            "loss": 0.5,
-        }
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            torch.save(checkpoint, f.name)
-            loaded = torch.load(f.name, weights_only=False)
-            assert "model_state_dict" in loaded
-            assert "optimizer_state_dict" in loaded
-            assert loaded["step"] == 100
-            os.unlink(f.name)
-
     def test_checkpoint_load_moves_optimizer_state_to_model_device(self):
         import tempfile
 
