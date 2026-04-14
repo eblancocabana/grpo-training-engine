@@ -23,7 +23,8 @@ A native PyTorch training engine for GRPO (Group Relative Policy Optimization) s
 ## 🚀 Quick Install
 
 ```bash
-# 1. Activate conda environment
+# 1. Load shell environment and activate conda environment
+source ~/.zshrc
 conda activate grpo-3060ti
 
 # 2. Install dependencies
@@ -54,6 +55,7 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 │   │   └── memory_manager.py    # VRAM management
 │   ├── grpo/
 │   │   ├── algorithm.py         # GRPO loss & advantage calculation
+│   │   ├── benchmark.py         # GSM8K benchmark loop
 │   │   ├── trainer.py           # Native training loop
 │   │   └── verifier.py          # Response verification
 │   ├── selective/
@@ -63,17 +65,21 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 │   │   └── sent_calculator.py   # Semantic Entropy calculation
 │   └── utils/
 │       ├── config.py            # Configuration management
-│       └── checkpoint.py        # Checkpoint save/load
+│       ├── checkpoint.py        # Checkpoint save/load
+│       └── logging_utils.py     # Structured logging
 ├── train.py                     # Main training script
 ├── scripts/
 │   ├── inference.py             # Post-training inference
+│   ├── preprocess_sent.py       # SENT preprocessing
 │   ├── preprocess_sent_vllm.py  # SENT Preprocessing (vLLM optimized)
 │   └── install_dependencies.sh  # Auto-installation script
-├── tests/                   # Comprehensive Test Suite
-│   ├── test_grpo_algorithm.py   # GRPO logic validation
+├── tests/                       # Test suite
+│   ├── optimizer/               # Optimizer workflow tests
+│   ├── test_grpo_algorithm.py   # GRPO math and clipping
+│   ├── test_integration.py      # Training loop integration
 │   ├── test_lora.py             # LoRA injection tests
 │   ├── test_sent.py             # Curriculum Learning tests
-│   ├── test_memory_manager.py   # VRAM constraints tests
+│   ├── test_triton_*.py         # Triton correctness / perf coverage
 │   └── ... (see tests/ for full list)
 └── requirements.txt             # Dependencies
 ```
@@ -91,15 +97,17 @@ Use `pytest tests/` for the full automated test suite.
 
 ### 2. Running Tests
 
-The project includes a comprehensive test suite using `pytest`.
+The project uses `pytest` for correctness, integration, optimizer, and Triton coverage.
 
 ```bash
 # Run all tests
 pytest tests/
 
-# Run specific test category
-pytest tests/test_sent.py        # Test Curriculum Learning
-pytest tests/test_grpo_algorithm.py # Validate GRPO Math
+# Run focused subsets
+pytest tests/test_sent.py
+pytest tests/test_grpo_algorithm.py
+pytest tests/optimizer/
+pytest tests/test_triton_generation_correctness.py
 ```
 
 ### 3. Preprocessing (SENT Curriculum)
@@ -171,8 +179,8 @@ The optimized configuration for RTX 3060 Ti is located in `src/utils/config.py::
 
 # Training
 - Batch size: 1
-- Gradient accumulation: 4
-- Sequence length: 512 (prompt) + 512 (response)
+- Gradient accumulation: 16
+- Sequence length: 4096 (prompt) + 768 (response)
 - Gradient checkpointing: Enabled
 ```
 
@@ -209,7 +217,7 @@ Group Relative Policy Optimization:
 
 ```python
 # No Value Network (VRAM saving)
-Advantage_i = (r_i - mean(r_group)) / (std(r_group) + eps)
+Advantage_i = r_i - mean(r_group)
 
 # GRPO Loss
 loss = -E[min(ratio * A, clip(ratio) * A)]
@@ -219,6 +227,8 @@ loss = -E[min(ratio * A, clip(ratio) * A)]
 - ~40-50% less VRAM (no Critic network)
 - Simpler implementation
 - Group baseline instead of Value function
+- Global normalization by `group_size`
+- Two-sided clipping with `epsilon_high` and hard cap `delta`
 
 ### 3. Selective Backpropagation (`src/selective/entropy_mask.py`)
 
@@ -262,19 +272,20 @@ Aggressive VRAM management:
    ├── Load prompt batch
    ├── Expand to group_size (G=4-8)
    ├── Generate responses
-   └── Verify responses → Rewards
+   ├── Verify responses → Rewards
+   └── Mask truncated completions if configured
 
 2. ADVANTAGE CALCULATION
    ├── Group rewards by prompt
-   ├── Normalize: (r - mean) / std
-   └── Get advantages
+   └── Center rewards: (r - mean)
 
 3. TRAINING
-   ├── Forward pass with generated tokens
+   ├── Pre-compute old_log_probs
+   ├── Forward pass with prompt + generated tokens
    ├── Calculate entropy per token
    ├── Create selection mask
    ├── GRPO Loss + mask
-   ├── Backward (only selected tokens)
+   ├── Backward (selected tokens only if enabled)
    └── Optimizer step
 ```
 
@@ -298,9 +309,12 @@ Edit `src/utils/config.py`:
 
 ```python
 # In get_8gb_vram_config()
-config.training.max_response_length = 512  # Adjust based on VRAM
+config.training.max_response_length = 768
+config.training.gradient_accumulation_steps = 16
 config.entropy.percentile = 0.5  # % tokens to keep
-config.grpo.clip_epsilon = 0.2  # PPO clipping
+config.grpo.clip_epsilon = 0.2
+config.grpo.epsilon_high = 0.3
+config.grpo.delta = 1.5
 ```
 
 ### Triton Kernels
@@ -371,11 +385,8 @@ Automatically saved in `./outputs/checkpoints/`:
 checkpoints/
 ├── checkpoint_step_500.pt      # Full checkpoint
 ├── checkpoint_step_1000.pt
-├── best_model.pt               # Best model
 ├── lora_weights_final.pt       # LoRA weights only
-├── latest.json                 # Last checkpoint info
-└── data/cache/                 # SENT Cache (generated)
-    └── gsm8k_sent_sorted.pt    # Sorted dataset indices
+└── ...
 ```
 
 **Load checkpoint:**
@@ -399,10 +410,10 @@ python train.py --no-wandb --epochs 1 --group-size 8
 | Parameter | Value | Justification |
 |-----------|-------|---------------|
 | `group_size` | 8 | Maximum stable without OOM |
-| `max_response_length` | 512 | Allows full reasoning chains |
-| `max_prompt_length` | 128 | Optimized for GSM8K |
+| `max_response_length` | 768 | Good balance of reasoning length and VRAM |
+| `max_prompt_length` | 4096 | Matches current config defaults |
 | `lora_rank` | 16 | Quality/Memory balance |
-| `gradient_accumulation` | 4 | Effective batch size = 4 |
+| `gradient_accumulation` | 16 | Effective batch size = 16 |
 | `learning_rate` | 1e-4 | Stable for GRPO |
 
 #### Performance Metrics
@@ -434,9 +445,10 @@ python train.py --no-wandb --epochs 1 --group-size 8
 
 ### 4. GRPO Algorithm Fix
 
-To prevent `loss=0` when all rewards in a group are identical:
-- `min_std = 0.1` clamp in advantage normalization
-- Baseline advantage for uniform groups: `(mean_reward - 0.5) * 0.5`
+Current Dr. GRPO implementation uses centered rewards directly:
+- `advantage = reward - group_mean`
+- no standard deviation normalization
+- no `min_std` clamp or synthetic baseline for uniform groups
 
 ## 📚 References
 
@@ -459,4 +471,4 @@ Academic project for TFG.
 
 **Author**: Endika Blanco Cabana
 **Hardware**: NVIDIA RTX 3060 Ti (8GB)
-**Date**: February 2026
+**Date**: April 2026
