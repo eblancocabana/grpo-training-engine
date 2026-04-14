@@ -30,7 +30,7 @@ conda activate grpo-3060ti
 bash scripts/install_dependencies.sh
 
 # 3. Verify installation
-python test_setup.py
+python train.py --dry-run
 ```
 
 ### Manual Installation
@@ -65,7 +65,6 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 │       ├── config.py            # Configuration management
 │       └── checkpoint.py        # Checkpoint save/load
 ├── train.py                     # Main training script
-├── test_setup.py                # System verification
 ├── scripts/
 │   ├── inference.py             # Post-training inference
 │   ├── preprocess_sent_vllm.py  # SENT Preprocessing (vLLM optimized)
@@ -84,16 +83,11 @@ pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
 ### 1. Verify System
 
 ```bash
-python test_setup.py
+python train.py --dry-run
 ```
 
-Runs tests to verify:
-- 4-bit model loading
-- LoRA injection
-- Text generation
-- Memory management
-
-- Memory management
+Runs the setup/configuration validation path without starting training.
+Use `pytest tests/` for the full automated test suite.
 
 ### 2. Running Tests
 
