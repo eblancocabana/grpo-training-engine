@@ -247,8 +247,8 @@ def main():
     parser.add_argument(
         "--use-triton",
         action="store_true",
-        default=True,
-        help="Enable Triton kernels (default: enabled)",
+        default=None,
+        help="Enable Triton kernels (default: preset value)",
     )
     parser.add_argument(
         "--no-triton", action="store_true", help="Disable Triton kernels"
@@ -531,47 +531,44 @@ def main():
         config.training.max_prompt_length = args.max_prompt_length
     if args.max_response_length is not None:
         config.training.max_response_length = args.max_response_length
-    config.training.use_triton_kernels = args.use_triton and not args.no_triton
-    default_triton_enabled = config.training.use_triton_kernels
-    config.training.triton_generation_mode = (
-        "auto" if default_triton_enabled else "off"
-    )
-    config.training.use_triton_generation = default_triton_enabled
-    config.training.use_triton_grpo_loss = default_triton_enabled
-    config.training.use_triton_entropy_mask = default_triton_enabled
-    config.training.use_triton_lora = default_triton_enabled
-    if args.triton_generation_mode is not None:
-        config.training.triton_generation_mode = (
-            args.triton_generation_mode if default_triton_enabled else "off"
+
+    if args.use_triton is True:
+        config.training.use_triton_kernels = True
+    if args.no_triton:
+        config.training.use_triton_kernels = False
+
+    if config.training.use_triton_kernels:
+        if args.triton_generation_mode is not None:
+            config.training.triton_generation_mode = args.triton_generation_mode
+        if args.triton_generation is True:
+            config.training.triton_generation_mode = "on"
+        if args.no_triton_generation:
+            config.training.triton_generation_mode = "off"
+        config.training.use_triton_generation = (
+            config.training.triton_generation_mode != "off"
         )
-    if args.triton_generation is not None:
-        config.training.triton_generation_mode = (
-            "on" if default_triton_enabled and args.triton_generation else "off"
-        )
-    if args.no_triton_generation:
+
+        if args.triton_grpo_loss is True:
+            config.training.use_triton_grpo_loss = True
+        if args.no_triton_grpo_loss:
+            config.training.use_triton_grpo_loss = False
+
+        if args.triton_entropy_mask is True:
+            config.training.use_triton_entropy_mask = True
+        if args.no_triton_entropy_mask:
+            config.training.use_triton_entropy_mask = False
+
+        if args.triton_lora is True:
+            config.training.use_triton_lora = True
+        if args.no_triton_lora:
+            config.training.use_triton_lora = False
+    else:
         config.training.triton_generation_mode = "off"
-    config.training.use_triton_generation = (
-        default_triton_enabled
-        and config.training.triton_generation_mode != "off"
-    )
-    if args.triton_grpo_loss is not None:
-        config.training.use_triton_grpo_loss = (
-            default_triton_enabled and args.triton_grpo_loss
-        )
-    if args.no_triton_grpo_loss:
+        config.training.use_triton_generation = False
         config.training.use_triton_grpo_loss = False
-    if args.triton_entropy_mask is not None:
-        config.training.use_triton_entropy_mask = (
-            default_triton_enabled and args.triton_entropy_mask
-        )
-    if args.no_triton_entropy_mask:
         config.training.use_triton_entropy_mask = False
-    if args.triton_lora is not None:
-        config.training.use_triton_lora = (
-            default_triton_enabled and args.triton_lora
-        )
-    if args.no_triton_lora:
         config.training.use_triton_lora = False
+
     config.training.triton_lora_prefer_base = args.triton_lora_prefer_base
     config.training.profile_enabled = args.profile
     if args.clip_epsilon is not None:
