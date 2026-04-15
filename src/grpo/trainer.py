@@ -9,7 +9,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import os
-from typing import Optional, Dict, List, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Any, Sequence
 import gc
 import time
 import math
@@ -58,6 +59,49 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
+@dataclass(slots=True)
+class RolloutStepState:
+    """CPU-resident rollout artifacts that can be replayed across retries."""
+
+    generated_texts: list[str]
+    response_ids_cpu: torch.Tensor
+    response_mask_cpu: torch.Tensor
+    rewards_cpu: torch.Tensor
+    response_lengths_cpu: torch.Tensor
+    truncation_mask_cpu: torch.Tensor
+    advantages_cpu: torch.Tensor
+    debug_infos: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class PreparedTrainingState:
+    """Prepared rollout tensors kept on CPU and moved to GPU per micro-batch."""
+
+    all_input_ids: torch.Tensor
+    all_attention_mask: torch.Tensor
+    response_only_mask: torch.Tensor
+    advantages: torch.Tensor
+    rewards: torch.Tensor
+    response_lengths: torch.Tensor
+    truncation_mask: torch.Tensor
+    all_old_log_probs: torch.Tensor
+
+
+@dataclass(slots=True)
+class TrainingRetryState:
+    """Training-state snapshot needed to replay a failed accumulation attempt."""
+
+    grad_snapshot: dict[int, torch.Tensor]
+    accumulation_batches: int
+    torch_rng_state: Optional[torch.Tensor] = None
+    cuda_rng_state: Optional[Dict[int, torch.Tensor]] = None
+    trainable_param_snapshot: Optional[dict[int, torch.Tensor]] = None
+    optimizer_state: Optional[Dict[str, Any]] = None
+    scheduler_state: Optional[Dict[str, Any]] = None
+    optimizer_step: int = 0
+    partial_accumulation_recovery_state: Optional[Dict[str, int]] = None
+
+
 class GRPOTrainerLoop:
     """
     Complete GRPO training loop for 8GB VRAM systems.
@@ -104,10 +148,26 @@ class GRPOTrainerLoop:
         self.global_step = 0
         self.optimizer_step = 0
         self._accumulation_batches = 0
-        self._gen_micro_batch = 4
-        self._train_micro_batch = 4
+        self._gen_micro_batch = max(1, int(self.config.training.generation_micro_batch))
+        self._train_micro_batch = max(1, int(self.config.training.training_micro_batch))
+        self._max_gen_micro_batch = max(
+            self._gen_micro_batch,
+            int(self.config.training.max_generation_micro_batch),
+        )
+        self._max_train_micro_batch = max(
+            self._train_micro_batch,
+            int(self.config.training.max_training_micro_batch),
+        )
         self._oom_backoff_count = 0
-        self._post_oom_success_batches = 0
+        self._gen_probe_success_batches = 0
+        self._train_probe_success_batches = 0
+        self._gen_probe_cooldown = 0
+        self._train_probe_cooldown = 0
+        self._phase_probe_usage: dict[str, Optional[float]] = {
+            "generation": None,
+            "training": None,
+        }
+        self._step_peak_memory_stats: dict[str, float] = {}
         self._wandb_run = None
         self._step_start_time = None
         self._resume_step = None
@@ -116,6 +176,13 @@ class GRPOTrainerLoop:
         self._profiler_hooks: ProfilerHooks | None = None
         self._metrics_jsonl_path: Optional[str] = None
         self._triton_generation_policy_logged = False
+        self._training_step_in_progress = False
+        self._partial_accumulation_replay_step = self.global_step
+        self._refresh_oom_backoff_count()
+        self._partial_accumulation_recovery_state = (
+            self._serialize_adaptive_recovery_state()
+        )
+        self._partial_accumulation_rng_state = self._serialize_rng_state()
 
     def setup(self):
         """Setup model, tokenizer, and training components."""
@@ -443,7 +510,257 @@ class GRPOTrainerLoop:
         del outputs
         return past_kv
 
-    def _sample_next_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        """Detect CUDA allocator failures without depending on one exact message."""
+        oom_types = tuple(
+            oom_type
+            for oom_type in (
+                getattr(torch.cuda, "OutOfMemoryError", None),
+                getattr(torch, "OutOfMemoryError", None),
+            )
+            if isinstance(oom_type, type)
+        )
+        if oom_types and isinstance(exc, oom_types):
+            return True
+
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "out of memory",
+                "cuda oom",
+                "cuda out of memory",
+                "memory allocation",
+                "cublas_status_alloc_failed",
+                "hip out of memory",
+            )
+        )
+
+    def _refresh_oom_backoff_count(self) -> None:
+        """Expose whether any phase is still running below its configured ceiling."""
+        self._oom_backoff_count = int(self._gen_micro_batch < self._max_gen_micro_batch)
+        self._oom_backoff_count += int(
+            self._train_micro_batch < self._max_train_micro_batch
+        )
+
+    def _clear_memory_after_oom(self) -> None:
+        """Drop allocator pressure at the failure boundary before a retry."""
+        if self.memory_manager is not None:
+            self.memory_manager.clear_cache(aggressive=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    def _begin_training_step(self) -> None:
+        """Initialize per-step state once, even if the step needs retries."""
+        self._training_step_in_progress = True
+        self._step_start_time = time.time()
+        self.model.train()
+        self._phase_probe_usage = {
+            "generation": None,
+            "training": None,
+        }
+        self._step_peak_memory_stats = {}
+        if hasattr(self.memory_manager, "reset_peak_stats"):
+            self.memory_manager.reset_peak_stats()
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_step_start(self.global_step, self.current_epoch)
+
+        if self._accumulation_batches == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._partial_accumulation_replay_step = self.global_step
+            self._partial_accumulation_recovery_state = (
+                self._serialize_adaptive_recovery_state()
+            )
+            self._partial_accumulation_rng_state = self._serialize_rng_state()
+
+    def _capture_memory_stats(self, prefer_peak: bool = True) -> Optional[Dict[str, float]]:
+        if self.memory_manager is None:
+            return None
+        stats = None
+        if (
+            prefer_peak
+            and hasattr(self.memory_manager, "get_peak_memory_stats")
+        ):
+            stats = self.memory_manager.get_peak_memory_stats()
+        if (
+            (not stats or "error" in stats)
+            and hasattr(self.memory_manager, "get_memory_stats")
+        ):
+            stats = self.memory_manager.get_memory_stats()
+        if not stats or "error" in stats:
+            return None
+        return stats
+
+    @staticmethod
+    def _usage_from_memory_stats(stats: Optional[Dict[str, float]]) -> Optional[float]:
+        if not stats:
+            return None
+        usage_values = []
+        for key in ("usage_fraction", "peak_usage_fraction"):
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                usage_values.append(float(value))
+        return max(usage_values) if usage_values else None
+
+    def _merge_step_peak_memory_stats(self, stats: Optional[Dict[str, float]]) -> None:
+        if not stats:
+            return
+
+        for key in (
+            "allocated_gb",
+            "reserved_gb",
+            "max_allocated_gb",
+            "usage_fraction",
+            "peak_allocated_gb",
+            "peak_reserved_gb",
+            "peak_usage_fraction",
+        ):
+            value = stats.get(key)
+            if not isinstance(value, (int, float)):
+                continue
+            self._step_peak_memory_stats[key] = max(
+                float(self._step_peak_memory_stats.get(key, float(value))),
+                float(value),
+            )
+
+        for key in ("total_gb", "free_gb"):
+            value = stats.get(key)
+            if isinstance(value, (int, float)) and key not in self._step_peak_memory_stats:
+                self._step_peak_memory_stats[key] = float(value)
+
+    def _prepare_phase_peak_tracking(self) -> None:
+        if hasattr(self.memory_manager, "reset_peak_stats"):
+            self.memory_manager.reset_peak_stats()
+
+    def _record_phase_peak_usage(self, phase: str) -> None:
+        stats = self._capture_memory_stats(prefer_peak=True)
+        self._record_phase_peak_usage_from_stats(phase, stats)
+
+    def _record_phase_peak_usage_from_stats(
+        self, phase: str, stats: Optional[Dict[str, float]]
+    ) -> None:
+        if not stats:
+            return
+
+        self._merge_step_peak_memory_stats(stats)
+        target_name, *_ = self._phase_backoff_target(phase)
+        usage_fraction = self._usage_from_memory_stats(stats)
+        if usage_fraction is None:
+            return
+
+        previous_usage = self._phase_probe_usage.get(target_name)
+        if previous_usage is None or usage_fraction > previous_usage:
+            self._phase_probe_usage[target_name] = usage_fraction
+
+    def _step_memory_stats_for_controls(self) -> Optional[Dict[str, float]]:
+        current_stats = self._capture_memory_stats(prefer_peak=False)
+        if not self._step_peak_memory_stats:
+            return current_stats
+
+        merged_stats = dict(self._step_peak_memory_stats)
+        if current_stats:
+            for key in ("allocated_gb", "reserved_gb", "usage_fraction", "free_gb", "total_gb"):
+                value = current_stats.get(key)
+                if isinstance(value, (int, float)):
+                    merged_stats[key] = float(value)
+            current_max_allocated = current_stats.get("max_allocated_gb")
+            if isinstance(current_max_allocated, (int, float)):
+                merged_stats["max_allocated_gb"] = max(
+                    float(merged_stats.get("max_allocated_gb", float(current_max_allocated))),
+                    float(current_max_allocated),
+                )
+        return merged_stats
+
+    def _create_rollout_sample_seeds(self, batch_size: int) -> Optional[torch.Tensor]:
+        """Assign each sampled response a stable seed so retries can replay it."""
+        if not self.config.training.generation_do_sample:
+            return None
+        return torch.randint(
+            low=0,
+            high=2**31 - 1,
+            size=(batch_size, self.config.grpo.group_size),
+            dtype=torch.int64,
+        )
+
+    def _generator_device_string(self, device: torch.device) -> str:
+        if device.type != "cuda":
+            return "cpu"
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return f"cuda:{index}"
+
+    def _build_response_generators(
+        self, sample_seeds: Optional[Sequence[int]], device: torch.device
+    ) -> Optional[list[torch.Generator]]:
+        """Build one RNG stream per response so sampling is independent of chunking."""
+        if sample_seeds is None or not self.config.training.generation_do_sample:
+            return None
+
+        generators: list[torch.Generator] = []
+        generator_device = self._generator_device_string(device)
+        for seed in sample_seeds:
+            generator = torch.Generator(device=generator_device)
+            generator.manual_seed(int(seed))
+            generators.append(generator)
+        return generators
+
+    def _cuda_rng_devices(self) -> list[int]:
+        if not torch.cuda.is_available():
+            return []
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            return []
+        return [device.index if device.index is not None else torch.cuda.current_device()]
+
+    def _retry_rng_cuda_devices(self) -> list[int]:
+        """Capture all CUDA RNG streams that may affect stochastic replay."""
+        if not torch.cuda.is_available():
+            return []
+        return list(range(torch.cuda.device_count()))
+
+    @contextmanager
+    def _fork_local_sampling_rng(self, seed: int):
+        """Run a sampled fallback call with a private RNG stream."""
+        cuda_devices = self._retry_rng_cuda_devices()
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.default_generator.manual_seed(seed)
+            for device_idx in cuda_devices:
+                with torch.cuda.device(device_idx):
+                    torch.cuda.manual_seed(seed)
+            yield
+
+    @staticmethod
+    def _pad_generated_rows(
+        rows: Sequence[torch.Tensor], pad_token_id: int
+    ) -> torch.Tensor:
+        """Pad a list of variable-length row tensors to a batch tensor."""
+        if not rows:
+            return torch.empty((0, 0), dtype=torch.long)
+
+        max_width = max(int(row.shape[-1]) for row in rows)
+        padded_rows = []
+        for row in rows:
+            row_2d = row.unsqueeze(0) if row.ndim == 1 else row
+            if row_2d.shape[1] == max_width:
+                padded_rows.append(row_2d)
+                continue
+            padded = torch.full(
+                (row_2d.shape[0], max_width),
+                pad_token_id,
+                dtype=row_2d.dtype,
+                device=row_2d.device,
+            )
+            padded[:, : row_2d.shape[1]] = row_2d
+            padded_rows.append(padded)
+        return torch.cat(padded_rows, dim=0)
+
+    def _sample_next_tokens(
+        self,
+        logits: torch.Tensor,
+        generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> torch.Tensor:
         """Sample the next token using the configured generation policy."""
         if not self.config.training.generation_do_sample:
             return logits.argmax(dim=-1)
@@ -466,11 +783,31 @@ class GRPOTrainerLoop:
                 sorted_remove, torch.finfo(sorted_logits.dtype).min
             )
             sorted_probs = F.softmax(sorted_logits, dim=-1)
-            sampled_sorted = torch.multinomial(sorted_probs, num_samples=1)
+            if generators is None:
+                sampled_sorted = torch.multinomial(sorted_probs, num_samples=1)
+            else:
+                sampled_sorted = torch.stack(
+                    [
+                        torch.multinomial(
+                            sorted_probs[row_idx], num_samples=1, generator=generator
+                        )
+                        for row_idx, generator in enumerate(generators)
+                    ],
+                    dim=0,
+                )
             return sorted_indices.gather(dim=-1, index=sampled_sorted).squeeze(-1)
 
         probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        if generators is None:
+            return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        sampled = torch.stack(
+            [
+                torch.multinomial(probs[row_idx], num_samples=1, generator=generator)
+                for row_idx, generator in enumerate(generators)
+            ],
+            dim=0,
+        )
+        return sampled.squeeze(-1)
 
     def _create_scheduler(self, total_optimizer_steps: int) -> LambdaLR:
         """Create the LR scheduler using the real optimizer-step budget."""
@@ -550,6 +887,13 @@ class GRPOTrainerLoop:
         self.optimizer.zero_grad(set_to_none=True)
         self.optimizer_step += 1
         self._accumulation_batches = 0
+        self._partial_accumulation_replay_step = (
+            self.global_step + 1 if self._training_step_in_progress else self.global_step
+        )
+        self._partial_accumulation_recovery_state = (
+            self._serialize_adaptive_recovery_state()
+        )
+        self._partial_accumulation_rng_state = self._serialize_rng_state()
         return True
 
     @contextmanager
@@ -737,7 +1081,7 @@ class GRPOTrainerLoop:
     ) -> torch.Tensor:
         """Mark completions that should contribute gradient signal."""
         truncation_mask = torch.ones(
-            response_ids.shape[0], dtype=torch.float32, device=self.device
+            response_ids.shape[0], dtype=torch.float32, device=response_ids.device
         )
         if not self.config.grpo.mask_truncated_completions:
             return truncation_mask
@@ -824,6 +1168,7 @@ class GRPOTrainerLoop:
         self,
         prefix_state,
         current_micro: int,
+        sample_seeds: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """Decode grouped responses from a shared Triton paged-KV prompt cache."""
         decode_state = expand_paged_kv_cache_state(prefix_state, current_micro)
@@ -840,8 +1185,65 @@ class GRPOTrainerLoop:
                 else (self.tokenizer.eos_token_id or 0)
             ),
             eos_token_id=self.tokenizer.eos_token_id,
-            seed=None,
+            seed=(
+                int(sample_seeds[0])
+                if sample_seeds is not None
+                and self.config.training.generation_do_sample
+                and len(sample_seeds) == 1
+                else None
+            ),
+            seeds=(
+                [int(seed) for seed in sample_seeds]
+                if sample_seeds is not None
+                and self.config.training.generation_do_sample
+                and len(sample_seeds) > 1
+                else None
+            ),
         )
+
+    def _generate_with_model_generate(
+        self,
+        real_ids: torch.Tensor,
+        real_mask: torch.Tensor,
+        current_micro: int,
+        sample_seeds: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
+        """Fallback to HF generate, using per-response seeds when replay safety matters."""
+        common_kwargs = {
+            "max_new_tokens": self.config.training.max_response_length,
+            "do_sample": self.config.training.generation_do_sample,
+            "temperature": self.config.training.generation_temperature,
+            "top_p": self.config.training.generation_top_p,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True,
+        }
+        if (
+            sample_seeds is None
+            or not self.config.training.generation_do_sample
+        ):
+            return self.model.generate(
+                input_ids=real_ids.expand(current_micro, -1),
+                attention_mask=real_mask.expand(current_micro, -1),
+                **common_kwargs,
+            )
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        rows = []
+        for seed in sample_seeds:
+            with self._fork_local_sampling_rng(int(seed)):
+                row = self.model.generate(
+                    input_ids=real_ids,
+                    attention_mask=real_mask,
+                    **common_kwargs,
+                )
+            rows.append(row)
+        return self._pad_generated_rows(rows, pad_token_id)
 
     def _generate_with_expanded_prefix_cache(
         self,
@@ -849,6 +1251,7 @@ class GRPOTrainerLoop:
         real_mask: torch.Tensor,
         prefix_cache,
         current_micro: int,
+        sample_seeds: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """Decode responses directly from a prefetched prompt cache."""
         pad_token_id = self.tokenizer.pad_token_id
@@ -877,6 +1280,9 @@ class GRPOTrainerLoop:
             dtype=real_mask.dtype,
             device=self.device,
         )
+        sample_generators = self._build_response_generators(
+            sample_seeds, device=current_input_ids.device
+        )
         unfinished = torch.ones(current_micro, dtype=torch.bool, device=self.device)
         generated_steps = 0
         pad_tokens = torch.full(
@@ -891,7 +1297,9 @@ class GRPOTrainerLoop:
                 use_cache=True,
             )
             next_logits = outputs.logits[:, -1, :]
-            sampled_tokens = self._sample_next_tokens(next_logits)
+            sampled_tokens = self._sample_next_tokens(
+                next_logits, generators=sample_generators
+            )
             next_tokens = torch.where(unfinished, sampled_tokens, pad_tokens)
 
             generated_ids[:, step_idx] = next_tokens
@@ -926,6 +1334,7 @@ class GRPOTrainerLoop:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         group_size_override: int | None = None,
+        sample_seeds: Optional[torch.Tensor] = None,
     ) -> tuple[List[str], torch.Tensor, torch.Tensor]:
         """
         Generate responses for GRPO group sampling with KV-cache prefix sharing.
@@ -985,6 +1394,9 @@ class GRPOTrainerLoop:
                 real_ids = single_ids[:, first_real:]
                 real_mask = single_mask[:, first_real:]
                 prompt_len = real_ids.shape[1]
+                prompt_sample_seeds = (
+                    sample_seeds[prompt_idx].tolist() if sample_seeds is not None else None
+                )
                 use_triton_kernels = use_triton_generation
 
                 if use_triton_kernels:
@@ -996,7 +1408,7 @@ class GRPOTrainerLoop:
                         prefix_cache = None
                         use_triton_kernels = False
                     except (AttributeError, RuntimeError, ValueError) as exc:
-                        if "out of memory" in str(exc).lower():
+                        if self._is_oom_error(exc):
                             raise
                         logger.warning(
                             "Falling back from Triton paged-KV prefill to torch prefix cache: %s",
@@ -1013,6 +1425,11 @@ class GRPOTrainerLoop:
                 for g_start in range(0, group_size, micro_batch_size):
                     g_end = min(g_start + micro_batch_size, group_size)
                     current_micro = g_end - g_start
+                    current_sample_seeds = (
+                        prompt_sample_seeds[g_start:g_end]
+                        if prompt_sample_seeds is not None
+                        else None
+                    )
                     outputs_are_response_only = True
 
                     if use_triton_kernels:
@@ -1021,50 +1438,36 @@ class GRPOTrainerLoop:
                                 outputs = self._generate_with_triton_paged_prefix_cache(
                                     prefix_state=prefix_cache,
                                     current_micro=current_micro,
+                                    sample_seeds=current_sample_seeds,
                                 )
                             except ImportError:
-                                outputs = self.model.generate(
-                                    input_ids=real_ids.expand(current_micro, -1),
-                                    attention_mask=real_mask.expand(current_micro, -1),
-                                    max_new_tokens=self.config.training.max_response_length,
-                                    do_sample=self.config.training.generation_do_sample,
-                                    temperature=self.config.training.generation_temperature,
-                                    top_p=self.config.training.generation_top_p,
-                                    pad_token_id=self.tokenizer.pad_token_id,
-                                    eos_token_id=self.tokenizer.eos_token_id,
-                                    use_cache=True,
+                                outputs = self._generate_with_model_generate(
+                                    real_ids=real_ids,
+                                    real_mask=real_mask,
+                                    current_micro=current_micro,
+                                    sample_seeds=current_sample_seeds,
                                 )
                                 outputs_are_response_only = False
                             except (RuntimeError, ValueError) as exc:
-                                if "out of memory" in str(exc).lower():
+                                if self._is_oom_error(exc):
                                     raise
                                 logger.warning(
                                     "Falling back from Triton paged_kv_decode to model.generate(): %s",
                                     exc,
                                 )
-                                outputs = self.model.generate(
-                                    input_ids=real_ids.expand(current_micro, -1),
-                                    attention_mask=real_mask.expand(current_micro, -1),
-                                    max_new_tokens=self.config.training.max_response_length,
-                                    do_sample=self.config.training.generation_do_sample,
-                                    temperature=self.config.training.generation_temperature,
-                                    top_p=self.config.training.generation_top_p,
-                                    pad_token_id=self.tokenizer.pad_token_id,
-                                    eos_token_id=self.tokenizer.eos_token_id,
-                                    use_cache=True,
+                                outputs = self._generate_with_model_generate(
+                                    real_ids=real_ids,
+                                    real_mask=real_mask,
+                                    current_micro=current_micro,
+                                    sample_seeds=current_sample_seeds,
                                 )
                                 outputs_are_response_only = False
                         else:
-                            outputs = self.model.generate(
-                                input_ids=real_ids.expand(current_micro, -1),
-                                attention_mask=real_mask.expand(current_micro, -1),
-                                max_new_tokens=self.config.training.max_response_length,
-                                do_sample=self.config.training.generation_do_sample,
-                                temperature=self.config.training.generation_temperature,
-                                top_p=self.config.training.generation_top_p,
-                                pad_token_id=self.tokenizer.pad_token_id,
-                                eos_token_id=self.tokenizer.eos_token_id,
-                                use_cache=True,
+                            outputs = self._generate_with_model_generate(
+                                real_ids=real_ids,
+                                real_mask=real_mask,
+                                current_micro=current_micro,
+                                sample_seeds=current_sample_seeds,
                             )
                             outputs_are_response_only = False
                     else:
@@ -1073,6 +1476,7 @@ class GRPOTrainerLoop:
                             real_mask=real_mask,
                             prefix_cache=prefix_cache,
                             current_micro=current_micro,
+                            sample_seeds=current_sample_seeds,
                         )
 
                     if not outputs_are_response_only:
@@ -1178,12 +1582,13 @@ class GRPOTrainerLoop:
         prompt_width = input_ids.shape[1]
         response_width = response_ids.shape[1]
         num_samples = response_ids.shape[0]
+        output_device = response_only_mask.device
 
         all_old_log_probs = torch.zeros(
             num_samples,
             prompt_width + response_width - 1,
             dtype=torch.float32,
-            device=self.device,
+            device=output_device,
         )
 
         for prompt_idx in range(batch_size):
@@ -1191,8 +1596,8 @@ class GRPOTrainerLoop:
             single_mask = attention_mask[prompt_idx : prompt_idx + 1]
 
             first_real = single_mask[0].argmax().item()
-            real_ids = single_ids[:, first_real:]
-            real_mask = single_mask[:, first_real:]
+            real_ids = single_ids[:, first_real:].to(self.device)
+            real_mask = single_mask[:, first_real:].to(self.device)
             real_prompt_len = real_ids.shape[1]
             prefix_cache = self._prefill_prompt_cache(real_ids, real_mask)
 
@@ -1205,8 +1610,8 @@ class GRPOTrainerLoop:
                 g_end = min(g_start + gen_micro_batch, group_size)
                 current_micro = g_end - g_start
 
-                mb_response_ids = group_response_ids[g_start:g_end]
-                mb_response_mask = group_response_mask[g_start:g_end]
+                mb_response_ids = group_response_ids[g_start:g_end].to(self.device)
+                mb_response_mask = group_response_mask[g_start:g_end].to(self.device)
                 mb_cache = self._expand_prefix_cache(prefix_cache, current_micro)
 
                 anchor_ids = real_ids[:, -1:].expand(current_micro, -1)
@@ -1243,180 +1648,171 @@ class GRPOTrainerLoop:
                 all_old_log_probs[
                     group_start + g_start : group_start + g_end,
                     prompt_width - 1 : prompt_width - 1 + response_width,
-                ] = compact_log_probs
+                ] = compact_log_probs.to(output_device)
 
-                del outputs, compact_logits, mb_cache
+                del outputs, compact_logits, mb_cache, mb_response_ids, mb_response_mask
 
-            del prefix_cache
+            del prefix_cache, real_ids, real_mask
             self.memory_manager.clear_cache()
 
         return all_old_log_probs * response_only_mask[:, 1:]
 
-    def training_step(self, batch: Dict) -> Dict[str, float]:
-        """
-        Execute one training step.
+    def _log_generated_batch_debug(
+        self,
+        batch: Dict[str, Any],
+        ground_truths: Sequence[Any],
+        generated_texts: Sequence[str],
+        rewards_list: Sequence[float],
+        debug_infos: Sequence[dict[str, Any]],
+    ) -> None:
+        """Emit the same generation diagnostics for both normal and retried steps."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
 
-        Args:
-            batch: Batch of data with prompts and answers
+        logger.debug("\n[DEBUG] Step %s", self.global_step)
+        questions = batch.get("questions") or []
+        if questions and ground_truths:
+            group_size = self.config.grpo.group_size
+            q_text = questions[0]
+            gt_text = ground_truths[0]
+            logger.debug("Question: %s", q_text)
+            logger.debug("Ground Truth: %s", gt_text)
+            logger.debug("-" * 20)
 
-        Returns:
-            Dictionary of metrics
-        """
-        self._step_start_time = time.time()
-        self.model.train()
-        if hasattr(self.memory_manager, "reset_peak_stats"):
-            self.memory_manager.reset_peak_stats()
+            batch_responses = generated_texts[:group_size]
+            batch_rewards = rewards_list[:group_size]
+            batch_infos = debug_infos[:group_size]
 
-        if self._profiler_hooks:
-            self._profiler_hooks.on_step_start(self.global_step, self.current_epoch)
+            correct_count = sum(1 for info in batch_infos if info.get("match", False))
+            total_count = len(batch_rewards)
+            failed_count = total_count - correct_count
 
-        if self._accumulation_batches == 0:
-            self.optimizer.zero_grad(set_to_none=True)
+            logger.debug(
+                "Responses: %d total | %d correct | %d failed",
+                total_count,
+                correct_count,
+                failed_count,
+            )
+            logger.debug("")
 
-        # Get batch data
+            failed_shown = 0
+            for idx, (resp, rew, info) in enumerate(
+                zip(batch_responses, batch_rewards, batch_infos)
+            ):
+                if info.get("match", False):
+                    continue
+                failed_shown += 1
+                logger.debug("[FAILED] Response %d (Reward: %.2f):", idx + 1, rew)
+                logger.debug("  -> Text: %s", resp.replace("\n", "\\n"))
+                logger.debug("  -> Extracted: %s", info.get("extracted_answer"))
+                logger.debug("  -> GT: %s", info.get("ground_truth_answer"))
+                logger.debug("  -> Match: %s", info.get("match"))
+                logger.debug("-" * 10)
+
+            if failed_shown == 0:
+                logger.debug("All responses correct!")
+        logger.debug("=" * 40)
+
+    def _prepare_rollout_state(
+        self,
+        batch: Dict[str, Any],
+        sample_seeds: Optional[torch.Tensor] = None,
+    ) -> RolloutStepState:
+        """Generate rollouts and rewards once, then keep them replayable on CPU."""
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
         ground_truths = batch["answers"]
 
-        # Phase 1: Generation (no gradients)
         self.memory_manager.optimize_for_inference()
+        self._prepare_phase_peak_tracking()
 
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_start("generation", step=self.global_step)
 
         generated_texts, response_ids, response_mask = self._generate_responses_with_tokens(
-            input_ids, attention_mask
+            input_ids,
+            attention_mask,
+            sample_seeds=sample_seeds,
         )
 
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_end("generation", step=self.global_step)
+        self._record_phase_peak_usage("generation")
 
-        # Calculate lengths for penalty
-        response_lengths = response_mask.sum(dim=1).float()
+        response_ids_cpu = response_ids.detach().cpu()
+        response_mask_cpu = response_mask.detach().cpu()
+        response_lengths = response_mask_cpu.sum(dim=1).float()
 
-        # Compute rewards
         rewards_list = []
         debug_infos = []
         group_size = self.config.grpo.group_size
-
-        # Expand ground truths
         expanded_ground_truths = []
         for gt in ground_truths:
             expanded_ground_truths.extend([gt] * group_size)
 
-        for i, (gen_text, gt) in enumerate(
-            zip(generated_texts, expanded_ground_truths)
-        ):
+        for idx, (gen_text, gt) in enumerate(zip(generated_texts, expanded_ground_truths)):
             reward, info = self.verifier.verify(gen_text, gt)
-
-            # Apply length penalty
             if self.config.grpo.length_penalty_coef > 0:
-                penalty = response_lengths[i] * self.config.grpo.length_penalty_coef
+                penalty = response_lengths[idx] * self.config.grpo.length_penalty_coef
                 reward -= penalty.item()
-
             rewards_list.append(reward)
             debug_infos.append(info)
 
-        rewards = torch.tensor(rewards_list, dtype=torch.float32, device=self.device)
-
-        # TRACE-level logging for tensor metadata
+        rewards = torch.tensor(rewards_list, dtype=torch.float32)
         log_tensor_meta(logger, "Rewards", rewards, level=TRACE)
+        self._log_generated_batch_debug(
+            batch=batch,
+            ground_truths=ground_truths,
+            generated_texts=generated_texts,
+            rewards_list=rewards_list,
+            debug_infos=debug_infos,
+        )
 
-        # --- DEBUG PRINT ---
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("\n[DEBUG] Step %s", self.global_step)
-            # Only print first item in batch
-            b = 0
-            if b < len(batch["questions"]):
-                q_text = batch["questions"][b]
-                gt_text = ground_truths[b]
-                logger.debug("Question: %s", q_text)
-                logger.debug("Ground Truth: %s", gt_text)
-                logger.debug("-" * 20)
-
-                start_idx = b * group_size
-                end_idx = start_idx + group_size
-                batch_responses = generated_texts[start_idx:end_idx]
-                batch_rewards = rewards_list[start_idx:end_idx]
-                batch_infos = debug_infos[start_idx:end_idx]
-
-                # Calculate statistics
-                correct_count = sum(
-                    1 for info in batch_infos if info.get("match", False)
-                )
-
-                total_count = len(batch_rewards)
-                failed_count = total_count - correct_count
-
-                logger.debug(
-                    "Responses: %d total | %d correct | %d failed",
-                    total_count,
-                    correct_count,
-                    failed_count,
-                )
-                logger.debug("")
-
-                # Only show failed responses
-                failed_shown = 0
-                for i, (resp, rew, info) in enumerate(
-                    zip(batch_responses, batch_rewards, batch_infos)
-                ):
-                    if info.get("match", False):
-                        continue  # Skip correct responses
-
-                    failed_shown += 1
-                    logger.debug("[FAILED] Response %d (Reward: %.2f):", i + 1, rew)
-                    clean_resp = resp.replace("\n", "\\n")
-                    logger.debug("  -> Text: %s", clean_resp)
-                    logger.debug("  -> Extracted: %s", info.get("extracted_answer"))
-                    logger.debug("  -> GT: %s", info.get("ground_truth_answer"))
-                    logger.debug("  -> Match: %s", info.get("match"))
-                    logger.debug("-" * 10)
-
-                if failed_shown == 0:
-                    logger.debug("All responses correct!")
-            logger.debug("=" * 40)
-        # -------------------
-
-        truncation_mask = self._compute_truncation_mask(response_ids, response_mask)
+        truncation_mask = self._compute_truncation_mask(
+            response_ids_cpu, response_mask_cpu
+        ).cpu()
         advantages = self._calculate_masked_group_advantages(rewards, truncation_mask)
-
-        # TRACE-level logging for tensor metadata
         log_tensor_meta(logger, "Advantages", advantages, level=TRACE)
-        self.memory_manager.optimize_for_training()
 
-        total_loss = 0.0
-        all_metrics = []
+        del input_ids, attention_mask, response_ids, response_mask
 
-        # Get expanded prompts (each prompt repeated group_size times)
+        return RolloutStepState(
+            generated_texts=list(generated_texts),
+            response_ids_cpu=response_ids_cpu,
+            response_mask_cpu=response_mask_cpu,
+            rewards_cpu=rewards,
+            response_lengths_cpu=response_lengths,
+            truncation_mask_cpu=truncation_mask,
+            advantages_cpu=advantages,
+            debug_infos=list(debug_infos),
+        )
+
+    def _prepare_training_state(
+        self, batch: Dict[str, Any], rollout_state: RolloutStepState
+    ) -> PreparedTrainingState:
+        """Build deterministic training tensors and frozen old log-probs."""
+        input_ids = batch["input_ids"].detach().cpu()
+        attention_mask = batch["attention_mask"].detach().cpu()
+        response_ids = rollout_state.response_ids_cpu
+        response_mask = rollout_state.response_mask_cpu
+        rewards = rollout_state.rewards_cpu
+        response_lengths = rollout_state.response_lengths_cpu
+        truncation_mask = rollout_state.truncation_mask_cpu
+        advantages = rollout_state.advantages_cpu
+
         group_size = self.config.grpo.group_size
-        prompt_ids_expanded = input_ids.repeat_interleave(
-            group_size, dim=0
-        )  # [batch*G, prompt_len]
+        prompt_ids_expanded = input_ids.repeat_interleave(group_size, dim=0)
         prompt_mask_expanded = attention_mask.repeat_interleave(group_size, dim=0)
 
-        num_samples = response_ids.shape[0]
-
-        del generated_texts
-
-        # Concatenate prompt + response for each sample
-        # This matches grpo_zero: batch_token_ids = prefix_token_ids + generated_token_ids
-        all_input_ids = torch.cat(
-            [prompt_ids_expanded, response_ids], dim=1
-        )  # [batch*G, prompt_len + resp_len]
+        all_input_ids = torch.cat([prompt_ids_expanded, response_ids], dim=1)
         all_attention_mask = torch.cat([prompt_mask_expanded, response_mask], dim=1)
 
-        # Create response-only mask: 0 for prompt tokens, 1 for response tokens
-        # This ensures only response tokens contribute to loss (like grpo_zero's batch_masks)
         prompt_len = prompt_ids_expanded.shape[1]
         num_samples = all_input_ids.shape[0]
-
-        # response_only_mask: [batch*G, prompt_len + resp_len]
-        # First prompt_len positions are 0, remaining resp_len positions use response_mask
         response_only_mask = torch.cat(
             [
                 torch.zeros(
-                    num_samples, prompt_len, dtype=torch.long, device=self.device
+                    num_samples, prompt_len, dtype=torch.long
                 ),
                 response_mask,
             ],
@@ -1425,16 +1821,10 @@ class GRPOTrainerLoop:
         if self.config.grpo.mask_truncated_completions:
             response_only_mask = response_only_mask * truncation_mask.unsqueeze(1)
 
-        del prompt_ids_expanded, prompt_mask_expanded, response_ids, response_mask
-
-        # Pre-compute old log probabilities (Phase 1.5)
-        # This is CRITICAL: We need the log probs of the generated text *before* updates start.
-        # Otherwise, if we compute them inside the loop, they change as the model updates,
-        # leading to ratio ~ 1.0 and zero gradients (or pure policy gradient without clipping).
-        all_old_log_probs = []
+        del prompt_ids_expanded, prompt_mask_expanded
 
         self.memory_manager.optimize_for_inference()
-
+        self._prepare_phase_peak_tracking()
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_start("old_log_probs", step=self.global_step)
 
@@ -1449,26 +1839,53 @@ class GRPOTrainerLoop:
 
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_end("old_log_probs", step=self.global_step)
+        self._record_phase_peak_usage("old_log_probs")
 
-        # Re-enable gradients for training phase
         self.memory_manager.optimize_for_training()
         self.model.train()
 
+        return PreparedTrainingState(
+            all_input_ids=all_input_ids,
+            all_attention_mask=all_attention_mask,
+            response_only_mask=response_only_mask,
+            advantages=advantages,
+            rewards=rewards,
+            response_lengths=response_lengths,
+            truncation_mask=truncation_mask,
+            all_old_log_probs=all_old_log_probs,
+        )
+
+    def _execute_training_from_state(
+        self, prepared_state: PreparedTrainingState
+    ) -> Dict[str, float]:
+        """Run the backward/update phase from deterministic prepared tensors."""
+        total_loss = 0.0
+        all_metrics = []
+        num_samples = prepared_state.all_input_ids.shape[0]
         training_micro_batch = self._train_micro_batch
 
+        self._prepare_phase_peak_tracking()
         if self._profiler_hooks:
             self._profiler_hooks.on_phase_start("training", step=self.global_step)
 
         for start_idx in range(0, num_samples, training_micro_batch):
             end_idx = min(start_idx + training_micro_batch, num_samples)
 
-            batch_input_ids = all_input_ids[start_idx:end_idx]
-            batch_attention_mask = all_attention_mask[start_idx:end_idx]
-            batch_response_mask = response_only_mask[
+            batch_input_ids = prepared_state.all_input_ids[start_idx:end_idx].to(
+                self.device
+            )
+            batch_attention_mask = prepared_state.all_attention_mask[
                 start_idx:end_idx
-            ]  # Response-only mask
-            batch_advantages = advantages[start_idx:end_idx]
-            batch_old_log_probs = all_old_log_probs[start_idx:end_idx]
+            ].to(self.device)
+            batch_response_mask = prepared_state.response_only_mask[start_idx:end_idx].to(
+                self.device
+            )
+            batch_advantages = prepared_state.advantages[start_idx:end_idx].to(
+                self.device
+            )
+            batch_old_log_probs = prepared_state.all_old_log_probs[start_idx:end_idx].to(
+                self.device
+            )
 
             reference_logits = None
             if self.config.grpo.use_kl:
@@ -1483,38 +1900,26 @@ class GRPOTrainerLoop:
                 reference_logits = reference_outputs.logits[:, :-1, :].detach()
                 del reference_outputs
 
-            # Forward pass (model sees full prompt+response context)
             outputs = self.model(
                 input_ids=batch_input_ids,
-                attention_mask=batch_attention_mask,  # Full attention for context
-                use_cache=False,  # CRITICAL: Disable cache for gradient checkpointing
+                attention_mask=batch_attention_mask,
+                use_cache=False,
             )
 
             logits = outputs.logits
-
-            # TRACE-level logging for tensor metadata
             log_tensor_meta(logger, "Logits", logits, level=TRACE)
             entropy_mask = None
             if self.config.entropy.use_entropy_mask:
-                # Compute entropy on logits[:, :-1, :] — exactly the same slice passed to
-                # compute_grpo_loss — so the mask is always in perfect token alignment.
-                # batch_response_mask[:, 1:] selects response-only positions in that slice.
                 loss_logits = logits[:, :-1, :].contiguous()
                 loss_resp_mask = batch_response_mask[:, 1:].contiguous()
-                entropy, entropy_mask = (
-                    self.entropy_calculator.calculate_entropy_and_mask(
-                        loss_logits,
-                        attention_mask=loss_resp_mask,
-                        use_triton_kernels=(
-                            self.config.training.use_triton_kernels
-                            and self.config.training.use_triton_entropy_mask
-                        ),
-                    )
+                _, entropy_mask = self.entropy_calculator.calculate_entropy_and_mask(
+                    loss_logits,
+                    attention_mask=loss_resp_mask,
+                    use_triton_kernels=(
+                        self.config.training.use_triton_kernels
+                        and self.config.training.use_triton_entropy_mask
+                    ),
                 )
-
-            # Compute loss for batch
-            # CRITICAL: Use response_only_mask (not attention_mask) so only response tokens
-            # contribute to loss.
 
             seq_len = logits.shape[1] - 1
             if batch_old_log_probs.shape[1] != seq_len:
@@ -1532,79 +1937,88 @@ class GRPOTrainerLoop:
                 entropy_mask=entropy_mask if entropy_mask is not None else None,
                 reference_logits=reference_logits,
             )
-
-            # Scale loss for gradient accumulation
             loss = loss / self.config.training.gradient_accumulation_steps
-
-            # Backward pass
             loss.backward()
 
             total_loss += loss.item() * (end_idx - start_idx)
             all_metrics.append(metrics)
 
-            # Clear memory between micro-batches
-            del outputs, logits
-
-        del all_input_ids, all_attention_mask, response_only_mask, all_old_log_probs
+            del (
+                outputs,
+                logits,
+                batch_input_ids,
+                batch_attention_mask,
+                batch_response_mask,
+                batch_advantages,
+                batch_old_log_probs,
+            )
 
         self._accumulation_batches += 1
+        self._record_phase_peak_usage("training")
         if self._optimizer_step_due():
-            self._flush_accumulated_gradients()
+            if self._flush_accumulated_gradients():
+                # Flush-boundary peaks can exceed the backward pass peak and must
+                # feed both vram_auto controls and train micro-batch regrowth.
+                self._record_phase_peak_usage_from_stats(
+                    "training",
+                    self._capture_memory_stats(prefer_peak=True),
+                )
         if hasattr(self.memory_manager, "maybe_update_checkpointing"):
-            peak_stats = None
-            if hasattr(self.memory_manager, "get_peak_memory_stats"):
-                peak_stats = self.memory_manager.get_peak_memory_stats()
+            peak_stats = self._step_memory_stats_for_controls()
             self.memory_manager.maybe_update_checkpointing(
                 self.model,
                 step=self.global_step,
                 memory_stats=peak_stats,
             )
 
-        # Aggregate metrics
         avg_metrics = {
             "loss": total_loss / num_samples,
-            "avg_reward": rewards.mean().item(),
-            "avg_response_length": response_lengths.mean().item(),
+            "avg_reward": prepared_state.rewards.mean().item(),
+            "avg_response_length": prepared_state.response_lengths.mean().item(),
         }
 
         if all_metrics:
             for key in all_metrics[0].keys():
                 avg_metrics[key] = sum(m[key] for m in all_metrics) / len(all_metrics)
 
-        # Add entropy stats
         if self.config.entropy.use_entropy_mask:
             avg_metrics["entropy_masked_ratio"] = avg_metrics.get(
                 "selected_tokens_ratio", 0.0
             )
 
-        # Add reward distribution stats
-        avg_metrics["reward_std"] = rewards.std().item()
-        avg_metrics["reward_max"] = rewards.max().item()
-        avg_metrics["reward_min"] = rewards.min().item()
-
+        avg_metrics["reward_std"] = prepared_state.rewards.std(unbiased=False).item()
+        avg_metrics["reward_max"] = prepared_state.rewards.max().item()
+        avg_metrics["reward_min"] = prepared_state.rewards.min().item()
         avg_metrics["positive_advantages_ratio"] = (
-            (advantages > 0).float().mean().item()
+            (prepared_state.advantages > 0).float().mean().item()
         )
 
         if self.config.grpo.mask_truncated_completions:
             avg_metrics["truncated_completions_ratio"] = (
-                1.0 - truncation_mask.mean().item()
+                1.0 - prepared_state.truncation_mask.mean().item()
             )
 
         step_time_s = None
         if self._step_start_time:
             step_time_s = time.time() - self._step_start_time
             avg_metrics["step_time_s"] = step_time_s
-        total_tokens = response_lengths.sum().item()
+        total_tokens = prepared_state.response_lengths.sum().item()
         avg_metrics["tokens_per_sec"] = (
             total_tokens / step_time_s if step_time_s and step_time_s > 0 else 0.0
         )
 
         vram_stats = self.memory_manager.get_memory_stats()
+        step_peak_stats = self._step_memory_stats_for_controls() or {}
         if "error" not in vram_stats:
             avg_metrics["vram_allocated"] = vram_stats.get("allocated_gb", 0.0)
             avg_metrics["vram_reserved"] = vram_stats.get("reserved_gb", 0.0)
-            avg_metrics["vram_max_allocated"] = vram_stats.get("max_allocated_gb", 0.0)
+            avg_metrics["vram_max_allocated"] = step_peak_stats.get(
+                "peak_allocated_gb",
+                step_peak_stats.get(
+                    "max_allocated_gb",
+                    vram_stats.get("max_allocated_gb", 0.0),
+                ),
+            )
             avg_metrics["vram_free"] = vram_stats.get("free_gb", 0.0)
             avg_metrics["vram_usage_fraction"] = vram_stats.get("usage_fraction", 0.0)
 
@@ -1615,7 +2029,6 @@ class GRPOTrainerLoop:
 
         self.global_step += 1
         self.memory_manager.step()
-
         self._log_wandb_metrics(avg_metrics)
 
         if self._profiler_hooks:
@@ -1624,7 +2037,275 @@ class GRPOTrainerLoop:
                 self.global_step - 1, avg_metrics, self.current_epoch
             )
 
+        self._training_step_in_progress = False
         return avg_metrics
+
+    def _phase_backoff_target(
+        self, phase: str
+    ) -> tuple[str, str, str, str, str]:
+        if phase in {"generation", "old_log_probs"}:
+            return (
+                "generation",
+                "_gen_micro_batch",
+                "_max_gen_micro_batch",
+                "_gen_probe_success_batches",
+                "_gen_probe_cooldown",
+            )
+        if phase == "training":
+            return (
+                "training",
+                "_train_micro_batch",
+                "_max_train_micro_batch",
+                "_train_probe_success_batches",
+                "_train_probe_cooldown",
+            )
+        raise ValueError(f"Unknown OOM phase '{phase}'.")
+
+    def _next_backoff_micro_batch(self, current: int) -> int:
+        factor = float(self.config.training.oom_backoff_factor)
+        next_micro = max(1, int(math.ceil(current * factor)))
+        if next_micro >= current and current > 1:
+            next_micro = current - 1
+        return max(1, next_micro)
+
+    def _handle_oom_retry(
+        self, phase: str, epoch: int, error: RuntimeError
+    ) -> None:
+        target_name, current_attr, max_attr, success_attr, cooldown_attr = (
+            self._phase_backoff_target(phase)
+        )
+        current_micro = int(getattr(self, current_attr))
+        next_micro = self._next_backoff_micro_batch(current_micro)
+
+        if self._profiler_hooks:
+            self._profiler_hooks.on_oom(
+                self.global_step,
+                {
+                    "phase": phase,
+                    "target": target_name,
+                    "gen_micro_batch": self._gen_micro_batch,
+                    "train_micro_batch": self._train_micro_batch,
+                    "epoch": epoch,
+                },
+            )
+
+        if next_micro == current_micro:
+            logger.info(
+                "\n[OOM] Unable to recover %s at minimum %s micro-batch (%s=%s, gen=%s, train=%s).",
+                phase,
+                target_name,
+                target_name,
+                current_micro,
+                self._gen_micro_batch,
+                self._train_micro_batch,
+            )
+            self._clear_memory_after_oom()
+            raise error
+
+        setattr(self, current_attr, next_micro)
+        setattr(self, success_attr, 0)
+        setattr(
+            self,
+            cooldown_attr,
+            int(self.config.training.micro_batch_probe_cooldown),
+        )
+        if hasattr(self.memory_manager, "enable_checkpointing"):
+            self.memory_manager.enable_checkpointing(self.model)
+        self._refresh_oom_backoff_count()
+
+        logger.info(
+            "\n[OOM] %s phase failure during %s: %s_micro_batch %s -> %s (gen=%s, train=%s)",
+            phase,
+            target_name,
+            target_name,
+            current_micro,
+            next_micro,
+            self._gen_micro_batch,
+            self._train_micro_batch,
+        )
+        self._clear_memory_after_oom()
+
+    def _recovery_probe_usage(self) -> Optional[float]:
+        return self._usage_from_memory_stats(self._capture_memory_stats(prefer_peak=True))
+
+    def _advance_phase_probe(self, phase: str, usage_fraction: Optional[float]) -> None:
+        _, current_attr, max_attr, success_attr, cooldown_attr = (
+            self._phase_backoff_target(phase)
+        )
+        current_micro = int(getattr(self, current_attr))
+        max_micro = int(getattr(self, max_attr))
+        if current_micro >= max_micro:
+            setattr(self, success_attr, 0)
+            setattr(self, cooldown_attr, 0)
+            return
+
+        cooldown = int(getattr(self, cooldown_attr))
+        if cooldown > 0:
+            setattr(self, cooldown_attr, cooldown - 1)
+            return
+
+        if (
+            usage_fraction is not None
+            and usage_fraction
+            > float(self.config.training.micro_batch_probe_usage_threshold)
+        ):
+            setattr(self, success_attr, 0)
+            return
+
+        success_batches = int(getattr(self, success_attr)) + 1
+        setattr(self, success_attr, success_batches)
+        if success_batches < int(self.config.training.micro_batch_probe_interval):
+            return
+
+        next_micro = min(max_micro, current_micro + 1)
+        setattr(self, current_attr, next_micro)
+        setattr(self, success_attr, 0)
+        setattr(
+            self,
+            cooldown_attr,
+            int(self.config.training.micro_batch_probe_cooldown),
+        )
+        self._refresh_oom_backoff_count()
+
+        logger.info(
+            "[OOM] Recovered %s micro-batch to %s (usage=%.3f, gen=%s, train=%s)",
+            phase,
+            next_micro,
+            usage_fraction if usage_fraction is not None else float("nan"),
+            self._gen_micro_batch,
+            self._train_micro_batch,
+        )
+
+    def _record_successful_recovery_batch(self) -> None:
+        generation_usage = self._phase_probe_usage.get("generation")
+        training_usage = self._phase_probe_usage.get("training")
+        fallback_usage = None
+        if generation_usage is None or training_usage is None:
+            fallback_usage = self._recovery_probe_usage()
+        self._advance_phase_probe(
+            "generation",
+            generation_usage if generation_usage is not None else fallback_usage,
+        )
+        self._advance_phase_probe(
+            "training",
+            training_usage if training_usage is not None else fallback_usage,
+        )
+
+    def _serialize_adaptive_recovery_state(self) -> Dict[str, int]:
+        """Persist the learned OOM-recovery schedule across checkpoint resumes."""
+        return {
+            "gen_micro_batch": int(self._gen_micro_batch),
+            "train_micro_batch": int(self._train_micro_batch),
+            "gen_probe_success_batches": int(self._gen_probe_success_batches),
+            "train_probe_success_batches": int(self._train_probe_success_batches),
+            "gen_probe_cooldown": int(self._gen_probe_cooldown),
+            "train_probe_cooldown": int(self._train_probe_cooldown),
+        }
+
+    def _reset_probe_progress(self) -> None:
+        self._gen_probe_success_batches = 0
+        self._train_probe_success_batches = 0
+        self._gen_probe_cooldown = 0
+        self._train_probe_cooldown = 0
+        self._refresh_oom_backoff_count()
+
+    def _restore_adaptive_recovery_state(
+        self, state: Optional[Dict[str, Any]]
+    ) -> None:
+        """Restore the post-OOM micro-batch schedule and probe state."""
+        if not isinstance(state, dict):
+            self._refresh_oom_backoff_count()
+            return
+
+        self._gen_micro_batch = min(
+            self._max_gen_micro_batch,
+            max(1, int(state.get("gen_micro_batch", self._gen_micro_batch))),
+        )
+        self._train_micro_batch = min(
+            self._max_train_micro_batch,
+            max(1, int(state.get("train_micro_batch", self._train_micro_batch))),
+        )
+        self._gen_probe_success_batches = max(
+            0,
+            int(
+                state.get(
+                    "gen_probe_success_batches", self._gen_probe_success_batches
+                )
+            ),
+        )
+        self._train_probe_success_batches = max(
+            0,
+            int(
+                state.get(
+                    "train_probe_success_batches", self._train_probe_success_batches
+                )
+            ),
+        )
+        self._gen_probe_cooldown = max(
+            0, int(state.get("gen_probe_cooldown", self._gen_probe_cooldown))
+        )
+        self._train_probe_cooldown = max(
+            0, int(state.get("train_probe_cooldown", self._train_probe_cooldown))
+        )
+        self._refresh_oom_backoff_count()
+
+    def _run_training_step_with_oom_recovery(
+        self, batch: Dict[str, Any], epoch: int
+    ) -> Dict[str, float]:
+        """Replay-safe retry loop that only redoes the phase that failed."""
+        self._begin_training_step()
+        rollout_state = None
+        prepared_state = None
+        sample_seeds = self._create_rollout_sample_seeds(batch["input_ids"].shape[0])
+
+        while True:
+            if rollout_state is None:
+                try:
+                    rollout_state = self._prepare_rollout_state(
+                        batch, sample_seeds=sample_seeds
+                    )
+                except RuntimeError as exc:
+                    if not self._is_oom_error(exc):
+                        raise
+                    self._handle_oom_retry("generation", epoch, exc)
+                    continue
+
+            if prepared_state is None:
+                try:
+                    prepared_state = self._prepare_training_state(batch, rollout_state)
+                except RuntimeError as exc:
+                    if not self._is_oom_error(exc):
+                        raise
+                    self._handle_oom_retry("old_log_probs", epoch, exc)
+                    continue
+
+            grad_snapshot = self._capture_optimizer_grad_snapshot()
+            try:
+                metrics = self._execute_training_from_state(prepared_state)
+                self._training_step_in_progress = False
+                return metrics
+            except RuntimeError as exc:
+                if not self._is_oom_error(exc):
+                    raise
+                self._restore_optimizer_grad_snapshot(grad_snapshot)
+                self._handle_oom_retry("training", epoch, exc)
+
+    def training_step(self, batch: Dict) -> Dict[str, float]:
+        """
+        Execute one training step.
+
+        Args:
+            batch: Batch of data with prompts and answers
+
+        Returns:
+            Dictionary of metrics
+        """
+        self._begin_training_step()
+        rollout_state = self._prepare_rollout_state(batch)
+        prepared_state = self._prepare_training_state(batch, rollout_state)
+        metrics = self._execute_training_from_state(prepared_state)
+        self._training_step_in_progress = False
+        return metrics
 
     def train_epoch(self, dataloader, epoch: int):
         """
@@ -1640,36 +2321,184 @@ class GRPOTrainerLoop:
         max_steps = self.config.training.max_steps
         return max_steps is not None and self.global_step >= max_steps
 
-    def _capture_optimizer_grad_snapshot(self) -> Dict[int, torch.Tensor]:
-        """Clone current gradients so an OOM retry can restore accumulation state."""
-        if self.optimizer is None:
-            return {}
+    @staticmethod
+    def _clone_state_to_cpu(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {
+                key: GRPOTrainerLoop._clone_state_to_cpu(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [GRPOTrainerLoop._clone_state_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(GRPOTrainerLoop._clone_state_to_cpu(item) for item in value)
+        return value
 
+    def _flush_due_after_current_batch(self) -> bool:
+        return (
+            self._accumulation_batches + 1
+            >= self.config.training.gradient_accumulation_steps
+        )
+
+    def _capture_retry_rng_state(self) -> tuple[torch.Tensor, Optional[Dict[int, torch.Tensor]]]:
+        """Capture torch RNG streams that can affect stochastic training retries."""
+        torch_state = torch.get_rng_state()
+        cuda_state: Optional[Dict[int, torch.Tensor]] = None
+        cuda_devices = self._retry_rng_cuda_devices()
+        if cuda_devices:
+            cuda_state = {
+                device_idx: torch.cuda.get_rng_state(device_idx).clone()
+                for device_idx in cuda_devices
+            }
+        return torch_state, cuda_state
+
+    def _serialize_rng_state(self) -> Dict[str, Any]:
+        """Serialize torch RNG state so checkpoint resumes can replay stochastic work."""
+        torch_state, cuda_state = self._capture_retry_rng_state()
+        serialized_state: Dict[str, Any] = {
+            "torch_rng_state": torch_state.clone(),
+        }
+        if cuda_state is not None:
+            serialized_state["cuda_rng_state"] = {
+                int(device_idx): state.clone().cpu()
+                for device_idx, state in cuda_state.items()
+            }
+        return serialized_state
+
+    def _restore_retry_rng_state(
+        self,
+        torch_state: Optional[torch.Tensor],
+        cuda_state: Optional[Dict[int, torch.Tensor]],
+    ) -> None:
+        """Restore torch RNG streams before replaying a stochastic training step."""
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
+        if cuda_state is not None:
+            available_devices = (
+                set(range(torch.cuda.device_count())) if torch.cuda.is_available() else set()
+            )
+            for device_idx, state in cuda_state.items():
+                if device_idx not in available_devices:
+                    continue
+                torch.cuda.set_rng_state(state, device=device_idx)
+
+    def _restore_serialized_rng_state(self, state: Any) -> bool:
+        """Restore a serialized checkpoint RNG payload if it is well-formed."""
+        if not isinstance(state, dict):
+            return False
+
+        torch_state = state.get("torch_rng_state")
+        if not torch.is_tensor(torch_state):
+            return False
+
+        cuda_state_raw = state.get("cuda_rng_state")
+        cuda_state: Optional[Dict[int, torch.Tensor]] = None
+        if isinstance(cuda_state_raw, dict):
+            parsed_cuda_state: Dict[int, torch.Tensor] = {}
+            for device_idx, device_state in cuda_state_raw.items():
+                if not torch.is_tensor(device_state):
+                    continue
+                parsed_cuda_state[int(device_idx)] = device_state
+            if parsed_cuda_state:
+                cuda_state = parsed_cuda_state
+
+        self._restore_retry_rng_state(torch_state, cuda_state)
+        return True
+
+    def _capture_optimizer_grad_snapshot(self) -> TrainingRetryState:
+        """Clone retry-relevant state so a training OOM can replay cleanly."""
         snapshot: Dict[int, torch.Tensor] = {}
+        torch_rng_state, cuda_rng_state = self._capture_retry_rng_state()
+        retry_state = TrainingRetryState(
+            grad_snapshot=snapshot,
+            accumulation_batches=int(self._accumulation_batches),
+            torch_rng_state=torch_rng_state,
+            cuda_rng_state=cuda_rng_state,
+            optimizer_step=int(self.optimizer_step),
+            partial_accumulation_recovery_state=dict(
+                self._partial_accumulation_recovery_state
+            ),
+        )
+        if self.optimizer is None:
+            return retry_state
+
+        capture_flush_state = self._flush_due_after_current_batch()
         seen: set[int] = set()
+        trainable_param_snapshot: Optional[Dict[int, torch.Tensor]] = (
+            {} if capture_flush_state else None
+        )
         for group in self.optimizer.param_groups:
             for param in group["params"]:
                 if id(param) in seen:
                     continue
                 seen.add(id(param))
+                if trainable_param_snapshot is not None:
+                    trainable_param_snapshot[id(param)] = param.detach().cpu().clone()
                 if param.grad is not None:
                     snapshot[id(param)] = param.grad.detach().clone()
-        return snapshot
+        if capture_flush_state:
+            retry_state.trainable_param_snapshot = trainable_param_snapshot
+            retry_state.optimizer_state = self._clone_state_to_cpu(
+                self.optimizer.state_dict()
+            )
+            if self.scheduler is not None and hasattr(self.scheduler, "state_dict"):
+                retry_state.scheduler_state = self._clone_state_to_cpu(
+                    self.scheduler.state_dict()
+                )
+        return retry_state
 
     def _restore_optimizer_grad_snapshot(
-        self, snapshot: Dict[int, torch.Tensor]
+        self, snapshot: TrainingRetryState
     ) -> None:
-        """Restore gradients captured before a failed training-step attempt."""
+        """Restore mutable training state before retrying a failed step."""
+        self._accumulation_batches = int(snapshot.accumulation_batches)
+        self.optimizer_step = int(snapshot.optimizer_step)
+        self._restore_retry_rng_state(
+            snapshot.torch_rng_state,
+            snapshot.cuda_rng_state,
+        )
+        if snapshot.partial_accumulation_recovery_state is not None:
+            self._partial_accumulation_recovery_state = dict(
+                snapshot.partial_accumulation_recovery_state
+            )
         if self.optimizer is None:
             return
 
+        if snapshot.trainable_param_snapshot is not None:
+            seen: set[int] = set()
+            with torch.no_grad():
+                for group in self.optimizer.param_groups:
+                    for param in group["params"]:
+                        if id(param) in seen:
+                            continue
+                        seen.add(id(param))
+                        value = snapshot.trainable_param_snapshot.get(id(param))
+                        if value is not None:
+                            param.copy_(value.to(device=param.device, dtype=param.dtype))
+
+        if snapshot.optimizer_state is not None:
+            self.optimizer.load_state_dict(snapshot.optimizer_state)
+            CheckpointManager.move_optimizer_state_to_model_device(
+                self.optimizer,
+                self.model,
+            )
+        if (
+            snapshot.scheduler_state is not None
+            and self.scheduler is not None
+            and hasattr(self.scheduler, "load_state_dict")
+        ):
+            self.scheduler.load_state_dict(snapshot.scheduler_state)
+
+        grad_snapshot = snapshot.grad_snapshot
         seen: set[int] = set()
         for group in self.optimizer.param_groups:
             for param in group["params"]:
                 if id(param) in seen:
                     continue
                 seen.add(id(param))
-                grad = snapshot.get(id(param))
+                grad = grad_snapshot.get(id(param))
                 if grad is None:
                     param.grad = None
                 else:
@@ -1716,61 +2545,10 @@ class GRPOTrainerLoop:
                 logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
                 reached_max_steps = True
                 break
-            while True:
-                grad_snapshot = self._capture_optimizer_grad_snapshot()
-                try:
-                    metrics = self.training_step(batch)
-                    break
-                except RuntimeError as e:
-                    if "out of memory" not in str(e).lower():
-                        raise
-                    self._restore_optimizer_grad_snapshot(grad_snapshot)
-                    if self._profiler_hooks:
-                        self._profiler_hooks.on_oom(
-                            self.global_step,
-                            {
-                                "gen_micro_batch": self._gen_micro_batch,
-                                "train_micro_batch": self._train_micro_batch,
-                                "epoch": epoch,
-                            },
-                        )
-                    next_gen_micro = max(1, self._gen_micro_batch // 2)
-                    next_train_micro = max(1, self._train_micro_batch // 2)
-                    if (
-                        next_gen_micro == self._gen_micro_batch
-                        and next_train_micro == self._train_micro_batch
-                    ):
-                        logger.info(
-                            "\n[OOM] Unable to recover at minimum micro-batches (gen=%s, train=%s).",
-                            self._gen_micro_batch,
-                            self._train_micro_batch,
-                        )
-                        self.memory_manager.clear_cache(aggressive=True)
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                        raise
-                    self._oom_backoff_count += 1
-                    self._post_oom_success_batches = 0
-                    self._gen_micro_batch = next_gen_micro
-                    self._train_micro_batch = next_train_micro
-                    if hasattr(self.memory_manager, "enable_checkpointing"):
-                        self.memory_manager.enable_checkpointing(self.model)
-                    logger.info(
-                        f"\n[OOM] Backoff #{self._oom_backoff_count}: gen_batch={self._gen_micro_batch}, train_batch={self._train_micro_batch}"
-                    )
-                    self.memory_manager.clear_cache(aggressive=True)
-                    torch.cuda.empty_cache()
-                    gc.collect()
+            metrics = self._run_training_step_with_oom_recovery(batch, epoch)
 
             epoch_metrics.append(metrics)
-
-            if self._oom_backoff_count > 0:
-                self._post_oom_success_batches += 1
-                if self._post_oom_success_batches >= 50:
-                    self._gen_micro_batch = min(4, self._gen_micro_batch + 1)
-                    self._train_micro_batch = min(4, self._train_micro_batch + 1)
-                    self._oom_backoff_count = max(0, self._oom_backoff_count - 1)
-                    self._post_oom_success_batches = 0
+            self._record_successful_recovery_batch()
 
             vram_info = self.memory_manager.get_memory_stats()
             vram_str = (
@@ -2138,15 +2916,49 @@ class GRPOTrainerLoop:
         self.current_epoch = info.get("epoch", 0)
         self.optimizer_step = info.get("optimizer_step", 0)
         saved_accumulation_batches = info.get("accumulation_batches", 0)
+        replay_pending = bool(
+            info.get(
+                "partial_accumulation_replay_pending",
+                saved_accumulation_batches > 0,
+            )
+        )
         self._accumulation_batches = 0
+        self._training_step_in_progress = False
         self._dataloader_seed = info.get("dataloader_seed", self._dataloader_seed)
+        self._restore_adaptive_recovery_state(info.get("adaptive_recovery_state"))
         self._resume_step = self.global_step
         self._resume_epoch = self.current_epoch
-        if saved_accumulation_batches:
-            replay_step = max(0, loaded_step - saved_accumulation_batches)
+        if replay_pending:
+            replay_step = max(
+                0,
+                int(
+                    info.get(
+                        "partial_accumulation_replay_step",
+                        loaded_step - saved_accumulation_batches,
+                    )
+                ),
+            )
+            replay_recovery_state = info.get("adaptive_recovery_replay_state")
+            if isinstance(replay_recovery_state, dict):
+                self._restore_adaptive_recovery_state(replay_recovery_state)
+            else:
+                logger.warning(
+                    "[Resume] Checkpoint missing replay-safe adaptive recovery state; clearing probe progress before replay."
+                )
+                self._reset_probe_progress()
+            replay_rng_state = info.get("adaptive_recovery_replay_rng_state")
+            if not self._restore_serialized_rng_state(replay_rng_state):
+                logger.warning(
+                    "[Resume] Checkpoint missing replay-safe RNG state; replayed stochastic batches may diverge after resume."
+                )
             self.global_step = replay_step
             self.current_step = replay_step
             self._resume_step = replay_step
+            self._partial_accumulation_replay_step = replay_step
+            self._partial_accumulation_recovery_state = (
+                self._serialize_adaptive_recovery_state()
+            )
+            self._partial_accumulation_rng_state = self._serialize_rng_state()
             logger.warning(
                 "[Resume] Discarding %d partially accumulated batches because gradient buffers are not checkpointed; rewinding replay step from %d to %d.",
                 saved_accumulation_batches,
@@ -2155,11 +2967,23 @@ class GRPOTrainerLoop:
             )
             if self.optimizer is not None:
                 self.optimizer.zero_grad(set_to_none=True)
+        else:
+            if not self._restore_serialized_rng_state(info.get("rng_state")):
+                logger.warning(
+                    "[Resume] Checkpoint missing RNG state; stochastic behavior after resume may diverge from an uninterrupted run."
+                )
+            self._partial_accumulation_replay_step = self.global_step
+            self._partial_accumulation_recovery_state = (
+                self._serialize_adaptive_recovery_state()
+            )
+            self._partial_accumulation_rng_state = self._serialize_rng_state()
 
         logger.info(
-            "[Resume] Loaded checkpoint at step %d, epoch %d.",
+            "[Resume] Loaded checkpoint at step %d, epoch %d (gen_micro_batch=%d, train_micro_batch=%d).",
             self.global_step,
             self.current_epoch,
+            self._gen_micro_batch,
+            self._train_micro_batch,
         )
         return info
 
@@ -2167,8 +2991,10 @@ class GRPOTrainerLoop:
         """Save training checkpoint."""
         if self.checkpoint_manager is None:
             return
-        
+
         checkpoint_name = f"checkpoint_step_{self.global_step}{suffix}.pt"
+        current_rng_state = self._serialize_rng_state()
+        replay_pending = self._training_step_in_progress or self._accumulation_batches > 0
 
         self.checkpoint_manager.save_checkpoint(
             model=self.model,
@@ -2181,6 +3007,24 @@ class GRPOTrainerLoop:
                 "optimizer_step": self.optimizer_step,
                 "accumulation_batches": self._accumulation_batches,
                 "dataloader_seed": self._dataloader_seed,
+                "rng_state": current_rng_state,
+                "adaptive_recovery_state": self._serialize_adaptive_recovery_state(),
+                "partial_accumulation_replay_pending": replay_pending,
+                "partial_accumulation_replay_step": (
+                    self._partial_accumulation_replay_step
+                    if replay_pending
+                    else self.global_step
+                ),
+                "adaptive_recovery_replay_state": (
+                    self._partial_accumulation_recovery_state
+                    if replay_pending
+                    else self._serialize_adaptive_recovery_state()
+                ),
+                "adaptive_recovery_replay_rng_state": (
+                    self._partial_accumulation_rng_state
+                    if replay_pending
+                    else current_rng_state
+                ),
             },
         )
 

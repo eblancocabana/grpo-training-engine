@@ -153,6 +153,14 @@ class TrainingConfig:
     use_triton_lora: bool = True
     triton_lora_prefer_base: bool = False
     clear_cache_frequency: int = 50
+    generation_micro_batch: int = 4
+    training_micro_batch: int = 4
+    max_generation_micro_batch: int = 4
+    max_training_micro_batch: int = 4
+    oom_backoff_factor: float = 0.5
+    micro_batch_probe_interval: int = 12
+    micro_batch_probe_cooldown: int = 4
+    micro_batch_probe_usage_threshold: float = 0.75
 
     # Logging
     log_interval: int = 10
@@ -267,6 +275,14 @@ def get_8gb_vram_config() -> Config:
     config.training.max_prompt_length = 4096
     config.training.max_response_length = 768
     config.training.clear_cache_frequency = 50
+    config.training.generation_micro_batch = 4
+    config.training.training_micro_batch = 4
+    config.training.max_generation_micro_batch = 4
+    config.training.max_training_micro_batch = 4
+    config.training.oom_backoff_factor = 0.5
+    config.training.micro_batch_probe_interval = 12
+    config.training.micro_batch_probe_cooldown = 4
+    config.training.micro_batch_probe_usage_threshold = 0.75
 
     # WandB settings
     config.wandb.enabled = True

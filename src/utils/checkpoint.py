@@ -172,7 +172,17 @@ class CheckpointManager:
             'epoch': checkpoint.get('epoch', 0),
             'metrics': checkpoint.get('metrics', {}),
         }
-        for key in ("optimizer_step", "accumulation_batches", "dataloader_seed"):
+        for key in (
+            "optimizer_step",
+            "accumulation_batches",
+            "dataloader_seed",
+            "rng_state",
+            "partial_accumulation_replay_pending",
+            "partial_accumulation_replay_step",
+            "adaptive_recovery_state",
+            "adaptive_recovery_replay_state",
+            "adaptive_recovery_replay_rng_state",
+        ):
             if key in checkpoint:
                 info[key] = checkpoint[key]
         
@@ -208,10 +218,11 @@ class CheckpointManager:
         param = next(model.parameters(), None)
         if param is None:
             return
-        device = param.device
-        for state in optimizer.state.values():
+        fallback_device = param.device
+        for state_key, state in optimizer.state.items():
+            target_device = getattr(state_key, "device", fallback_device)
             for key, value in list(state.items()):
-                state[key] = cls._move_value_to_device(value, device)
+                state[key] = cls._move_value_to_device(value, target_device)
     
     def load_lora_weights(
         self,

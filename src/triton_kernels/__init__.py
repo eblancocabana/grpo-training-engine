@@ -2,9 +2,10 @@ from __future__ import annotations
 
 # pyright: reportMissingTypeStubs=false
 
+from contextlib import contextmanager
 from importlib import import_module
 import math
-from typing import Callable, Protocol, cast
+from typing import Callable, Protocol, Sequence, cast
 
 import torch
 
@@ -149,12 +150,176 @@ def _paged_kv_decode_torch(
     **kwargs: object,
 ) -> object:
     model_typed = cast(_GeneratorLike, model)
-    return model_typed.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        **kwargs,
+    input_ids_t = cast(torch.Tensor, input_ids)
+    attention_mask_t = (
+        cast(torch.Tensor, attention_mask) if attention_mask is not None else None
     )
+    seed = cast(int | None, kwargs.pop("seed", None))
+    seeds = cast(Sequence[int] | None, kwargs.pop("seeds", None))
+    kwargs.pop("block_size", None)
+
+    @contextmanager
+    def _fork_generation_rng(
+        tensor: torch.Tensor, generation_seed: int | None
+    ):
+        if generation_seed is None:
+            yield
+            return
+        devices = (
+            list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        )
+        with torch.random.fork_rng(devices=devices):
+            torch.default_generator.manual_seed(int(generation_seed))
+            for device_idx in devices:
+                with torch.cuda.device(device_idx):
+                    torch.cuda.manual_seed(int(generation_seed))
+            yield
+
+    def _resolve_pad_token_id() -> int:
+        candidate = kwargs.get("pad_token_id")
+        if isinstance(candidate, int):
+            return candidate
+        for attr_name in ("generation_config", "config"):
+            config_obj = getattr(model_typed, attr_name, None)
+            config_pad_token_id = getattr(config_obj, "pad_token_id", None)
+            if isinstance(config_pad_token_id, int):
+                return config_pad_token_id
+        candidate = kwargs.get("eos_token_id")
+        if isinstance(candidate, int):
+            return candidate
+        for attr_name in ("generation_config", "config"):
+            config_obj = getattr(model_typed, attr_name, None)
+            config_eos_token_id = getattr(config_obj, "eos_token_id", None)
+            if isinstance(config_eos_token_id, int):
+                return config_eos_token_id
+        return 0
+
+    def _pad_generated_rows(rows: Sequence[torch.Tensor], pad_token_id: int) -> torch.Tensor:
+        if not rows:
+            return torch.empty((0, 0), dtype=input_ids_t.dtype, device=input_ids_t.device)
+        max_width = max(int(row.shape[-1]) for row in rows)
+        padded_rows = []
+        for row in rows:
+            row_2d = row if row.ndim == 2 else row.unsqueeze(0)
+            if row_2d.shape[1] == max_width:
+                padded_rows.append(row_2d)
+                continue
+            padded = torch.full(
+                (row_2d.shape[0], max_width),
+                pad_token_id,
+                dtype=row_2d.dtype,
+                device=row_2d.device,
+            )
+            padded[:, : row_2d.shape[1]] = row_2d
+            padded_rows.append(padded)
+        return torch.cat(padded_rows, dim=0)
+
+    def _merge_generation_rows(rows: Sequence[object | None], pad_token_id: int) -> object:
+        if not rows:
+            return rows
+
+        non_none_rows = [row for row in rows if row is not None]
+        if not non_none_rows:
+            return None
+
+        first_row = non_none_rows[0]
+        if torch.is_tensor(first_row):
+            reference = cast(torch.Tensor, first_row)
+            tensor_rows: list[torch.Tensor] = []
+            for row in rows:
+                if row is None:
+                    fill_value = 0.0 if reference.is_floating_point() else pad_token_id
+                    tensor_rows.append(
+                        torch.full(
+                            reference.shape,
+                            fill_value,
+                            dtype=reference.dtype,
+                            device=reference.device,
+                        )
+                    )
+                    continue
+                tensor_rows.append(cast(torch.Tensor, row))
+            return _pad_generated_rows(
+                tensor_rows, pad_token_id
+            )
+        if first_row is None:
+            return None
+        if isinstance(first_row, tuple):
+            max_len = max(len(cast(tuple[object, ...], row)) for row in non_none_rows)
+            merged_items = [
+                _merge_generation_rows(
+                    [
+                        row[idx]
+                        if row is not None and idx < len(cast(tuple[object, ...], row))
+                        else None
+                        for row in rows
+                    ],
+                    pad_token_id,
+                )
+                for idx in range(max_len)
+            ]
+            if hasattr(first_row, "_fields"):
+                return type(first_row)(*merged_items)
+            return tuple(merged_items)
+        if isinstance(first_row, list):
+            max_len = max(len(cast(list[object], row)) for row in non_none_rows)
+            return [
+                _merge_generation_rows(
+                    [
+                        row[idx]
+                        if row is not None and idx < len(cast(list[object], row))
+                        else None
+                        for row in rows
+                    ],
+                    pad_token_id,
+                )
+                for idx in range(max_len)
+            ]
+
+        keys = getattr(first_row, "keys", None)
+        if callable(keys):
+            merged_payload = {
+                key: _merge_generation_rows([row[key] for row in rows], pad_token_id)
+                for key in first_row.keys()
+            }
+            try:
+                return type(first_row)(**merged_payload)
+            except TypeError:
+                return merged_payload
+
+        return first_row
+
+    if seeds is not None:
+        if len(seeds) != input_ids_t.shape[0]:
+            raise ValueError(
+                f"Expected {input_ids_t.shape[0]} generation seeds, received {len(seeds)}."
+            )
+        pad_token_id = _resolve_pad_token_id()
+        rows: list[object] = []
+        for row_idx, row_seed in enumerate(seeds):
+            row_input_ids = input_ids_t[row_idx : row_idx + 1]
+            row_attention_mask = (
+                attention_mask_t[row_idx : row_idx + 1]
+                if attention_mask_t is not None
+                else None
+            )
+            with _fork_generation_rng(row_input_ids, int(row_seed)):
+                generated = model_typed.generate(
+                    input_ids=row_input_ids,
+                    attention_mask=row_attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    **kwargs,
+                )
+            rows.append(generated)
+        return _merge_generation_rows(rows, pad_token_id)
+
+    with _fork_generation_rng(input_ids_t, seed):
+        return model_typed.generate(
+            input_ids=input_ids_t,
+            attention_mask=attention_mask_t,
+            max_new_tokens=max_new_tokens,
+            **kwargs,
+        )
 
 
 def _fused_grpo_loss_torch(*args: object, **kwargs: object) -> object:
@@ -254,19 +419,19 @@ def paged_kv_decode(
     attention_mask_t = (
         cast(torch.Tensor, attention_mask) if attention_mask is not None else None
     )
+    low_level_args = [
+        "k_cache",
+        "v_cache",
+        "block_tables",
+        "context_lens",
+        "qkv_proj_fn",
+        "logits_fn",
+    ]
 
     def _getattr(obj: object, name: str) -> object | None:
         return cast(object | None, getattr(obj, name, None))
 
     if kernel is not None:
-        low_level_args = [
-            "k_cache",
-            "v_cache",
-            "block_tables",
-            "context_lens",
-            "qkv_proj_fn",
-            "logits_fn",
-        ]
         has_low_level = all(arg in kwargs for arg in low_level_args)
         if has_low_level:
             return kernel(
@@ -283,6 +448,8 @@ def paged_kv_decode(
                 top_p=cast(float, kwargs.pop("top_p", 1.0)),
                 pad_token_id=cast(int | None, kwargs.pop("pad_token_id", None)),
                 eos_token_id=cast(int | None, kwargs.pop("eos_token_id", None)),
+                seed=cast(int | None, kwargs.pop("seed", None)),
+                seeds=cast(Sequence[int] | None, kwargs.pop("seeds", None)),
                 attention_mask=attention_mask_t,
                 use_cache=cast(bool | None, kwargs.pop("use_cache", None)),
                 **kwargs,
@@ -320,6 +487,11 @@ def paged_kv_decode(
             pad_token_id=cast(int, kwargs.pop("pad_token_id", 0)),
             eos_token_id=cast(int | None, kwargs.pop("eos_token_id", None)),
             seed=cast(int | None, kwargs.pop("seed", None)),
+            seeds=cast(Sequence[int] | None, kwargs.pop("seeds", None)),
+        )
+    if any(arg in kwargs for arg in low_level_args):
+        raise RuntimeError(
+            "Low-level paged_kv_decode fallback requires Triton; raw cache decoding is unavailable without Triton."
         )
     _warn_fallback("paged_kv_decode")
     return _paged_kv_decode_torch(

@@ -16,7 +16,7 @@ from __future__ import annotations
 # pyright: reportIndexIssue=false
 
 import torch
-from typing import cast
+from typing import Sequence, cast
 
 try:
     import triton
@@ -242,7 +242,7 @@ def fused_logits_sampling(
     do_sample: bool,
     temperature: float,
     top_p: float,
-    generator: torch.Generator | None,
+    generator: torch.Generator | Sequence[torch.Generator] | None,
     eos_token_id: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = lm_head(hidden)
@@ -262,7 +262,22 @@ def fused_logits_sampling(
         scaled = scaled.scatter(dim=-1, index=sorted_indices, src=sorted_logits)
 
     probs = torch.softmax(scaled, dim=-1)
-    next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+    if isinstance(generator, Sequence):
+        if len(generator) != probs.shape[0]:
+            raise ValueError(
+                f"Expected {probs.shape[0]} sampling generators, received {len(generator)}."
+            )
+        next_tokens = torch.stack(
+            [
+                torch.multinomial(probs[row_idx], num_samples=1, generator=row_generator)
+                for row_idx, row_generator in enumerate(generator)
+            ],
+            dim=0,
+        ).squeeze(-1)
+    else:
+        next_tokens = torch.multinomial(
+            probs, num_samples=1, generator=generator
+        ).squeeze(-1)
     if eos_token_id is not None:
         _ = eos_token_id
     return logits, next_tokens

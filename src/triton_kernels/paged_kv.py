@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, TYPE_CHECKING, Protocol, cast
+from typing import Callable, Optional, Sequence, Tuple, TYPE_CHECKING, Protocol, cast
 import math
 
 import torch
@@ -559,7 +559,7 @@ def _sample_tokens(
     do_sample: bool,
     temperature: float,
     top_p: float,
-    generator: Optional[torch.Generator],
+    generator: Optional[torch.Generator | Sequence[torch.Generator]],
 ) -> torch.Tensor:
     if not do_sample or temperature <= 0.0:
         return torch.argmax(logits, dim=-1)
@@ -576,12 +576,45 @@ def _sample_tokens(
             torch.finfo(sorted_logits.dtype).min,
         )
         sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        sampled_sorted = torch.multinomial(
-            sorted_probs, num_samples=1, generator=generator
-        )
+        if isinstance(generator, Sequence):
+            if len(generator) != sorted_probs.shape[0]:
+                raise ValueError(
+                    f"Expected {sorted_probs.shape[0]} sampling generators, received {len(generator)}."
+                )
+            sampled_sorted = torch.stack(
+                [
+                    torch.multinomial(
+                        sorted_probs[row_idx],
+                        num_samples=1,
+                        generator=row_generator,
+                    )
+                    for row_idx, row_generator in enumerate(generator)
+                ],
+                dim=0,
+            )
+        else:
+            sampled_sorted = torch.multinomial(
+                sorted_probs, num_samples=1, generator=generator
+            )
         return sorted_indices.gather(dim=-1, index=sampled_sorted).squeeze(-1)
 
     probs = torch.softmax(scaled, dim=-1)
+    if isinstance(generator, Sequence):
+        if len(generator) != probs.shape[0]:
+            raise ValueError(
+                f"Expected {probs.shape[0]} sampling generators, received {len(generator)}."
+            )
+        return torch.stack(
+            [
+                torch.multinomial(
+                    probs[row_idx],
+                    num_samples=1,
+                    generator=row_generator,
+                )
+                for row_idx, row_generator in enumerate(generator)
+            ],
+            dim=0,
+        ).squeeze(-1)
     return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
 
@@ -1212,6 +1245,7 @@ def decode_from_paged_kv_cache(
     pad_token_id: int,
     eos_token_id: Optional[int],
     seed: Optional[int],
+    seeds: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """Decode from a prefetched paged KV cache state."""
     if not TRITON_AVAILABLE:
@@ -1258,8 +1292,18 @@ def decode_from_paged_kv_cache(
         device=state.k_cache.device,
         dtype=state.last_tokens.dtype,
     )
-    generator = None
-    if seed is not None:
+    generator: torch.Generator | list[torch.Generator] | None = None
+    if seeds is not None:
+        if len(seeds) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} decode seeds, received {len(seeds)}."
+            )
+        generator = []
+        for row_seed in seeds:
+            row_generator = torch.Generator(device=state.k_cache.device)
+            row_generator.manual_seed(int(row_seed))
+            generator.append(row_generator)
+    elif seed is not None:
         generator = torch.Generator(device=state.k_cache.device)
         generator.manual_seed(seed)
     generated_steps = 0
@@ -1418,6 +1462,7 @@ def paged_kv_decode_model(
     pad_token_id: int,
     eos_token_id: Optional[int],
     seed: Optional[int],
+    seeds: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     prefix_state = prefill_paged_kv_cache(
         model,
@@ -1436,6 +1481,7 @@ def paged_kv_decode_model(
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
         seed=seed,
+        seeds=seeds,
     )
 
 
@@ -1455,6 +1501,7 @@ def paged_kv_decode(
     eos_token_id: Optional[int] = None,
     pad_token_id: Optional[int] = None,
     seed: Optional[int] = None,
+    seeds: Optional[Sequence[int]] = None,
     attention_mask: Optional[torch.Tensor] = None,
     use_cache: Optional[bool] = None,
 ) -> torch.Tensor:
@@ -1489,8 +1536,18 @@ def paged_kv_decode(
         dtype=input_ids.dtype,
     )
 
-    generator = None
-    if seed is not None:
+    generator: torch.Generator | list[torch.Generator] | None = None
+    if seeds is not None:
+        if len(seeds) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} decode seeds, received {len(seeds)}."
+            )
+        generator = []
+        for row_seed in seeds:
+            row_generator = torch.Generator(device=input_ids.device)
+            row_generator.manual_seed(int(row_seed))
+            generator.append(row_generator)
+    elif seed is not None:
         generator = torch.Generator(device=input_ids.device)
         generator.manual_seed(seed)
 
