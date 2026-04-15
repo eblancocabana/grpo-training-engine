@@ -1,0 +1,104 @@
+{
+  "model": {
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "load_in_4bit": true,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_use_double_quant": true,
+    "attn_implementation": "sdpa"
+  },
+  "lora": {
+    "rank": 16,
+    "alpha": 32,
+    "dropout": 0.0,
+    "adapter_quantization": "8bit",
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ]
+  },
+  "grpo": {
+    "group_size": 4,
+    "clip_epsilon": 0.2,
+    "epsilon_high": 0.3,
+    "delta": 1.5,
+    "kl_coef": 0.1,
+    "use_kl": false,
+    "mask_truncated_completions": true,
+    "length_penalty_coef": 0.001
+  },
+  "entropy": {
+    "use_entropy_mask": true,
+    "threshold": null,
+    "percentile": 0.5,
+    "min_tokens": 10
+  },
+  "training": {
+    "dataset_name": "gsm8k",
+    "max_prompt_length": 128,
+    "max_response_length": 1024,
+    "verbosity": 0,
+    "num_epochs": 3,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 16,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "warmup_steps": 100,
+    "max_grad_norm": 1.0,
+    "optimizer_type": "adamw",
+    "scheduler_type": "cosine",
+    "enable_gradient_checkpointing": true,
+    "checkpointing_strategy": "vram_auto",
+    "checkpointing_layer_name_patterns": [],
+    "checkpointing_layer_types": [],
+    "checkpointing_vram_enable_threshold": 0.82,
+    "checkpointing_vram_disable_threshold": 0.72,
+    "checkpointing_update_interval_steps": 10,
+    "use_triton_kernels": false,
+    "triton_lora_prefer_base": false,
+    "clear_cache_frequency": 50,
+    "log_interval": 10,
+    "eval_interval": 100,
+    "save_interval": 500,
+    "profile_enabled": false,
+    "log_metrics_jsonl": false,
+    "metrics_jsonl_path": null,
+    "generation_temperature": 0.7,
+    "generation_top_p": 0.9,
+    "generation_do_sample": true,
+    "max_steps": 20,
+    "output_dir": "benchmarks/output/ing_inf/triton_off_current",
+    "checkpoint_dir": null,
+    "log_dir": "benchmarks/output/ing_inf/triton_off_current/logs",
+    "skip_initial_benchmark": true
+  },
+  "wandb": {
+    "enabled": true,
+    "project": "grpo-training",
+    "entity": null,
+    "run_name": "INF-triton_off_current",
+    "tags": [
+      "baseline",
+      "triton_off",
+      "ing_inf",
+      "benchmark"
+    ],
+    "notes": "GRPO training with entropy-aware selective backpropagation",
+    "log_frequency": 1,
+    "log_gradients": false,
+    "log_model": true,
+    "implementation": "python"
+  },
+  "sent": {
+    "enabled": true,
+    "num_samples": 4,
+    "temperature": 1.0,
+    "cache_path": "data/cache/gsm8k_sent_sorted.pt",
+    "checkpoint_interval": 100,
+    "curriculum_stages": 2,
+    "resume_from_checkpoint": true,
+    "seed": null
+  }
+}

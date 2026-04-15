@@ -1,0 +1,103 @@
+[INFO][grpo.main] ============================================================
+[INFO][grpo.main] System Check for RTX 3060 Ti
+[INFO][grpo.main] ============================================================
+[INFO][grpo.main] GPU: NVIDIA GeForce RTX 3060 Ti
+[INFO][grpo.main] VRAM: 7.7 GB
+[INFO][grpo.main] CUDA Version: 12.8
+[INFO][grpo.main] PyTorch Version: 2.9.1+cu128
+[INFO][grpo.main] ============================================================
+[INFO][grpo.main] Loading 8GB VRAM optimized configuration...
+[INFO][grpo.main] Training Configuration:
+[INFO][grpo.main]   Model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+[INFO][grpo.main]   LoRA Rank: 16
+[INFO][grpo.main]   LoRA Alpha: 32
+[INFO][grpo.main]   Group Size: 4
+[INFO][grpo.main]   Clip Epsilon: 0.2
+[INFO][grpo.main]   Epsilon High: 0.3
+[INFO][grpo.main]   Delta (safety cap): 1.5
+[INFO][grpo.main]   Mask Truncated: True
+[INFO][grpo.main]   Learning Rate: 0.0001
+[INFO][grpo.main]   Epochs: 3
+[INFO][grpo.main]   Gradient Accumulation: 2
+[INFO][grpo.main]   Entropy Mask: True
+[INFO][grpo.main]   Triton Kernels: False
+[INFO][grpo.main]   Max Prompt Length: 128
+[INFO][grpo.main]   Max Response Length: 1024
+[INFO][grpo.main]   Output Directory: benchmarks/output/ing_inf/triton_off_grad_accum_2
+[INFO][grpo.main]   WandB Enabled: True
+[INFO][grpo.main]   Profiler Enabled: False
+[INFO][grpo.main]   Metrics JSONL: False
+[INFO][grpo.main]   WandB Project: grpo-training
+[INFO][grpo.main]   WandB Implementation: python
+[INFO][grpo.main] Initializing trainer...
+[INFO][grpo.trainer] ============================================================
+[INFO][grpo.trainer] GRPO Training Engine - 8GB VRAM Optimized
+[INFO][grpo.trainer] ============================================================
+[INFO][grpo.trainer] 
+[Setup] Loading model and tokenizer...
+[INFO][grpo.core.model_loader] Loading model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B...
+[INFO][grpo.core.model_loader] Model loaded to: cuda:0
+[INFO][grpo.trainer] 
+[Setup] Injecting LoRA layers...
+[INFO][grpo.core.lora] Total LoRA layers injected: 112
+[INFO][grpo.core.lora] Trainable parameters: 4,358,144
+[INFO][grpo.core.memory_manager] Model with LoRA Memory Usage:
+[INFO][grpo.core.memory_manager]   Total parameters: 1,126,348,288
+[INFO][grpo.core.memory_manager]   Trainable parameters: 4,358,144 (0.39%)
+[INFO][grpo.core.memory_manager]   Estimated memory: 0.53 GB
+[INFO][grpo.trainer] 
+[Setup] Optimizing 224 LoRA parameter tensors
+[INFO][grpo.core.memory_manager] Gradient checkpointing disabled (vram_auto).
+[INFO][grpo.grpo.benchmark] Loading GSM8K test split for benchmark...
+[INFO][grpo.data.gsm8k] Loading GSM8K test split for GRPO...
+[INFO][grpo.data.gsm8k] Loaded 1319 examples
+[INFO][grpo.grpo.benchmark] Initialized GSM8K Benchmark with 50 samples from test split
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/ndk/.netrc.
+wandb: Currently logged in as: e-blanco (e-blanco-universidad-de-deusto) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run 340vagc6
+wandb: Tracking run with wandb version 0.24.2
+wandb: Run data is saved locally in /home/ndk/proyectos/clase/pfg/wandb/run-20260408_183135-340vagc6
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run INF-triton_off_grad_accum_2
+wandb: ⭐️ View project at https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training
+wandb: 🚀 View run at https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training/runs/340vagc6
+[INFO][grpo.trainer] [WandB] Initialized run: INF-triton_off_grad_accum_2
+[INFO][grpo.trainer] [WandB] Project: grpo-training
+wandb: WARNING The get_url method is deprecated and will be removed in a future release. Please use `run.url` instead.
+[INFO][grpo.trainer] [WandB] URL: https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training/runs/340vagc6
+[INFO][grpo.trainer] 
+[Setup] Complete!
+[INFO][grpo.core.memory_manager] [Setup] VRAM: 1.58GB / 7.66GB (29.4%) | Free: 5.40GB
+[INFO][grpo.trainer] 
+[Train] Creating dataloader...
+[INFO][grpo.data.gsm8k] Loading GSM8K train split for GRPO...
+[INFO][grpo.data.gsm8k] Loaded 7473 examples
+[WARNING][grpo.data.gsm8k] Config hash mismatch: cache=431b974c4ba65f60611fd211fb2fc0a1699d7df4233ae39d25da2d75497ee8f4, current=d01c597d8728895af6efb348b82cfdf9da258c4127631ff7420475dded933f07
+[INFO][grpo.data.gsm8k] [SENT] Curriculum Learning enabled
+[INFO][grpo.data.gsm8k] [SENT] Cache loaded from: data/cache/gsm8k_sent_sorted.pt
+[INFO][grpo.data.gsm8k] [SENT] Total sorted samples: 7473
+[INFO][grpo.data.gsm8k] [SENT] Curriculum stages: 2 (Current: 1)
+[INFO][grpo.trainer] [SENT] Training on stage 1/2 (samples 0-3736)
+[INFO][grpo.trainer] [Train] Starting training for 3 epochs...
+[INFO][grpo.trainer] [Train] Steps per epoch: ~3736
+[INFO][grpo.trainer] [Train] Gradient accumulation: 2
+[INFO][grpo.trainer] [Train] Effective batch size: 2
+[INFO][grpo.utils.checkpoint] Saved config to benchmarks/output/ing_inf/triton_off_grad_accum_2/config.json
+[INFO][grpo.trainer] [Benchmark] Initial benchmark skipped by configuration.
+Epoch 1:   0%|          | 0/3736 [00:00<?, ?it/s]/home/ndk/.conda/envs/grpo-3060ti/lib/python3.10/site-packages/bitsandbytes/autograd/_functions.py:123: UserWarning: MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization
+  warnings.warn(f"MatMul8bitLt: inputs will be cast from {A.dtype} to float16 during quantization")
+                                                 [INFO][grpo.trainer] 
+[OOM] Backoff #1: gen_batch=2, train_batch=2
+Epoch 1:   0%|          | 0/3736 [00:49<?, ?it/s]Epoch 1:   0%|          | 1/3736 [00:50<52:11:57, 50.31s/it]Epoch 1:   0%|          | 1/3736 [01:47<52:11:57, 50.31s/it, loss=0.0216, reward=0.724, tokens_per_sec=19.308, vram=4.5GB, step=1]Epoch 1:   0%|          | 2/3736 [01:47<56:20:43, 54.32s/it, loss=0.0216, reward=0.724, tokens_per_sec=19.308, vram=4.5GB, step=1]                                                                                                                                  [INFO][grpo.trainer] 
+[OOM] Backoff #2: gen_batch=1, train_batch=1
+Epoch 1:   0%|          | 2/3736 [05:13<56:20:43, 54.32s/it, loss=0.0216, reward=0.724, tokens_per_sec=19.308, vram=4.5GB, step=1]Epoch 1:   0%|          | 3/3736 [05:13<128:16:12, 123.70s/it, loss=0.0216, reward=0.724, tokens_per_sec=19.308, vram=4.5GB, step=1]Epoch 1:   0%|          | 3/3736 [06:53<128:16:12, 123.70s/it, loss=0.0500, reward=0.731, tokens_per_sec=10.807, vram=3.2GB, step=2]Epoch 1:   0%|          | 4/3736 [06:53<118:21:31, 114.17s/it, loss=0.0500, reward=0.731, tokens_per_sec=10.807, vram=3.2GB, step=2]Epoch 1:   0%|          | 4/3736 [09:00<118:21:31, 114.17s/it, loss=0.5821, reward=0.653, tokens_per_sec=10.893, vram=3.6GB, step=3]Epoch 1:   0%|          | 5/3736 [09:00<123:14:40, 118.92s/it, loss=0.5821, reward=0.653, tokens_per_sec=10.893, vram=3.6GB, step=3]                                                                                                                                    [WARNING][grpo.core.memory_manager] High VRAM usage detected!
+Epoch 1:   0%|          | 5/3736 [12:28<123:14:40, 118.92s/it, loss=0.5821, reward=0.653, tokens_per_sec=10.893, vram=3.6GB, step=3]                                                                                                                                    [INFO][grpo.core.memory_manager]  VRAM: 6.23GB / 7.66GB (90.6%) | Free: 0.72GB
+Epoch 1:   0%|          | 5/3736 [12:28<123:14:40, 118.92s/it, loss=0.5821, reward=0.653, tokens_per_sec=10.893, vram=3.6GB, step=3]Epoch 1:   0%|          | 5/3736 [12:28<123:14:40, 118.92s/it, loss=-10.6190, reward=0.432, tokens_per_sec=10.918, vram=3.8GB, step=4]Epoch 1:   0%|          | 6/3736 [12:28<154:41:45, 149.30s/it, loss=-10.6190, reward=0.432, tokens_per_sec=10.918, vram=3.8GB, step=4]Epoch 1:   0%|          | 6/3736 [14:32<154:41:45, 149.30s/it, loss=0.0367, reward=0.666, tokens_per_sec=10.800, vram=3.4GB, step=5]  Epoch 1:   0%|          | 7/3736 [14:32<145:59:13, 140.94s/it, loss=0.0367, reward=0.666, tokens_per_sec=10.800, vram=3.4GB, step=5]Epoch 1:   0%|          | 7/3736 [16:10<145:59:13, 140.94s/it, loss=0.1187, reward=0.734, tokens_per_sec=10.813, vram=3.2GB, step=6]Epoch 1:   0%|          | 8/3736 [16:10<131:51:49, 127.34s/it, loss=0.1187, reward=0.734, tokens_per_sec=10.813, vram=3.2GB, step=6]Epoch 1:   0%|          | 8/3736 [17:54<131:51:49, 127.34s/it, loss=0.0534, reward=0.719, tokens_per_sec=10.804, vram=3.1GB, step=7]Epoch 1:   0%|          | 9/3736 [17:54<124:15:29, 120.02s/it, loss=0.0534, reward=0.719, tokens_per_sec=10.804, vram=3.1GB, step=7]Epoch 1:   0%|          | 9/3736 [20:49<124:15:29, 120.02s/it, loss=0.2642, reward=0.526, tokens_per_sec=10.874, vram=4.1GB, step=8]Epoch 1:   0%|          | 10/3736 [20:49<141:35:11, 136.80s/it, loss=0.2642, reward=0.526, tokens_per_sec=10.874, vram=4.1GB, step=8]Epoch 1:   0%|          | 10/3736 [24:13<141:35:11, 136.80s/it, loss=0.1407, reward=-0.557, tokens_per_sec=10.896, vram=4.3GB, step=9]Epoch 1:   0%|          | 11/3736 [24:13<163:00:48, 157.54s/it, loss=0.1407, reward=-0.557, tokens_per_sec=10.896, vram=4.3GB, step=9]Epoch 1:   0%|          | 11/3736 [26:09<163:00:48, 157.54s/it, loss=0.3368, reward=0.685, tokens_per_sec=10.936, vram=3.4GB, step=10]                                                                                                                                      [INFO][grpo.core.memory_manager] [Step 10] VRAM: 3.40GB / 7.66GB (53.6%) | Free: 3.55GB
+Epoch 1:   0%|          | 11/3736 [26:09<163:00:48, 157.54s/it, loss=0.3368, reward=0.685, tokens_per_sec=10.936, vram=3.4GB, step=10]Epoch 1:   0%|          | 12/3736 [26:09<149:40:50, 144.70s/it, loss=0.3368, reward=0.685, tokens_per_sec=10.936, vram=3.4GB, step=10]Epoch 1:   0%|          | 12/3736 [27:54<149:40:50, 144.70s/it, loss=0.0596, reward=0.714, tokens_per_sec=10.838, vram=3.1GB, step=11]Epoch 1:   0%|          | 13/3736 [27:54<137:22:47, 132.84s/it, loss=0.0596, reward=0.714, tokens_per_sec=10.838, vram=3.1GB, step=11]Epoch 1:   0%|          | 13/3736 [30:33<137:22:47, 132.84s/it, loss=0.3698, reward=0.569, tokens_per_sec=10.860, vram=3.9GB, step=12]Epoch 1:   0%|          | 14/3736 [30:33<145:22:43, 140.61s/it, loss=0.3698, reward=0.569, tokens_per_sec=10.860, vram=3.9GB, step=12]                                                                                                                                      [WARNING][grpo.core.memory_manager] High VRAM usage detected!
+Epoch 1:   0%|          | 14/3736 [36:27<145:22:43, 140.61s/it, loss=0.3698, reward=0.569, tokens_per_sec=10.860, vram=3.9GB, step=12]                                                                                                                                      [INFO][grpo.core.memory_manager]  VRAM: 6.30GB / 7.66GB (91.5%) | Free: 0.65GB
+Epoch 1:   0%|          | 14/3736 [36:27<145:22:43, 140.61s/it, loss=0.3698, reward=0.569, tokens_per_sec=10.860, vram=3.9GB, step=12]Epoch 1:   0%|          | 14/3736 [36:27<145:22:43, 140.61s/it, loss=-20.8751, reward=-0.219, tokens_per_sec=10.937, vram=4.3GB, step=13]Epoch 1:   0%|          | 15/3736 [36:27<211:56:47, 205.05s/it, loss=-20.8751, reward=-0.219, tokens_per_sec=10.937, vram=4.3GB, step=13]Epoch 1:   0%|          | 15/3736 [38:50<211:56:47, 205.05s/it, loss=3.4972, reward=0.611, tokens_per_sec=10.907, vram=4.4GB, step=14]   Epoch 1:   0%|          | 16/3736 [38:50<192:29:04, 186.28s/it, loss=3.4972, reward=0.611, tokens_per_sec=10.907, vram=4.4GB, step=14]Epoch 1:   0%|          | 16/3736 [41:06<192:29:04, 186.28s/it, loss=0.0449, reward=0.631, tokens_per_sec=10.839, vram=3.5GB, step=15]Epoch 1:   0%|          | 17/3736 [41:06<176:52:18, 171.21s/it, loss=0.0449, reward=0.631, tokens_per_sec=10.839, vram=3.5GB, step=15]                                                                                                                                      [WARNING][grpo.core.memory_manager] High VRAM usage detected!
+Epoch 1:   0%|          | 17/3736 [47:21<176:52:18, 171.21s/it, loss=0.0449, reward=0.631, tokens_per_sec=10.839, vram=3.5GB, step=15]                                                                                                                                      [INFO][grpo.core.memory_manager]  VRAM: 6.13GB / 7.66GB (89.3%) | Free: 0.82GB
+Epoch 1:   0%|          | 17/3736 [47:21<176:52:18, 171.21s/it, loss=0.0449, reward=0.631, tokens_per_sec=10.839, vram=3.5GB, step=15]Epoch 1:   0%|          | 17/3736 [47:21<176:52:18, 171.21s/it, loss=0.0000, reward=-1.024, tokens_per_sec=10.918, vram=3.5GB, step=16]Epoch 1:   0%|          | 18/3736 [47:21<240:10:14, 232.55s/it, loss=0.0000, reward=-1.024, tokens_per_sec=10.918, vram=3.5GB, step=16]                                                                                                                                       [WARNING][grpo.core.memory_manager] High VRAM usage detected!
+Epoch 1:   0%|          | 18/3736 [52:17<240:10:14, 232.55s/it, loss=0.0000, reward=-1.024, tokens_per_sec=10.918, vram=3.5GB, step=16]                                                                                                                                       [INFO][grpo.core.memory_manager]  VRAM: 6.23GB / 7.66GB (90.6%) | Free: 0.72GB
+Epoch 1:   0%|          | 18/3736 [52:17<240:10:14, 232.55s/it, loss=0.0000, reward=-1.024, tokens_per_sec=10.918, vram=3.5GB, step=16]Epoch 1:   0%|          | 18/3736 [52:18<240:10:14, 232.55s/it, loss=-1.9013, reward=0.188, tokens_per_sec=10.969, vram=3.7GB, step=17]Epoch 1:   1%|          | 19/3736 [52:18<259:52:14, 251.69s/it, loss=-1.9013, reward=0.188, tokens_per_sec=10.969, vram=3.7GB, step=17]Epoch 1:   1%|          | 19/3736 [54:31<259:52:14, 251.69s/it, loss=0.1811, reward=0.637, tokens_per_sec=10.882, vram=3.7GB, step=18] Epoch 1:   1%|          | 20/3736 [54:31<223:07:22, 216.16s/it, loss=0.1811, reward=0.637, tokens_per_sec=10.882, vram=3.7GB, step=18]Epoch 1:   1%|          | 20/3736 [57:17<223:07:22, 216.16s/it, loss=2.4226, reward=-0.202, tokens_per_sec=10.854, vram=4.0GB, step=19]Epoch 1:   1%|          | 21/3736 [57:17<207:39:00, 201.22s/it, loss=2.4226, reward=-0.202, tokens_per_sec=10.854, vram=4.0GB, step=19]

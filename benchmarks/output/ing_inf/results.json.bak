@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-04-08T10:52:20",
+  "total_runs": 1,
+  "successful_runs": 1,
+  "results": [
+    {
+      "config_name": "triton_on_baseline",
+      "success": true,
+      "duration_s": 2424.3638730049133,
+      "steps_completed": 30,
+      "step_time_avg_s": 67.74333333333335,
+      "step_time_min_s": 25.34,
+      "step_time_max_s": 139.43,
+      "tokens_per_sec": 24.284366666666664,
+      "tokens_per_sec_min": 15.701,
+      "tokens_per_sec_max": 47.363,
+      "vram_peak_gb": 7.7,
+      "vram_avg_gb": 4.6242857142857146,
+      "loss_avg": 2.6712500000000006,
+      "loss_final": -6.6707,
+      "reward_avg": 0.3688666666666667,
+      "reward_final": -0.043,
+      "error_message": null,
+      "oom_events": 1
+    }
+  ]
+}
