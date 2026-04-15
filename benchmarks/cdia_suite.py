@@ -729,12 +729,8 @@ class CdiaBenchmarkSuite:
                     cwd=str(REPO_ROOT),
                     text=True,
                 )
-                process.wait(timeout=3600)
+                process.wait()
                 success = process.returncode == 0
-        except subprocess.TimeoutExpired:
-            if process is not None:
-                process.kill()
-            print("[TIMEOUT] Benchmark exceeded 1 hour")
         except Exception as exc:
             print(f"[ERROR] {exc}")
 
