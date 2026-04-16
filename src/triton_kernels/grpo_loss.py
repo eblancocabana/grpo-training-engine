@@ -246,6 +246,7 @@ def _compute_metrics(
     epsilon_high: float,
     delta: float,
     loss: torch.Tensor,
+    entropy_mask: torch.Tensor | None = None,
 ) -> Dict[str, float]:
     batch_size, seq_len, vocab_size = policy_logits.shape
 
@@ -270,7 +271,7 @@ def _compute_metrics(
     adv_std = advantages.std().item() if advantages.numel() > 1 else 0.0
     ratio_capped_pct = (ratio >= delta).float().mean().item()
 
-    return {
+    metrics = {
         "loss": loss.item(),
         "policy_loss": policy_loss.mean().item(),
         "kl_loss": 0.0,
@@ -279,6 +280,11 @@ def _compute_metrics(
         "ratio_capped_pct": ratio_capped_pct,
         "advantage_std": adv_std,
     }
+
+    if entropy_mask is not None:
+        metrics["selected_tokens_ratio"] = entropy_mask.float().mean().item()
+
+    return metrics
 
 
 def _validate_masks(
@@ -657,6 +663,7 @@ def fused_grpo_loss(
             epsilon_high,
             delta,
             loss,
+            entropy_mask=entropy_mask,
         )
 
     return loss, metrics

@@ -92,6 +92,87 @@ def test_triton_grpo_loss_matches_torch_grpo_loss() -> None:
         )
 
 
+def test_triton_grpo_loss_reports_entropy_mask_metrics() -> None:
+    _skip_if_no_cuda_or_triton()
+
+    _ = torch.manual_seed(321)
+    _ = torch.cuda.manual_seed_all(321)
+    torch.backends.cudnn.deterministic = True
+
+    device = torch.device("cuda")
+    batch_size = 2
+    seq_len = 5
+    vocab_size = 16
+    group_size = 2
+
+    policy_logits = torch.randn(
+        batch_size, seq_len, vocab_size, device=device, dtype=torch.bfloat16
+    )
+    old_policy_logits = torch.randn(
+        batch_size, seq_len, vocab_size, device=device, dtype=torch.float32
+    )
+    target_ids = torch.randint(
+        0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long
+    )
+    advantages = torch.randn(batch_size, device=device, dtype=torch.float32)
+    attention_mask = torch.tensor(
+        [[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]],
+        device=device,
+        dtype=torch.float32,
+    )
+    entropy_mask = torch.tensor(
+        [[0, 1, 1, 0, 0], [1, 0, 1, 1, 0]],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    old_log_probs = -F.cross_entropy(
+        old_policy_logits.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
+        reduction="none",
+    ).view(batch_size, seq_len)
+
+    loss_triton, metrics_triton = fused_grpo_loss(
+        policy_logits=policy_logits,
+        target_ids=target_ids,
+        old_log_probs=old_log_probs,
+        advantages=advantages,
+        clip_epsilon=0.2,
+        epsilon_high=0.3,
+        delta=1.5,
+        group_size=group_size,
+        attention_mask=attention_mask,
+        entropy_mask=entropy_mask,
+    )
+
+    trainer = GRPOTrainer(
+        clip_epsilon=0.2,
+        epsilon_high=0.3,
+        delta=1.5,
+        group_size=group_size,
+        use_kl=False,
+        use_triton_kernels=False,
+    )
+    loss_torch, metrics_torch = trainer.compute_grpo_loss(
+        policy_logits=policy_logits,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        target_ids=target_ids,
+        attention_mask=attention_mask,
+        entropy_mask=entropy_mask,
+    )
+
+    torch.testing.assert_close(loss_triton, loss_torch, rtol=1e-3, atol=1e-3)
+    assert set(metrics_triton.keys()) == set(metrics_torch.keys())
+    assert metrics_triton["selected_tokens_ratio"] == pytest.approx(
+        entropy_mask.mean().item()
+    )
+    for key in metrics_triton:
+        assert metrics_triton[key] == pytest.approx(
+            metrics_torch[key], rel=5e-3, abs=5e-3
+        )
+
+
 def test_triton_grpo_loss_falls_back_for_fp16_logits() -> None:
     _skip_if_no_cuda_or_triton()
 
