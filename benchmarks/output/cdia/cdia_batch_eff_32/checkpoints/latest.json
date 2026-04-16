@@ -1,0 +1,5 @@
+{
+  "latest_checkpoint": "/home/ndk/proyectos/clase/pfg/benchmarks/output/cdia/cdia_batch_eff_32/checkpoints/checkpoint_step_120_final.pt",
+  "step": 120,
+  "epoch": 0
+}
