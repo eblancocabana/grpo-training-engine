@@ -68,6 +68,7 @@ class RolloutStepState:
     response_mask_cpu: torch.Tensor
     rewards_cpu: torch.Tensor
     response_lengths_cpu: torch.Tensor
+    actual_truncation_mask_cpu: torch.Tensor
     truncation_mask_cpu: torch.Tensor
     advantages_cpu: torch.Tensor
     debug_infos: list[dict[str, Any]]
@@ -83,6 +84,7 @@ class PreparedTrainingState:
     advantages: torch.Tensor
     rewards: torch.Tensor
     response_lengths: torch.Tensor
+    actual_truncation_mask: torch.Tensor
     truncation_mask: torch.Tensor
     all_old_log_probs: torch.Tensor
 
@@ -1076,15 +1078,13 @@ class GRPOTrainerLoop:
                         param, memory_format=torch.preserve_format
                     )
 
-    def _compute_truncation_mask(
+    def _compute_actual_truncation_mask(
         self, response_ids: torch.Tensor, response_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Mark completions that should contribute gradient signal."""
+        """Mark completions that ended naturally instead of hitting the length cap."""
         truncation_mask = torch.ones(
             response_ids.shape[0], dtype=torch.float32, device=response_ids.device
         )
-        if not self.config.grpo.mask_truncated_completions:
-            return truncation_mask
 
         eos_id = self.tokenizer.eos_token_id
         for idx in range(response_ids.shape[0]):
@@ -1093,6 +1093,31 @@ class GRPOTrainerLoop:
                 if eos_id not in resp_tokens:
                     truncation_mask[idx] = 0.0
         return truncation_mask
+
+    def _compute_truncation_mask(
+        self, response_ids: torch.Tensor, response_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mark completions that should contribute gradient signal."""
+        actual_truncation_mask = self._compute_actual_truncation_mask(
+            response_ids, response_mask
+        )
+        if self.config.grpo.mask_truncated_completions:
+            return actual_truncation_mask
+        return torch.ones_like(actual_truncation_mask)
+
+    def _build_truncation_observability_metrics(
+        self, actual_truncation_mask: torch.Tensor
+    ) -> Dict[str, float]:
+        """Expose actual truncation and loss-masking policy as separate metrics."""
+        actual_truncated_ratio = 1.0 - actual_truncation_mask.float().mean().item()
+        masking_active = float(self.config.grpo.mask_truncated_completions)
+        return {
+            "actual_truncated_completions_ratio": actual_truncated_ratio,
+            "truncation_masking_active": masking_active,
+            "truncated_completions_masked_out_of_loss_ratio": (
+                actual_truncated_ratio if self.config.grpo.mask_truncated_completions else 0.0
+            ),
+        }
 
     def _calculate_masked_group_advantages(
         self, rewards: torch.Tensor, sample_mask: torch.Tensor
@@ -1768,6 +1793,9 @@ class GRPOTrainerLoop:
             debug_infos=debug_infos,
         )
 
+        actual_truncation_mask = self._compute_actual_truncation_mask(
+            response_ids_cpu, response_mask_cpu
+        ).cpu()
         truncation_mask = self._compute_truncation_mask(
             response_ids_cpu, response_mask_cpu
         ).cpu()
@@ -1782,6 +1810,7 @@ class GRPOTrainerLoop:
             response_mask_cpu=response_mask_cpu,
             rewards_cpu=rewards,
             response_lengths_cpu=response_lengths,
+            actual_truncation_mask_cpu=actual_truncation_mask,
             truncation_mask_cpu=truncation_mask,
             advantages_cpu=advantages,
             debug_infos=list(debug_infos),
@@ -1797,6 +1826,7 @@ class GRPOTrainerLoop:
         response_mask = rollout_state.response_mask_cpu
         rewards = rollout_state.rewards_cpu
         response_lengths = rollout_state.response_lengths_cpu
+        actual_truncation_mask = rollout_state.actual_truncation_mask_cpu
         truncation_mask = rollout_state.truncation_mask_cpu
         advantages = rollout_state.advantages_cpu
 
@@ -1851,6 +1881,7 @@ class GRPOTrainerLoop:
             advantages=advantages,
             rewards=rewards,
             response_lengths=response_lengths,
+            actual_truncation_mask=actual_truncation_mask,
             truncation_mask=truncation_mask,
             all_old_log_probs=all_old_log_probs,
         )
@@ -1992,10 +2023,15 @@ class GRPOTrainerLoop:
         avg_metrics["positive_advantages_ratio"] = (
             (prepared_state.advantages > 0).float().mean().item()
         )
+        avg_metrics.update(
+            self._build_truncation_observability_metrics(
+                prepared_state.actual_truncation_mask
+            )
+        )
 
         if self.config.grpo.mask_truncated_completions:
             avg_metrics["truncated_completions_ratio"] = (
-                1.0 - prepared_state.truncation_mask.mean().item()
+                1.0 - prepared_state.truncation_mask.float().mean().item()
             )
 
         step_time_s = None

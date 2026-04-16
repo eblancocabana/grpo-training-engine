@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1987,3 +1988,72 @@ class TestIntegration:
 
         assert loop._gen_micro_batch == 3
         assert loop._train_micro_batch == 4
+
+
+def test_actual_truncation_detection_is_independent_of_loss_masking():
+    from src.grpo.trainer import GRPOTrainerLoop
+    from src.utils.config import get_8gb_vram_config
+
+    config = get_8gb_vram_config()
+    config.training.max_response_length = 4
+    config.grpo.mask_truncated_completions = False
+
+    loop = GRPOTrainerLoop(config)
+    loop.tokenizer = types.SimpleNamespace(eos_token_id=9)
+
+    response_ids = torch.tensor(
+        [
+            [1, 2, 3, 4],
+            [1, 2, 9, 0],
+        ],
+        dtype=torch.long,
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 1, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    actual_truncation_mask = loop._compute_actual_truncation_mask(
+        response_ids, response_mask
+    )
+    loss_truncation_mask = loop._compute_truncation_mask(response_ids, response_mask)
+
+    torch.testing.assert_close(
+        actual_truncation_mask, torch.tensor([0.0, 1.0], dtype=torch.float32)
+    )
+    torch.testing.assert_close(
+        loss_truncation_mask, torch.tensor([1.0, 1.0], dtype=torch.float32)
+    )
+
+
+def test_truncation_observability_metrics_reflect_actual_ratio_and_policy():
+    from src.grpo.trainer import GRPOTrainerLoop
+    from src.utils.config import get_8gb_vram_config
+
+    config = get_8gb_vram_config()
+    config.grpo.mask_truncated_completions = False
+
+    loop = GRPOTrainerLoop(config)
+    metrics = loop._build_truncation_observability_metrics(
+        torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=torch.float32)
+    )
+
+    assert metrics["actual_truncated_completions_ratio"] == pytest.approx(0.5)
+    assert metrics["truncation_masking_active"] == pytest.approx(0.0)
+    assert metrics["truncated_completions_masked_out_of_loss_ratio"] == pytest.approx(
+        0.0
+    )
+
+    loop.config.grpo.mask_truncated_completions = True
+    metrics = loop._build_truncation_observability_metrics(
+        torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=torch.float32)
+    )
+
+    assert metrics["actual_truncated_completions_ratio"] == pytest.approx(0.5)
+    assert metrics["truncation_masking_active"] == pytest.approx(1.0)
+    assert metrics["truncated_completions_masked_out_of_loss_ratio"] == pytest.approx(
+        0.5
+    )
