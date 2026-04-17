@@ -1,0 +1,322 @@
+{
+  "trainer_steps": 120,
+  "baseline": {
+    "learning_rate": 0.0001,
+    "gradient_accumulation_steps": 4,
+    "group_size": 4,
+    "batch_size": 1,
+    "max_prompt_length": 128,
+    "max_response_length": 1024,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": true,
+    "entropy_mask": true,
+    "entropy_percentile": 0.5,
+    "entropy_min_tokens": 10,
+    "clip_epsilon": 0.2,
+    "epsilon_high": 0.3,
+    "delta": 1.5,
+    "length_penalty_coef": 0.001,
+    "mask_truncated_completions": true,
+    "trainer_steps": 120
+  },
+  "configs": [
+    {
+      "name": "baseline",
+      "family": "baseline",
+      "description": "Reference config inherited unchanged from cdia_suite",
+      "overrides": {},
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.001,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": [
+        "Default finalist screen still uses trainer steps, not matched optimizer updates.",
+        "Compare optimizer_step_final before making stability claims.",
+        "The suite disables SENT with --no-sent to keep finalist checks comparable and fast."
+      ]
+    },
+    {
+      "name": "length_penalty_0",
+      "family": "length_penalty_boundary",
+      "description": "Remove the length penalty entirely",
+      "overrides": {
+        "length_penalty_coef": 0.0
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": []
+    },
+    {
+      "name": "length_penalty_00025",
+      "family": "length_penalty_boundary",
+      "description": "Lower boundary check below the current best penalty",
+      "overrides": {
+        "length_penalty_coef": 0.00025
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.00025,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": [
+        "Tests whether 0.0005 is too strong and a milder penalty improves stability."
+      ]
+    },
+    {
+      "name": "length_penalty_0005",
+      "family": "length_penalty_boundary",
+      "description": "Current best mild length-penalty regime from the reduced CDIA screen",
+      "overrides": {
+        "length_penalty_coef": 0.0005
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": []
+    },
+    {
+      "name": "length_penalty_0005_batch_eff_32",
+      "family": "interaction_batch_size",
+      "description": "Check whether batch_eff_32 stays helpful under the current best penalty",
+      "overrides": {
+        "length_penalty_coef": 0.0005,
+        "gradient_accumulation_steps": 8
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 8,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": [
+        "Uses grad_accum=8, so trainer steps and optimizer updates are not the same as baseline.",
+        "Interpret with optimizer_step_final, not trainer steps alone."
+      ]
+    },
+    {
+      "name": "length_penalty_0005_eps_high_02",
+      "family": "interaction_epsilon_high",
+      "description": "Check whether tighter upper clipping stays helpful under the current best penalty",
+      "overrides": {
+        "length_penalty_coef": 0.0005,
+        "epsilon_high": 0.2
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.2,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": []
+    },
+    {
+      "name": "length_penalty_0_batch_eff_32",
+      "family": "interaction_batch_size",
+      "description": "Check whether batch_eff_32 is still helpful when length penalty is removed",
+      "overrides": {
+        "length_penalty_coef": 0.0,
+        "gradient_accumulation_steps": 8
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 8,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": [
+        "Tests whether the apparent batch-size win depended on the length-penalty regime.",
+        "Interpret with optimizer_step_final, not trainer steps alone."
+      ]
+    },
+    {
+      "name": "length_penalty_0_eps_high_02",
+      "family": "interaction_epsilon_high",
+      "description": "Check whether tighter upper clipping is still helpful with no length penalty",
+      "overrides": {
+        "length_penalty_coef": 0.0,
+        "epsilon_high": 0.2
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.2,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0,
+        "mask_truncated_completions": true,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": []
+    },
+    {
+      "name": "length_penalty_0005_mask_truncated_off",
+      "family": "interaction_truncation_mask",
+      "description": "Check whether disabling truncation masking still helps under the current best penalty",
+      "overrides": {
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": false
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 128,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": false,
+        "trainer_steps": 120
+      },
+      "runnable": true,
+      "blocked_reason": null,
+      "notes": [
+        "Actual truncation incidence is still logged even though truncated samples remain in the loss.",
+        "Compare actual_truncated_completions_ratio against truncated_completions_masked_out_of_loss_ratio."
+      ]
+    }
+  ]
+}
