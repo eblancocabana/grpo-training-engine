@@ -1,0 +1,85 @@
+{
+  "trainer_steps": 240,
+  "benchmark_cadence_trainer_steps": 100,
+  "final_checkpoint_benchmark": true,
+  "baseline": {
+    "learning_rate": 0.0001,
+    "gradient_accumulation_steps": 4,
+    "group_size": 4,
+    "batch_size": 1,
+    "max_prompt_length": 4096,
+    "max_response_length": 1024,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": true,
+    "entropy_mask": true,
+    "entropy_percentile": 0.5,
+    "entropy_min_tokens": 10,
+    "clip_epsilon": 0.2,
+    "epsilon_high": 0.3,
+    "delta": 1.5,
+    "length_penalty_coef": 0.001,
+    "mask_truncated_completions": true,
+    "trainer_steps": 240,
+    "seed": 1,
+    "sent_enabled": false,
+    "difficulty_weighting_mode": "off",
+    "difficulty_weighting_min_weight": 1.0,
+    "difficulty_weighting_max_weight": 1.2
+  },
+  "comparison_groups": [
+    "length_penalty_0",
+    "length_penalty_0005_mask_truncated_off"
+  ],
+  "default_run_names": [
+    "length_penalty_0_seed1",
+    "length_penalty_0_seed2",
+    "length_penalty_0_seed3",
+    "length_penalty_0005_mask_truncated_off_seed1",
+    "length_penalty_0005_mask_truncated_off_seed2",
+    "length_penalty_0005_mask_truncated_off_seed3"
+  ],
+  "heldout_benchmark_source": "trainer GSM8KBenchmark test split from src/grpo/benchmark.py",
+  "configs": [
+    {
+      "name": "length_penalty_0005_mask_truncated_off_seed3",
+      "comparison_group": "length_penalty_0005_mask_truncated_off",
+      "description": "Endurance finalist comparison: len_penalty=0.0005, mask_truncated=False, seed 3",
+      "overrides": {
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": false,
+        "seed": 3,
+        "sent_enabled": false
+      },
+      "resolved": {
+        "learning_rate": 0.0001,
+        "gradient_accumulation_steps": 4,
+        "group_size": 4,
+        "batch_size": 1,
+        "max_prompt_length": 4096,
+        "max_response_length": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "do_sample": true,
+        "entropy_mask": true,
+        "entropy_percentile": 0.5,
+        "entropy_min_tokens": 10,
+        "clip_epsilon": 0.2,
+        "epsilon_high": 0.3,
+        "delta": 1.5,
+        "length_penalty_coef": 0.0005,
+        "mask_truncated_completions": false,
+        "trainer_steps": 240,
+        "seed": 3,
+        "sent_enabled": false,
+        "difficulty_weighting_mode": "off",
+        "difficulty_weighting_min_weight": 1.0,
+        "difficulty_weighting_max_weight": 1.2
+      },
+      "notes": [
+        "Strict finalist run.",
+        "Penalized raw reward includes a length-cost subtraction."
+      ]
+    }
+  ]
+}
