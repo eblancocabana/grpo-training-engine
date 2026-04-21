@@ -440,6 +440,21 @@ class GRPOTrainerLoop:
         with open(self._metrics_jsonl_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
+    def _record_benchmark_metrics(
+        self, metrics: Optional[Dict[str, Any]], phase: str
+    ) -> None:
+        """Persist held-out benchmark metrics alongside train metrics."""
+        if not metrics:
+            return
+
+        payload: Dict[str, Any] = {"benchmark_phase": phase}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                payload[key] = float(value)
+            else:
+                payload[key] = value
+        self._append_metrics_jsonl_entry("benchmark_metrics", payload)
+
     def _log_wandb_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
         """Log metrics to WandB and optional local JSONL."""
         log_dict = self._build_metrics_log_dict(metrics, prefix=prefix)
@@ -2670,7 +2685,10 @@ class GRPOTrainerLoop:
                         self._profiler_hooks.annotate_step(
                             self.global_step, "benchmark"
                         )
-                    self.benchmark.run(self.global_step)
+                    benchmark_metrics = self.benchmark.run(self.global_step)
+                    self._record_benchmark_metrics(
+                        benchmark_metrics, phase="periodic"
+                    )
                 except Exception as e:
                     logger.info(
                         "[Benchmark] Failed at step %s: %s", self.global_step, e
@@ -2866,6 +2884,7 @@ class GRPOTrainerLoop:
                     "[Train] Running initial benchmark before training start..."
                 )
                 metrics = self.benchmark.run(self.global_step)
+                self._record_benchmark_metrics(metrics, phase="initial")
                 # write marker with minimal metadata
                 try:
                     model_repr = repr(self.config.model.__dict__)
@@ -2995,6 +3014,15 @@ class GRPOTrainerLoop:
         # Save final checkpoint
         self.save_checkpoint(suffix="_final")
         self.save_lora_weights(suffix="_final")
+
+        try:
+            logger.info(
+                "[Train] Running final benchmark after final checkpoint save..."
+            )
+            metrics = self.benchmark.run(self.global_step)
+            self._record_benchmark_metrics(metrics, phase="final_checkpoint")
+        except Exception as e:
+            logger.info("[Benchmark] Final checkpoint benchmark failed: %s", e)
 
         self._finish_wandb()
 
