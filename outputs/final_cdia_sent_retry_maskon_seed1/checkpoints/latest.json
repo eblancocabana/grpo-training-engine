@@ -1,0 +1,5 @@
+{
+  "latest_checkpoint": "outputs/final_cdia_sent_retry_maskon_seed1/checkpoints/checkpoint_step_2800_interrupted.pt",
+  "step": 2800,
+  "epoch": 0
+}
