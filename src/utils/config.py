@@ -64,6 +64,11 @@ class GRPOConfig:
     length_penalty_coef: float = (
         0.001  # Penalty per token (reward = reward - coef * length)
     )
+    # Difficulty weighting is off by default and only enabled explicitly for
+    # ablations that use a known ordering signal such as SENT-ranked samples.
+    difficulty_weighting_mode: str = "off"
+    difficulty_weighting_min_weight: float = 1.0
+    difficulty_weighting_max_weight: float = 1.2
 
 
 @dataclass

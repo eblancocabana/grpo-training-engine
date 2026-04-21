@@ -452,6 +452,25 @@ def main():
         help="Penalty applied per generated token before GRPO advantage calculation",
     )
     parser.add_argument(
+        "--difficulty-weighting-mode",
+        type=str,
+        choices=["off", "sent_rank_linear"],
+        default=None,
+        help="Difficulty-aware sample weighting mode (default: off)",
+    )
+    parser.add_argument(
+        "--difficulty-weighting-min-weight",
+        type=float,
+        default=None,
+        help="Minimum sample weight for difficulty-aware weighting",
+    )
+    parser.add_argument(
+        "--difficulty-weighting-max-weight",
+        type=float,
+        default=None,
+        help="Maximum sample weight for difficulty-aware weighting",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -580,6 +599,16 @@ def main():
         config.grpo.delta = args.delta
     if args.length_penalty_coef is not None:
         config.grpo.length_penalty_coef = args.length_penalty_coef
+    if args.difficulty_weighting_mode is not None:
+        config.grpo.difficulty_weighting_mode = args.difficulty_weighting_mode
+    if args.difficulty_weighting_min_weight is not None:
+        config.grpo.difficulty_weighting_min_weight = (
+            args.difficulty_weighting_min_weight
+        )
+    if args.difficulty_weighting_max_weight is not None:
+        config.grpo.difficulty_weighting_max_weight = (
+            args.difficulty_weighting_max_weight
+        )
     if args.no_mask_truncated:
         config.grpo.mask_truncated_completions = False
     if args.gradient_accumulation_steps is not None:
@@ -596,6 +625,21 @@ def main():
         config.entropy.min_tokens = args.entropy_min_tokens
     if args.no_sent:
         config.sent.enabled = False
+
+    if (
+        config.grpo.difficulty_weighting_max_weight
+        < config.grpo.difficulty_weighting_min_weight
+    ):
+        raise ValueError(
+            "difficulty_weighting_max_weight must be >= difficulty_weighting_min_weight"
+        )
+    if (
+        config.grpo.difficulty_weighting_mode == "sent_rank_linear"
+        and not config.sent.enabled
+    ):
+        raise ValueError(
+            "difficulty_weighting_mode=sent_rank_linear requires SENT to remain enabled."
+        )
 
     if args.max_steps is not None:
         config.training.max_steps = args.max_steps
@@ -648,6 +692,14 @@ def main():
     logger.info("  Delta (safety cap): %s", config.grpo.delta)
     logger.info("  Length Penalty Coef: %s", config.grpo.length_penalty_coef)
     logger.info("  Mask Truncated: %s", config.grpo.mask_truncated_completions)
+    logger.info(
+        "  Difficulty Weighting Mode: %s", config.grpo.difficulty_weighting_mode
+    )
+    logger.info(
+        "  Difficulty Weight Range: [%.3f, %.3f]",
+        config.grpo.difficulty_weighting_min_weight,
+        config.grpo.difficulty_weighting_max_weight,
+    )
     logger.info("  Learning Rate: %s", config.training.learning_rate)
     logger.info("  Epochs: %s", config.training.num_epochs)
     logger.info(

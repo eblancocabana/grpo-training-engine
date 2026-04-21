@@ -82,6 +82,7 @@ class PreparedTrainingState:
     all_attention_mask: torch.Tensor
     response_only_mask: torch.Tensor
     advantages: torch.Tensor
+    sample_weights: Optional[torch.Tensor]
     rewards: torch.Tensor
     response_lengths: torch.Tensor
     actual_truncation_mask: torch.Tensor
@@ -1133,6 +1134,42 @@ class GRPOTrainerLoop:
         advantages = torch.where(valid_counts > 0, advantages, torch.zeros_like(advantages))
         return advantages.view(-1)
 
+    def _build_difficulty_sample_weights(
+        self, batch: Dict[str, Any]
+    ) -> Optional[torch.Tensor]:
+        """Build optional per-sample weights from an explicit difficulty proxy.
+
+        Difficulty weighting is off by default. The `sent_rank_linear` mode uses
+        SENT sorted position as a difficulty proxy, not as a universal estimator.
+        """
+        mode = getattr(self.config.grpo, "difficulty_weighting_mode", "off")
+        if mode == "off":
+            return None
+
+        min_weight = float(self.config.grpo.difficulty_weighting_min_weight)
+        max_weight = float(self.config.grpo.difficulty_weighting_max_weight)
+        if max_weight < min_weight:
+            raise ValueError(
+                "difficulty_weighting_max_weight must be >= difficulty_weighting_min_weight"
+            )
+
+        if mode == "sent_rank_linear":
+            rank_fraction = batch.get("sent_rank_fraction")
+            if rank_fraction is None:
+                raise ValueError(
+                    "difficulty_weighting_mode=sent_rank_linear requires an active "
+                    "SENT-ranked dataloader; plain GSM8K order is not treated as a "
+                    "difficulty signal."
+                )
+            if not torch.is_tensor(rank_fraction):
+                rank_fraction = torch.tensor(rank_fraction, dtype=torch.float32)
+            rank_fraction = rank_fraction.detach().to(dtype=torch.float32).cpu()
+            rank_fraction = rank_fraction.clamp_(0.0, 1.0)
+            prompt_weights = min_weight + rank_fraction * (max_weight - min_weight)
+            return prompt_weights.repeat_interleave(self.config.grpo.group_size)
+
+        raise ValueError(f"Unsupported difficulty_weighting_mode: {mode}")
+
     def _responses_from_output_tokens(
         self, output_ids: torch.Tensor
     ) -> tuple[list[str], torch.Tensor]:
@@ -1829,6 +1866,7 @@ class GRPOTrainerLoop:
         actual_truncation_mask = rollout_state.actual_truncation_mask_cpu
         truncation_mask = rollout_state.truncation_mask_cpu
         advantages = rollout_state.advantages_cpu
+        sample_weights = self._build_difficulty_sample_weights(batch)
 
         group_size = self.config.grpo.group_size
         prompt_ids_expanded = input_ids.repeat_interleave(group_size, dim=0)
@@ -1879,6 +1917,7 @@ class GRPOTrainerLoop:
             all_attention_mask=all_attention_mask,
             response_only_mask=response_only_mask,
             advantages=advantages,
+            sample_weights=sample_weights,
             rewards=rewards,
             response_lengths=response_lengths,
             actual_truncation_mask=actual_truncation_mask,
@@ -1914,6 +1953,11 @@ class GRPOTrainerLoop:
             batch_advantages = prepared_state.advantages[start_idx:end_idx].to(
                 self.device
             )
+            batch_sample_weights = None
+            if prepared_state.sample_weights is not None:
+                batch_sample_weights = prepared_state.sample_weights[
+                    start_idx:end_idx
+                ].to(self.device)
             batch_old_log_probs = prepared_state.all_old_log_probs[start_idx:end_idx].to(
                 self.device
             )
@@ -1967,6 +2011,7 @@ class GRPOTrainerLoop:
                 attention_mask=batch_response_mask[:, 1:],
                 entropy_mask=entropy_mask if entropy_mask is not None else None,
                 reference_logits=reference_logits,
+                sample_weights=batch_sample_weights,
             )
             loss = loss / self.config.training.gradient_accumulation_steps
             loss.backward()
@@ -1981,6 +2026,7 @@ class GRPOTrainerLoop:
                 batch_attention_mask,
                 batch_response_mask,
                 batch_advantages,
+                batch_sample_weights,
                 batch_old_log_probs,
             )
 
@@ -2023,6 +2069,16 @@ class GRPOTrainerLoop:
         avg_metrics["positive_advantages_ratio"] = (
             (prepared_state.advantages > 0).float().mean().item()
         )
+        if prepared_state.sample_weights is not None:
+            avg_metrics["difficulty_weight_mean"] = (
+                prepared_state.sample_weights.mean().item()
+            )
+            avg_metrics["difficulty_weight_min"] = (
+                prepared_state.sample_weights.min().item()
+            )
+            avg_metrics["difficulty_weight_max"] = (
+                prepared_state.sample_weights.max().item()
+            )
         avg_metrics.update(
             self._build_truncation_observability_metrics(
                 prepared_state.actual_truncation_mask
@@ -2697,6 +2753,16 @@ class GRPOTrainerLoop:
             logger.warning(
                 "[SENT] Requested but inactive for this run; trainer will use standard GSM8K epoch semantics."
             )
+        if (
+            getattr(self.config.grpo, "difficulty_weighting_mode", "off")
+            == "sent_rank_linear"
+            and not use_sent
+        ):
+            raise ValueError(
+                "difficulty_weighting_mode=sent_rank_linear requires the active "
+                "SENT-ranked dataloader path. Plain GSM8K ordering is not used "
+                "as a difficulty signal."
+            )
 
         logger.info("[Train] Starting training for %s epochs...", num_epochs)
         logger.info("[Train] Steps per epoch: ~%s", len(dataloader))
@@ -2736,6 +2802,14 @@ class GRPOTrainerLoop:
                 "steps_per_epoch": len(dataloader),
                 "output_dir": self.config.training.output_dir,
                 "use_triton": self.config.training.use_triton_kernels,
+                "sent_enabled": use_sent,
+                "difficulty_weighting_mode": self.config.grpo.difficulty_weighting_mode,
+                "difficulty_weighting_min_weight": (
+                    self.config.grpo.difficulty_weighting_min_weight
+                ),
+                "difficulty_weighting_max_weight": (
+                    self.config.grpo.difficulty_weighting_max_weight
+                ),
             },
         )
 

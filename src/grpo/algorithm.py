@@ -122,6 +122,7 @@ class GRPOTrainer:
         attention_mask: torch.Tensor | None = None,
         entropy_mask: torch.Tensor | None = None,
         target_ids: torch.Tensor | None = None,
+        sample_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """
         Compute Dr. GRPO loss with two-sided clipping.
@@ -157,7 +158,9 @@ class GRPOTrainer:
         else:
             raise ValueError("Either old_log_probs or old_policy_logits must be provided")
 
-        use_triton_loss = self.use_triton_kernels and not self.use_kl
+        use_triton_loss = (
+            self.use_triton_kernels and not self.use_kl and sample_weights is None
+        )
         if use_triton_loss:
             triton_module = importlib.import_module("src.triton_kernels")
             fused_grpo_loss = cast(
@@ -231,6 +234,11 @@ class GRPOTrainer:
                 torch.zeros_like(selected_tokens),
             )
             per_sample_loss = per_sample_loss * scale
+        if sample_weights is not None:
+            per_sample_loss = per_sample_loss * sample_weights.to(
+                device=per_sample_loss.device,
+                dtype=per_sample_loss.dtype,
+            )
 
         loss = per_sample_loss.sum() / self.group_size
         

@@ -355,6 +355,13 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
             return self.entropies[idx]
         return float("nan")
 
+    @staticmethod
+    def _sent_rank_fraction(rank: int, total_size: int) -> float:
+        """Map a SENT sorted position to a normalized [0, 1] rank fraction."""
+        if total_size <= 1:
+            return 0.0
+        return float(rank) / float(total_size - 1)
+
     def __len__(self) -> int:
         if self.use_sent:
             return len(self.current_stage_indices)
@@ -362,8 +369,15 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if self.use_sent:
-            actual_idx = self.sorted_indices[self.current_stage_indices[idx]]
-            return super().__getitem__(actual_idx)
+            sent_rank = self.current_stage_indices[idx]
+            actual_idx = self.sorted_indices[sent_rank]
+            item = super().__getitem__(actual_idx)
+            item["sent_rank"] = sent_rank
+            item["sent_rank_fraction"] = self._sent_rank_fraction(
+                sent_rank, len(self.sorted_indices)
+            )
+            item["sent_rank_total"] = len(self.sorted_indices)
+            return item
         return super().__getitem__(idx)
 
 
@@ -492,12 +506,27 @@ def create_grpo_dataloader(
                     attention_mask, dtype=torch.long
                 )
 
-        return {
+        collated = {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask_padded,
             "questions": [item["question"] for item in batch],
             "answers": [item["answer"] for item in batch],
         }
+        sent_rank_values = [item.get("sent_rank") for item in batch]
+        sent_rank_fraction_values = [item.get("sent_rank_fraction") for item in batch]
+        sent_rank_totals = [item.get("sent_rank_total") for item in batch]
+        if (
+            all(value is not None for value in sent_rank_values)
+            and all(value is not None for value in sent_rank_fraction_values)
+            and all(value is not None for value in sent_rank_totals)
+        ):
+            collated["sent_rank"] = torch.tensor(sent_rank_values, dtype=torch.long)
+            collated["sent_rank_fraction"] = torch.tensor(
+                sent_rank_fraction_values, dtype=torch.float32
+            )
+            collated["sent_rank_total"] = int(sent_rank_totals[0])
+
+        return collated
 
     worker_count: int = 4
     if num_workers is not None:
