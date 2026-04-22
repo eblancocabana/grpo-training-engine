@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytest
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
@@ -105,6 +106,75 @@ class TestEdgeCases:
             ]
             assert state_tensors
             assert all(t.device.type == "cuda" for t in state_tensors)
+
+    def test_checkpoint_load_ignores_quantization_aux_state_keys(self):
+        import tempfile
+
+        from src.utils.checkpoint import CheckpointManager
+
+        model = nn.Linear(4, 4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            checkpoint_path = manager.save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=None,
+                step=1,
+                epoch=0,
+            )
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint["model_state_dict"]["weight.absmax"] = torch.tensor([1.0])
+            checkpoint["model_state_dict"][
+                "weight.quant_state.bitsandbytes__nf4"
+            ] = torch.tensor([0], dtype=torch.uint8)
+            torch.save(checkpoint, checkpoint_path)
+
+            restored = nn.Linear(4, 4)
+            with pytest.raises(RuntimeError):
+                restored.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+            manager.load_checkpoint(
+                checkpoint_path,
+                model=restored,
+                optimizer=None,
+                scheduler=None,
+            )
+
+            torch.testing.assert_close(restored.weight, model.weight)
+            torch.testing.assert_close(restored.bias, model.bias)
+
+    def test_checkpoint_load_still_raises_for_non_quantization_unexpected_keys(self):
+        import tempfile
+
+        from src.utils.checkpoint import CheckpointManager
+
+        model = nn.Linear(4, 4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = CheckpointManager(tmpdir)
+            checkpoint_path = manager.save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=None,
+                step=1,
+                epoch=0,
+            )
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint["model_state_dict"]["weight.not_quant_metadata"] = torch.tensor(
+                [1.0]
+            )
+            torch.save(checkpoint, checkpoint_path)
+
+            with pytest.raises(RuntimeError):
+                manager.load_checkpoint(
+                    checkpoint_path,
+                    model=nn.Linear(4, 4),
+                    optimizer=None,
+                    scheduler=None,
+                )
 
     def test_move_optimizer_state_to_model_device_uses_state_key_devices(self):
         from src.utils.checkpoint import CheckpointManager

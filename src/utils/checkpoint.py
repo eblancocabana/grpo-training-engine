@@ -13,6 +13,14 @@ from .logging_utils import get_logger
 logger = get_logger("utils.checkpoint")
 
 
+_IGNORABLE_QUANTIZATION_AUX_SUFFIXES = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+)
+
+
 class CheckpointManager:
     """
     Manages saving and loading of training checkpoints.
@@ -156,7 +164,11 @@ class CheckpointManager:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
         # Load model state
-        model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        self._load_model_state_dict(
+            model=model,
+            state_dict=checkpoint['model_state_dict'],
+            strict=strict,
+        )
         
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in checkpoint:
@@ -189,6 +201,42 @@ class CheckpointManager:
         logger.info("Loaded step %d, epoch %d", info['step'], info['epoch'])
         
         return info
+
+    @staticmethod
+    def _is_ignorable_quantization_aux_key(key: str) -> bool:
+        if key.endswith(_IGNORABLE_QUANTIZATION_AUX_SUFFIXES):
+            return True
+        if ".quant_state.bitsandbytes__" in key:
+            return True
+        return False
+
+    @classmethod
+    def _load_model_state_dict(
+        cls,
+        model: torch.nn.Module,
+        state_dict: Dict[str, Any],
+        strict: bool,
+    ) -> None:
+        if not strict:
+            model.load_state_dict(state_dict, strict=False)
+            return
+
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            return
+        except RuntimeError as exc:
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            unexpected = list(incompatible.unexpected_keys)
+            has_missing = bool(incompatible.missing_keys)
+            unexpected_are_ignorable = bool(unexpected) and all(
+                cls._is_ignorable_quantization_aux_key(key) for key in unexpected
+            )
+            if has_missing or not unexpected_are_ignorable:
+                raise exc
+            logger.warning(
+                "Ignoring %d BitsAndBytes quantization metadata tensors during checkpoint restore.",
+                len(unexpected),
+            )
 
     @staticmethod
     def _move_value_to_device(value: Any, device: torch.device) -> Any:
