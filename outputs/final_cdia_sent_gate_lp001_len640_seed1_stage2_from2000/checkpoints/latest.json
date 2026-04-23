@@ -1,0 +1,5 @@
+{
+  "latest_checkpoint": "outputs/final_cdia_sent_gate_lp001_len640_seed1_stage2_from2000/checkpoints/checkpoint_step_3639_interrupted.pt",
+  "step": 3639,
+  "epoch": 0
+}
