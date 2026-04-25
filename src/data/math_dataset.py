@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -49,17 +50,24 @@ DATASET_SPECS: Dict[str, MathDatasetSpec] = {
     "open-deepscaler": MathDatasetSpec("open-deepscaler", "knoveleng/open-deepscaler"),
 }
 
+FILTERED_DATASET_DIRS: Dict[str, str] = {
+    "dapo-open-rs-lenfilter-640": "data/filtered/dapo-open-rs_lenfilter_640",
+    "dapo-math-17k-lenfilter-640": "data/filtered/dapo-math-17k_lenfilter_640",
+    "open-rs-lenfilter-640": "data/filtered/open-rs_lenfilter_640",
+    "open-deepscaler-lenfilter-640": "data/filtered/open-deepscaler_lenfilter_640",
+}
+
 
 def supported_dataset_names() -> list[str]:
     """Return supported normalized dataset names."""
-    return list(DATASET_SPECS)
+    return list(DATASET_SPECS) + list(FILTERED_DATASET_DIRS)
 
 
 def canonical_dataset_name(dataset_name: str) -> str:
     """Validate and canonicalize a dataset alias."""
     normalized = str(dataset_name).strip().lower()
-    if normalized not in DATASET_SPECS:
-        allowed = ", ".join(sorted(DATASET_SPECS))
+    if normalized not in DATASET_SPECS and normalized not in FILTERED_DATASET_DIRS:
+        allowed = ", ".join(sorted(supported_dataset_names()))
         raise MathDatasetError(f"Unsupported dataset_name='{dataset_name}'. Allowed: {allowed}")
     return normalized
 
@@ -331,6 +339,81 @@ def _load_hf_dataset_dict(dataset_name: str) -> Any:
     return load_dataset(spec.hf_path)
 
 
+def filtered_dataset_path(dataset_name: str, split: str) -> str:
+    """Return the local JSONL path for a length-filtered dataset split."""
+    dataset_name = canonical_dataset_name(dataset_name)
+    if dataset_name not in FILTERED_DATASET_DIRS:
+        raise MathDatasetError(f"Dataset '{dataset_name}' is not a filtered local dataset")
+    if split not in SUPPORTED_SPLITS:
+        raise MathDatasetError(f"Unsupported split='{split}'. Expected train/validation/test.")
+    return os.path.join(FILTERED_DATASET_DIRS[dataset_name], f"{split}.jsonl")
+
+
+def _load_filtered_split_rows(dataset_name: str, split: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load an explicit filtered JSONL split without re-splitting it."""
+    path = filtered_dataset_path(dataset_name, split)
+    if not os.path.exists(path):
+        raise MathDatasetError(
+            f"Filtered dataset split not found: {path}. "
+            "Run scripts/filter_dataset_by_response_length_vllm.py first."
+        )
+
+    rows: list[dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line_number, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MathDatasetError(f"Invalid JSON in {path}:{line_number}: {exc}") from exc
+            missing = [
+                key
+                for key in (
+                    "question",
+                    "answer",
+                    "solution",
+                    "original_id",
+                    "raw_index",
+                    "split",
+                    "dataset_name",
+                    "source",
+                )
+                if key not in row
+            ]
+            if missing:
+                raise MathDatasetError(
+                    f"Filtered row {path}:{line_number} is missing fields: {missing}"
+                )
+            row["split"] = split
+            row["dataset_name"] = dataset_name
+            rows.append(row)
+
+    split_sizes: dict[str, int | None] = {}
+    for split_name in SUPPORTED_SPLITS:
+        split_path = filtered_dataset_path(dataset_name, split_name)
+        if not os.path.exists(split_path):
+            split_sizes[split_name] = None
+            continue
+        with open(split_path, "r", encoding="utf-8") as fh:
+            split_sizes[split_name] = sum(1 for line in fh if line.strip())
+
+    metadata = {
+        "dataset_name": dataset_name,
+        "split": split,
+        "source_split": split,
+        "split_seed": None,
+        "split_ratios": None,
+        "split_sizes": split_sizes,
+        "num_rows": len(rows),
+        "invalid_rows_dropped": 0,
+        "filtered_local": True,
+        "path": path,
+    }
+    return rows, metadata
+
+
 def _sequence_from_split(dataset_obj: Any, split: str) -> Sequence[Any]:
     if isinstance(dataset_obj, Mapping):
         if split not in dataset_obj:
@@ -360,6 +443,8 @@ def load_math_split_rows(
     dataset_name = canonical_dataset_name(dataset_name)
     if split not in SUPPORTED_SPLITS:
         raise MathDatasetError(f"Unsupported split='{split}'. Expected train/validation/test.")
+    if dataset_name in FILTERED_DATASET_DIRS:
+        return _load_filtered_split_rows(dataset_name, split)
 
     raw = _load_hf_dataset_dict(dataset_name)
     split_sizes: dict[str, int] = {}

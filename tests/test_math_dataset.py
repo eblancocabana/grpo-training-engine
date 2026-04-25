@@ -8,12 +8,15 @@ import pytest
 from src.data import gsm8k_loader
 from src.data.math_dataset import (
     DATASET_SPECS,
+    FILTERED_DATASET_DIRS,
     GRPOMathDataset,
     MathDatasetError,
     deterministic_split_indices,
     extract_answer,
     load_math_split_rows,
     normalize_math_row,
+    safe_dataset_cache_stem,
+    supported_dataset_names,
 )
 from src.data.sent_calculator import make_sent_metadata
 from src.utils.config import SENTConfig, get_8gb_vram_config
@@ -48,6 +51,33 @@ def _rows(n=20):
     ]
 
 
+def _write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _filtered_row(split, raw_index):
+    return {
+        "question": f"Q {split} {raw_index}",
+        "answer": str(raw_index),
+        "solution": f"S {raw_index}",
+        "original_id": f"{split}-{raw_index}",
+        "raw_index": raw_index,
+        "split": split,
+        "dataset_name": "dapo-open-rs-lenfilter-640",
+        "source": "dapo-math-17k",
+        "original_dataset_name": "dapo-math-17k",
+        "length_filter_num_samples": 4,
+        "length_filter_keep_min_finished": 4,
+        "length_filter_response_lengths": [10, 11, 12, 13],
+        "length_filter_finish_reasons": ["stop", "stop", "stop", "stop"],
+        "length_filter_finished_count": 4,
+        "length_filter_kept": True,
+        "length_filter_generation_config": {},
+    }
+
+
 def test_deterministic_splits_for_new_datasets_are_stable_and_disjoint():
     for dataset_name in ("open-rs", "dapo-math-17k", "open-deepscaler"):
         assert dataset_name in DATASET_SPECS
@@ -61,6 +91,62 @@ def test_deterministic_splits_for_new_datasets_are_stable_and_disjoint():
         assert set(first["train"]).isdisjoint(first["test"])
         assert set(first["validation"]).isdisjoint(first["test"])
         assert len(first["train"]) + len(first["validation"]) + len(first["test"]) == 100
+
+
+def test_dataset_registry_exposes_mixed_lenfilter():
+    assert "dapo-open-rs-lenfilter-640" in supported_dataset_names()
+
+
+def test_dataset_registry_exposes_open_rs_lenfilter():
+    assert "open-rs-lenfilter-640" in supported_dataset_names()
+
+
+def test_safe_dataset_cache_stems_for_filtered_dataset_names():
+    assert (
+        safe_dataset_cache_stem("dapo-open-rs-lenfilter-640")
+        == "dapo_open_rs_lenfilter_640"
+    )
+    assert safe_dataset_cache_stem("open-rs-lenfilter-640") == "open_rs_lenfilter_640"
+
+
+def test_filtered_local_jsonl_splits_load_without_resplitting(monkeypatch, tmp_path):
+    dataset_dir = tmp_path / "dapo-open-rs_lenfilter_640"
+    dataset_dir.mkdir()
+    rows_by_split = {
+        "train": [_filtered_row("train", 101), _filtered_row("train", 102)],
+        "validation": [_filtered_row("validation", 201)],
+        "test": [_filtered_row("test", 301)],
+    }
+    for split, rows in rows_by_split.items():
+        _write_jsonl(dataset_dir / f"{split}.jsonl", rows)
+
+    monkeypatch.setitem(
+        FILTERED_DATASET_DIRS,
+        "dapo-open-rs-lenfilter-640",
+        str(dataset_dir),
+    )
+
+    train_rows, train_metadata = load_math_split_rows(
+        "dapo-open-rs-lenfilter-640",
+        "train",
+        split_seed=999,
+    )
+    validation_rows, _ = load_math_split_rows(
+        "dapo-open-rs-lenfilter-640",
+        "validation",
+        split_seed=999,
+    )
+    test_rows, _ = load_math_split_rows(
+        "dapo-open-rs-lenfilter-640",
+        "test",
+        split_seed=999,
+    )
+
+    assert [row["raw_index"] for row in train_rows] == [101, 102]
+    assert [row["raw_index"] for row in validation_rows] == [201]
+    assert [row["raw_index"] for row in test_rows] == [301]
+    assert train_metadata["filtered_local"] is True
+    assert train_metadata["split_sizes"] == {"train": 2, "validation": 1, "test": 1}
 
 
 @pytest.mark.parametrize(

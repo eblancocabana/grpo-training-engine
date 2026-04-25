@@ -34,7 +34,7 @@ from src.data.sent_calculator import (
     load_sent_cache,
     make_sent_metadata,
 )
-from src.data.gsm8k_loader import format_grpo_prompt
+from src.data.gsm8k_loader import format_grpo_prompt, resolve_sent_cache_path
 from src.data.math_dataset import load_math_split_rows, supported_dataset_names
 
 logger = get_logger("preprocess_sent_vllm")
@@ -78,6 +78,18 @@ def main():
     parser.add_argument("--model-id", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (number of queries)")
     parser.add_argument("--max-model-len", type=int, default=2048, help="Max model context length")
+    parser.add_argument(
+        "--max-prompt-length",
+        type=int,
+        default=None,
+        help="Alias for the prompt length used in SENT cache metadata.",
+    )
+    parser.add_argument(
+        "--max-response-length",
+        type=int,
+        default=None,
+        help="Maximum sampled response length for SENT generations.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                         help="Fraction of GPU memory for vLLM (default: 0.90)")
     parser.add_argument(
@@ -94,6 +106,8 @@ def main():
     )
 
     args = parser.parse_args()
+
+    args.cache_path = resolve_sent_cache_path(args.dataset_name, args.cache_path)
 
     os.makedirs(os.path.dirname(args.cache_path) or "data/cache", exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -127,7 +141,11 @@ def main():
     config.sent.cache_path = args.cache_path
     config.sent.checkpoint_interval = args.checkpoint_interval
     config.sent.seed = args.seed
-    config.training.max_prompt_length = args.max_model_len
+    config.training.max_prompt_length = (
+        args.max_prompt_length if args.max_prompt_length is not None else args.max_model_len
+    )
+    if args.max_response_length is not None:
+        config.training.max_response_length = args.max_response_length
 
     logger.info("Loading vLLM engine: %s ...", model_id)
     start_time = time.time()
