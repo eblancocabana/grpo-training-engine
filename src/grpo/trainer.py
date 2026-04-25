@@ -40,7 +40,8 @@ from src.triton_kernels.paged_kv import (
 )
 
 from src.data.gsm8k_loader import create_grpo_dataloader
-from src.grpo.benchmark import GSM8KBenchmark
+from src.grpo.benchmark import GSM8KBenchmark, MathBenchmark
+from src.data.math_dataset import supported_dataset_names
 from src.utils.checkpoint import CheckpointManager, save_training_config
 from src.utils.config import Config, get_8gb_vram_config
 from tools.vram_profiler.profiler_hooks import ProfilerHooks, ProfilerState
@@ -68,10 +69,10 @@ class RolloutStepState:
     response_mask_cpu: torch.Tensor
     rewards_cpu: torch.Tensor
     response_lengths_cpu: torch.Tensor
-    actual_truncation_mask_cpu: torch.Tensor
     truncation_mask_cpu: torch.Tensor
     advantages_cpu: torch.Tensor
     debug_infos: list[dict[str, Any]]
+    actual_truncation_mask_cpu: Optional[torch.Tensor] = None
 
 
 @dataclass(slots=True)
@@ -82,12 +83,12 @@ class PreparedTrainingState:
     all_attention_mask: torch.Tensor
     response_only_mask: torch.Tensor
     advantages: torch.Tensor
-    sample_weights: Optional[torch.Tensor]
     rewards: torch.Tensor
     response_lengths: torch.Tensor
-    actual_truncation_mask: torch.Tensor
     truncation_mask: torch.Tensor
     all_old_log_probs: torch.Tensor
+    sample_weights: Optional[torch.Tensor] = None
+    actual_truncation_mask: Optional[torch.Tensor] = None
 
 
 @dataclass(slots=True)
@@ -144,6 +145,7 @@ class GRPOTrainerLoop:
         self.checkpoint_manager = None
         self.generator = None
         self.benchmark = None
+        self.eval_benchmarks: dict[tuple[str, str, int, bool], MathBenchmark] = {}
 
         # Training state
         self.current_step = 0
@@ -180,6 +182,7 @@ class GRPOTrainerLoop:
         self._metrics_jsonl_path: Optional[str] = None
         self._triton_generation_policy_logged = False
         self._training_step_in_progress = False
+        self._current_curriculum_stage = 1
         self._partial_accumulation_replay_step = self.global_step
         self._refresh_oom_backoff_count()
         self._partial_accumulation_recovery_state = (
@@ -307,21 +310,32 @@ class GRPOTrainerLoop:
         else:
             self.checkpoint_manager = None
 
-        # Initialize benchmark
-        self.benchmark = GSM8KBenchmark(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            memory_manager=self.memory_manager,
-            dataset_split="test",
-            num_samples=50,
-            device=self.device,
-            generate_fn=self.generate_benchmark_responses,
-            max_new_tokens=self.config.training.max_response_length,
-            max_prompt_length=self.config.training.max_prompt_length,
-            do_sample=self.config.training.generation_do_sample,
-            temperature=self.config.training.generation_temperature,
-            top_p=self.config.training.generation_top_p,
-        )
+        # Initialize selected-dataset validation benchmark. Tests and dry setup
+        # paths can use non-callable tokenizer stubs, so benchmark construction is
+        # allowed to defer until the first real eval.
+        try:
+            self.benchmark = MathBenchmark(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                memory_manager=self.memory_manager,
+                dataset_name=self.config.training.dataset_name,
+                dataset_split="validation",
+                num_samples=self.config.training.eval_num_samples,
+                device=self.device,
+                generate_fn=None,
+                max_new_tokens=self.config.training.max_response_length,
+                max_prompt_length=self.config.training.max_prompt_length,
+                do_sample=self.config.training.eval_do_sample,
+                temperature=1.0,
+                top_p=None,
+                split_seed=self.config.training.split_seed,
+                split_ratios=self.config.training.split_ratios,
+                strict_filter_invalid=self.config.training.drop_invalid_dataset_rows,
+                eval_seed=self.config.training.eval_seed,
+            )
+        except Exception as exc:
+            logger.info("[Eval] Deferred benchmark initialization: %s", exc)
+            self.benchmark = None
 
         # Setup WandB
         self._setup_wandb()
@@ -429,11 +443,17 @@ class GRPOTrainerLoop:
     def _append_metrics_jsonl_entry(self, event: str, payload: Dict[str, Any]):
         if self._metrics_jsonl_path is None:
             return
+        config = getattr(self, "config", None)
+        training_config = getattr(config, "training", None)
 
         entry = {
             "event": event,
-            "step": self.global_step,
-            "epoch": self.current_epoch,
+            "step": getattr(self, "global_step", 0),
+            "epoch": getattr(self, "current_epoch", 0),
+            "optimizer_step": getattr(self, "optimizer_step", 0),
+            "dataset_name": getattr(training_config, "dataset_name", "gsm8k"),
+            "split": "train",
+            "curriculum_stage": getattr(self, "_current_curriculum_stage", 1),
             "timestamp": time.time(),
             **payload,
         }
@@ -447,13 +467,142 @@ class GRPOTrainerLoop:
         if not metrics:
             return
 
-        payload: Dict[str, Any] = {"benchmark_phase": phase}
+        payload: Dict[str, Any] = {
+            "benchmark_phase": phase,
+            "optimizer_step": getattr(self, "optimizer_step", 0),
+            "dataset_name": getattr(
+                getattr(getattr(self, "config", None), "training", None),
+                "dataset_name",
+                "gsm8k",
+            ),
+            "curriculum_stage": getattr(self, "_current_curriculum_stage", 1),
+        }
         for key, value in metrics.items():
             if isinstance(value, (int, float)):
                 payload[key] = float(value)
             else:
                 payload[key] = value
         self._append_metrics_jsonl_entry("benchmark_metrics", payload)
+
+    def _get_eval_benchmark(
+        self,
+        *,
+        dataset_name: str,
+        split: str,
+        num_samples: int,
+        do_sample: bool,
+    ) -> MathBenchmark:
+        """Create or reuse a fixed-subset split-aware evaluator."""
+        key = (dataset_name, split, int(num_samples), bool(do_sample))
+        if key not in self.eval_benchmarks:
+            self.eval_benchmarks[key] = MathBenchmark(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                memory_manager=self.memory_manager,
+                dataset_name=dataset_name,
+                dataset_split=split,
+                num_samples=num_samples,
+                device=self.device,
+                generate_fn=None,
+                max_new_tokens=self.config.training.max_response_length,
+                max_prompt_length=self.config.training.max_prompt_length,
+                do_sample=do_sample,
+                temperature=1.0 if not do_sample else self.config.training.generation_temperature,
+                top_p=None if not do_sample else self.config.training.generation_top_p,
+                split_seed=self.config.training.split_seed,
+                split_ratios=self.config.training.split_ratios,
+                strict_filter_invalid=self.config.training.drop_invalid_dataset_rows,
+                eval_seed=self.config.training.eval_seed,
+            )
+        return self.eval_benchmarks[key]
+
+    def _run_eval(
+        self,
+        *,
+        dataset_name: str,
+        split: str,
+        num_samples: int,
+        phase: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Run one split-aware eval and record metadata-rich metrics."""
+        try:
+            benchmark = self._get_eval_benchmark(
+                dataset_name=dataset_name,
+                split=split,
+                num_samples=num_samples,
+                do_sample=self.config.training.eval_do_sample,
+            )
+            metrics = benchmark.run(self.global_step)
+            metrics["optimizer_step"] = self.optimizer_step
+            metrics["checkpoint_step"] = self.global_step
+            metrics["dataset_name"] = self.config.training.dataset_name
+            metrics["split"] = "train"
+            metrics["eval_dataset_name"] = dataset_name
+            metrics["eval_split"] = split
+            metrics["curriculum_stage"] = self._current_curriculum_stage
+            self._record_benchmark_metrics(metrics, phase=phase)
+            return metrics
+        except Exception as exc:
+            logger.info(
+                "[Eval] Failed for %s/%s at optimizer_step=%s: %s",
+                dataset_name,
+                split,
+                self.optimizer_step,
+                exc,
+            )
+            return None
+
+    def _run_transfer_eval(self, *, split: str, num_samples: int, phase: str) -> None:
+        """Run transfer eval on all supported datasets except the selected one."""
+        for dataset_name in supported_dataset_names():
+            if dataset_name == self.config.training.dataset_name:
+                continue
+            self._run_eval(
+                dataset_name=dataset_name,
+                split=split,
+                num_samples=num_samples,
+                phase=phase,
+            )
+
+    def _maybe_run_periodic_evals(self, previous_optimizer_step: int) -> None:
+        """Run evals only when an optimizer step has advanced."""
+        if self.optimizer_step <= previous_optimizer_step:
+            return
+        main_interval = max(1, int(self.config.training.eval_every_optimizer_steps))
+        if self.optimizer_step % main_interval == 0:
+            self._run_eval(
+                dataset_name=self.config.training.dataset_name,
+                split="validation",
+                num_samples=self.config.training.eval_num_samples,
+                phase="periodic_validation",
+            )
+
+        if not self.config.training.transfer_eval_enabled:
+            return
+        transfer_interval = max(
+            1, int(self.config.training.transfer_eval_every_optimizer_steps)
+        )
+        if self.optimizer_step % transfer_interval == 0:
+            self._run_transfer_eval(
+                split="validation",
+                num_samples=self.config.training.transfer_eval_num_samples,
+                phase="periodic_transfer_validation",
+            )
+
+    def _run_final_evals(self) -> None:
+        """Run selected-dataset final test eval and optional transfer test eval."""
+        self._run_eval(
+            dataset_name=self.config.training.dataset_name,
+            split=getattr(self.config.training, "final_eval_split", "test"),
+            num_samples=self.config.training.final_eval_num_samples,
+            phase="final_test",
+        )
+        if self.config.training.final_transfer_eval_enabled:
+            self._run_transfer_eval(
+                split="test",
+                num_samples=self.config.training.final_transfer_eval_num_samples,
+                phase="final_transfer_test",
+            )
 
     def _log_wandb_metrics(self, metrics: Dict[str, float], prefix: str = "train"):
         """Log metrics to WandB and optional local JSONL."""
@@ -1028,6 +1177,10 @@ class GRPOTrainerLoop:
             cache_path=self.config.sent.cache_path,
             model_id=self.config.model.model_id,
             generator=generator,
+            dataset_name=self.config.training.dataset_name,
+            split_seed=self.config.training.split_seed,
+            split_ratios=self.config.training.split_ratios,
+            strict_filter_invalid=self.config.training.drop_invalid_dataset_rows,
         )
 
         if self._dataloader_uses_sent(dataloader):
@@ -1054,9 +1207,11 @@ class GRPOTrainerLoop:
             return
         current_stage = getattr(dataset, "current_stage", None)
         if current_stage == sent_stage:
+            self._current_curriculum_stage = sent_stage
             return
         dataset.set_stage(sent_stage)
         dataloader.current_sent_stage = sent_stage
+        self._current_curriculum_stage = sent_stage
         if hasattr(dataset, "get_stage_info"):
             stage_info = dataset.get_stage_info()
             logger.info(
@@ -1878,8 +2033,12 @@ class GRPOTrainerLoop:
         response_mask = rollout_state.response_mask_cpu
         rewards = rollout_state.rewards_cpu
         response_lengths = rollout_state.response_lengths_cpu
-        actual_truncation_mask = rollout_state.actual_truncation_mask_cpu
         truncation_mask = rollout_state.truncation_mask_cpu
+        actual_truncation_mask = (
+            rollout_state.actual_truncation_mask_cpu
+            if rollout_state.actual_truncation_mask_cpu is not None
+            else truncation_mask
+        )
         advantages = rollout_state.advantages_cpu
         sample_weights = self._build_difficulty_sample_weights(batch)
 
@@ -2094,10 +2253,13 @@ class GRPOTrainerLoop:
             avg_metrics["difficulty_weight_max"] = (
                 prepared_state.sample_weights.max().item()
             )
+        actual_truncation_mask = (
+            prepared_state.actual_truncation_mask
+            if prepared_state.actual_truncation_mask is not None
+            else prepared_state.truncation_mask
+        )
         avg_metrics.update(
-            self._build_truncation_observability_metrics(
-                prepared_state.actual_truncation_mask
-            )
+            self._build_truncation_observability_metrics(actual_truncation_mask)
         )
 
         if self.config.grpo.mask_truncated_completions:
@@ -2133,6 +2295,7 @@ class GRPOTrainerLoop:
         avg_metrics["train_micro_batch"] = float(self._train_micro_batch)
         avg_metrics["oom_backoff_count"] = float(self._oom_backoff_count)
         avg_metrics["optimizer_step"] = float(self.optimizer_step)
+        avg_metrics["curriculum_stage"] = float(self._current_curriculum_stage)
 
         self.global_step += 1
         self.memory_manager.step()
@@ -2652,6 +2815,7 @@ class GRPOTrainerLoop:
                 logger.info("Reached max steps (%s); stopping epoch.", self.global_step)
                 reached_max_steps = True
                 break
+            previous_optimizer_step = self.optimizer_step
             metrics = self._run_training_step_with_oom_recovery(batch, epoch)
 
             epoch_metrics.append(metrics)
@@ -2678,21 +2842,7 @@ class GRPOTrainerLoop:
             if self.global_step % self.config.training.log_interval == 0:
                 self.memory_manager.print_memory_stats(f"[Step {self.global_step}]")
 
-            # Benchmark evaluation every 100 steps
-            if self.global_step % 100 == 0:
-                try:
-                    if self._profiler_hooks:
-                        self._profiler_hooks.annotate_step(
-                            self.global_step, "benchmark"
-                        )
-                    benchmark_metrics = self.benchmark.run(self.global_step)
-                    self._record_benchmark_metrics(
-                        benchmark_metrics, phase="periodic"
-                    )
-                except Exception as e:
-                    logger.info(
-                        "[Benchmark] Failed at step %s: %s", self.global_step, e
-                    )
+            self._maybe_run_periodic_evals(previous_optimizer_step)
 
             # Save checkpoint
             if (
@@ -2828,6 +2978,17 @@ class GRPOTrainerLoop:
                 "difficulty_weighting_max_weight": (
                     self.config.grpo.difficulty_weighting_max_weight
                 ),
+                "dataset_name": self.config.training.dataset_name,
+                "split": "train",
+                "split_seed": self.config.training.split_seed,
+                "split_ratios": {
+                    "train": self.config.training.split_train_ratio,
+                    "validation": self.config.training.split_validation_ratio,
+                    "test": self.config.training.split_test_ratio,
+                },
+                "eval_every_optimizer_steps": (
+                    self.config.training.eval_every_optimizer_steps
+                ),
             },
         )
 
@@ -2883,8 +3044,12 @@ class GRPOTrainerLoop:
                 logger.info(
                     "[Train] Running initial benchmark before training start..."
                 )
-                metrics = self.benchmark.run(self.global_step)
-                self._record_benchmark_metrics(metrics, phase="initial")
+                metrics = self._run_eval(
+                    dataset_name=self.config.training.dataset_name,
+                    split="validation",
+                    num_samples=self.config.training.eval_num_samples,
+                    phase="initial_validation",
+                )
                 # write marker with minimal metadata
                 try:
                     model_repr = repr(self.config.model.__dict__)
@@ -2976,6 +3141,7 @@ class GRPOTrainerLoop:
                 sent_stage=sent_stage,
                 use_sent=use_sent,
             )
+            self._current_curriculum_stage = current_sent_stage
             if not use_sent:
                 dataloader = self._create_train_dataloader(
                     sent_stage=current_sent_stage,
@@ -3015,14 +3181,8 @@ class GRPOTrainerLoop:
         self.save_checkpoint(suffix="_final")
         self.save_lora_weights(suffix="_final")
 
-        try:
-            logger.info(
-                "[Train] Running final benchmark after final checkpoint save..."
-            )
-            metrics = self.benchmark.run(self.global_step)
-            self._record_benchmark_metrics(metrics, phase="final_checkpoint")
-        except Exception as e:
-            logger.info("[Benchmark] Final checkpoint benchmark failed: %s", e)
+        logger.info("[Train] Running final split-aware evaluation after final checkpoint save...")
+        self._run_final_evals()
 
         self._finish_wandb()
 

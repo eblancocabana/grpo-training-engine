@@ -24,8 +24,6 @@ from typing import Any, Dict, List
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from tqdm import tqdm
-from datasets import load_dataset
-
 from src.grpo.verifier import RuleBasedVerifier
 from src.utils.config import get_8gb_vram_config
 from src.utils.logging_utils import setup_logging, get_logger
@@ -37,6 +35,7 @@ from src.data.sent_calculator import (
     make_sent_metadata,
 )
 from src.data.gsm8k_loader import format_grpo_prompt
+from src.data.math_dataset import load_math_split_rows, supported_dataset_names
 
 logger = get_logger("preprocess_sent_vllm")
 
@@ -66,7 +65,8 @@ def _assert_resume_cache_compatible(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess GSM8K with SENT (vLLM)")
+    parser = argparse.ArgumentParser(description="Preprocess math dataset train split with SENT (vLLM)")
+    parser.add_argument("--dataset-name", choices=supported_dataset_names(), default="gsm8k")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--max-steps", type=int, default=None, help="Process only N queries")
     parser.add_argument("--M", type=int, default=4, help="Number of samples per query")
@@ -80,6 +80,18 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=2048, help="Max model context length")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                         help="Fraction of GPU memory for vLLM (default: 0.90)")
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=16,
+        help="Maximum active vLLM sequences. Lower this on 8GB GPUs to avoid sampler warmup OOM.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=4096,
+        help="Maximum tokens per vLLM scheduler batch.",
+    )
 
     args = parser.parse_args()
 
@@ -96,16 +108,20 @@ def main():
     logger.info("=" * 60)
     logger.info("SENT Preprocessing (vLLM backend)")
     logger.info("=" * 60)
+    logger.info("Dataset: %s", args.dataset_name)
     logger.info("Cache path: %s", args.cache_path)
     logger.info("Resume: %s", args.resume)
     logger.info("Max steps: %s", args.max_steps)
     logger.info("Samples (M): %s", args.M)
     logger.info("Temperature: %s", args.temperature)
     logger.info("Batch size: %s", args.batch_size)
+    logger.info("Max num seqs: %s", args.max_num_seqs)
+    logger.info("Max num batched tokens: %s", args.max_num_batched_tokens)
 
     config = get_8gb_vram_config()
     model_id = args.model_id or config.model.model_id
     config.model.model_id = model_id
+    config.training.dataset_name = args.dataset_name
     config.sent.num_samples = args.M
     config.sent.temperature = args.temperature
     config.sent.cache_path = args.cache_path
@@ -126,6 +142,8 @@ def main():
         model=model_id,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
         seed=args.seed or 42,
         trust_remote_code=True,
     )
@@ -152,10 +170,20 @@ def main():
         max_prompt_length=config.training.max_prompt_length,
     )["sent_cache_key"]
 
-    logger.info("Loading GSM8K dataset...")
-    gsm8k = load_dataset("gsm8k", "main", split="train")
-    dataset = [{"id": i, "question": item["question"]} for i, item in enumerate(gsm8k)]
+    logger.info("Loading %s train split...", args.dataset_name)
+    rows, split_metadata = load_math_split_rows(
+        args.dataset_name,
+        "train",
+        split_seed=config.training.split_seed,
+        split_ratios=config.training.split_ratios,
+        strict_filter_invalid=config.training.drop_invalid_dataset_rows,
+    )
+    dataset = [
+        {"id": row.get("original_id", i), "question": row["question"]}
+        for i, row in enumerate(rows)
+    ]
     logger.info("Loaded %d examples", len(dataset))
+    logger.info("Split sizes: %s", split_metadata.get("split_sizes"))
 
     if args.max_steps:
         dataset = dataset[:args.max_steps]

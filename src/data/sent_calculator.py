@@ -23,6 +23,11 @@ from src.grpo.verifier import RuleBasedVerifier
 from src.core.memory_manager import MemoryManager
 from src.utils.config import Config
 from src.data.gsm8k_loader import format_grpo_prompt, _make_sent_cache_key
+from src.data.math_dataset import (
+    PROMPT_FORMAT_VERSION,
+    prompt_format_hash,
+    split_ratios_dict,
+)
 
 
 def cluster_by_answer(
@@ -103,28 +108,49 @@ def make_sent_metadata(
     backend: str = "hf",
     tokenizer: Optional[object] = None,
     max_prompt_length: Optional[int] = None,
+    dataset_name: Optional[str] = None,
+    split: str = "train",
 ) -> Dict[str, Any]:
     """Create metadata block for cache files."""
     cfg = config.to_dict() if hasattr(config, "to_dict") else {}
     cfg_ser = json.dumps(cfg, sort_keys=True)
     cfg_hash = hashlib.sha256(cfg_ser.encode()).hexdigest()
+    training = getattr(config, "training", None)
+    sent = getattr(config, "sent", None)
+    resolved_dataset_name = dataset_name or getattr(training, "dataset_name", "gsm8k")
+    split_seed = getattr(training, "split_seed", 42)
+    split_ratios = getattr(training, "split_ratios", (0.90, 0.05, 0.05))
+    resolved_max_prompt_length = (
+        max_prompt_length
+        if max_prompt_length is not None
+        else getattr(training, "max_prompt_length", None)
+    )
     return {
         "version": "sent_v1",
         "config_hash": cfg_hash,
         "sent_cache_key": _make_sent_cache_key(
-            getattr(config, "sent", None),
+            sent,
             tokenizer=tokenizer,
-            max_prompt_length=(
-                max_prompt_length
-                if max_prompt_length is not None
-                else getattr(getattr(config, "training", None), "max_prompt_length", None)
-            ),
+            max_prompt_length=resolved_max_prompt_length,
             model_id=getattr(getattr(config, "model", None), "model_id", None),
+            dataset_name=resolved_dataset_name,
+            split=split,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
         ),
         "created_at": time.time(),
         "status": status,
         "model_id": getattr(config.model, "model_id", None),
         "backend": backend,
+        "dataset_name": resolved_dataset_name,
+        "split": split,
+        "split_seed": split_seed,
+        "split_ratios": split_ratios_dict(split_ratios),
+        "max_prompt_length": resolved_max_prompt_length,
+        "num_samples": getattr(sent, "num_samples", None),
+        "temperature": getattr(sent, "temperature", None),
+        "prompt_format_version": PROMPT_FORMAT_VERSION,
+        "prompt_format_hash": prompt_format_hash(tokenizer),
     }
 
 
@@ -475,4 +501,6 @@ class SemanticEntropyCalculator:
             backend="hf",
             tokenizer=self.tokenizer,
             max_prompt_length=self.config.training.max_prompt_length,
+            dataset_name=getattr(self.config.training, "dataset_name", "gsm8k"),
+            split="train",
         )

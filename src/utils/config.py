@@ -125,6 +125,11 @@ class TrainingConfig:
 
     # Data
     dataset_name: str = "gsm8k"
+    split_seed: int = 42
+    split_train_ratio: float = 0.90
+    split_validation_ratio: float = 0.05
+    split_test_ratio: float = 0.05
+    drop_invalid_dataset_rows: bool = False
     max_prompt_length: int = 4096
     max_response_length: int = 768
     verbosity: int = 0
@@ -170,6 +175,17 @@ class TrainingConfig:
     # Logging
     log_interval: int = 10
     eval_interval: int = 100
+    eval_num_samples: int = 64
+    eval_every_optimizer_steps: int = 25
+    transfer_eval_enabled: bool = True
+    transfer_eval_every_optimizer_steps: int = 100
+    transfer_eval_num_samples: int = 32
+    final_eval_num_samples: int = 256
+    final_transfer_eval_num_samples: int = 128
+    final_transfer_eval_enabled: bool = True
+    eval_do_sample: bool = False
+    eval_seed: int = 42
+    final_eval_split: str = "test"
     save_interval: int = 500
 
     profile_enabled: bool = False
@@ -182,6 +198,15 @@ class TrainingConfig:
     generation_do_sample: bool = True
 
     max_steps: Optional[int] = None
+
+    @property
+    def split_ratios(self) -> tuple[float, float, float]:
+        """Return train/validation/test split ratios."""
+        return (
+            self.split_train_ratio,
+            self.split_validation_ratio,
+            self.split_test_ratio,
+        )
 
     # Paths
     output_dir: str = "./outputs"
@@ -279,6 +304,14 @@ def get_8gb_vram_config() -> Config:
     config.training.use_triton_lora = True
     config.training.max_prompt_length = 4096
     config.training.max_response_length = 768
+    config.training.eval_num_samples = 64
+    config.training.eval_every_optimizer_steps = 25
+    config.training.transfer_eval_enabled = True
+    config.training.transfer_eval_every_optimizer_steps = 100
+    config.training.transfer_eval_num_samples = 32
+    config.training.final_eval_num_samples = 256
+    config.training.final_transfer_eval_num_samples = 128
+    config.training.eval_do_sample = False
     config.training.clear_cache_frequency = 50
     config.training.generation_micro_batch = 4
     config.training.training_micro_batch = 4

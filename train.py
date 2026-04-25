@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.grpo.trainer import GRPOTrainerLoop
 from src.utils.config import get_8gb_vram_config
 from src.utils.logging_utils import setup_logging, get_logger
+from src.data.math_dataset import supported_dataset_names
 
 # Module-level logger
 logger = get_logger("main")
@@ -197,7 +198,7 @@ def main():
     parser.add_argument(
         "--group-size",
         type=int,
-        default=4,
+        default=None,
         help="Group size for GRPO (responses per prompt)",
     )
     parser.add_argument(
@@ -211,7 +212,25 @@ def main():
         help="Quantization for LoRA adapters (default: none)",
     )
     parser.add_argument(
-        "--learning-rate", type=float, default=1e-4, help="Learning rate"
+        "--learning-rate", type=float, default=None, help="Learning rate"
+    )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        choices=supported_dataset_names(),
+        default="gsm8k",
+        help="Training dataset to use",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic local train/validation/test splits",
+    )
+    parser.add_argument(
+        "--drop-invalid-dataset-rows",
+        action="store_true",
+        help="Drop rows with invalid/missing normalized answers instead of failing",
     )
     parser.add_argument(
         "--batch-size",
@@ -355,6 +374,61 @@ def main():
         "--no-mask-truncated",
         action="store_true",
         help="Disable masking of truncated completions",
+    )
+    parser.add_argument(
+        "--eval-num-samples",
+        type=int,
+        default=64,
+        help="Selected validation split samples for in-training eval",
+    )
+    parser.add_argument(
+        "--eval-every-optimizer-steps",
+        type=int,
+        default=25,
+        help="Run selected validation eval every N optimizer steps",
+    )
+    transfer_group = parser.add_mutually_exclusive_group()
+    transfer_group.add_argument(
+        "--transfer-eval-enabled",
+        dest="transfer_eval_enabled",
+        action="store_true",
+        default=True,
+        help="Enable transfer validation eval on other supported datasets",
+    )
+    transfer_group.add_argument(
+        "--no-transfer-eval",
+        dest="transfer_eval_enabled",
+        action="store_false",
+        help="Disable transfer validation eval",
+    )
+    parser.add_argument(
+        "--transfer-eval-every-optimizer-steps",
+        type=int,
+        default=100,
+        help="Run transfer validation eval every N optimizer steps",
+    )
+    parser.add_argument(
+        "--transfer-eval-num-samples",
+        type=int,
+        default=32,
+        help="Samples per transfer validation dataset",
+    )
+    parser.add_argument(
+        "--final-eval-num-samples",
+        type=int,
+        default=256,
+        help="Selected test split samples for final eval",
+    )
+    parser.add_argument(
+        "--final-transfer-eval-num-samples",
+        type=int,
+        default=128,
+        help="Samples per transfer test dataset at final eval",
+    )
+    parser.add_argument(
+        "--eval-do-sample",
+        action="store_true",
+        help="Use sampling during eval (default: deterministic greedy)",
     )
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -539,17 +613,33 @@ def main():
     logger.info("Loading 8GB VRAM optimized configuration...")
     config = get_8gb_vram_config()
 
+    config.training.dataset_name = args.dataset_name
+    config.training.split_seed = args.split_seed
+    config.training.drop_invalid_dataset_rows = args.drop_invalid_dataset_rows
+
+    if args.dataset_name == "open-rs":
+        config.sent.enabled = True
+        config.sent.curriculum_stages = 2
+        config.training.learning_rate = 5e-6
+        config.training.max_response_length = 768
+        config.training.generation_temperature = 0.6
+        config.training.generation_top_p = 0.95
+        config.grpo.group_size = 4
+        config.grpo.mask_truncated_completions = False
+
     # Override with command line args
     config.training.output_dir = args.output_dir
     config.training.num_epochs = args.epochs
     config.training.checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
     config.training.log_dir = os.path.join(args.output_dir, "logs")
-    config.grpo.group_size = args.group_size
+    if args.group_size is not None:
+        config.grpo.group_size = args.group_size
     if args.batch_size is not None:
         config.training.batch_size = args.batch_size
     config.lora.rank = args.lora_rank
     config.lora.adapter_quantization = args.lora_adapter_quant
-    config.training.learning_rate = args.learning_rate
+    if args.learning_rate is not None:
+        config.training.learning_rate = args.learning_rate
     if args.use_entropy_mask is not None:
         config.entropy.use_entropy_mask = args.use_entropy_mask
     if args.max_prompt_length is not None:
@@ -617,6 +707,17 @@ def main():
         )
     if args.no_mask_truncated:
         config.grpo.mask_truncated_completions = False
+    config.training.eval_num_samples = args.eval_num_samples
+    config.training.eval_every_optimizer_steps = args.eval_every_optimizer_steps
+    config.training.transfer_eval_enabled = args.transfer_eval_enabled
+    config.training.final_transfer_eval_enabled = args.transfer_eval_enabled
+    config.training.transfer_eval_every_optimizer_steps = (
+        args.transfer_eval_every_optimizer_steps
+    )
+    config.training.transfer_eval_num_samples = args.transfer_eval_num_samples
+    config.training.final_eval_num_samples = args.final_eval_num_samples
+    config.training.final_transfer_eval_num_samples = args.final_transfer_eval_num_samples
+    config.training.eval_do_sample = args.eval_do_sample
     if args.gradient_accumulation_steps is not None:
         config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
     if args.temperature is not None:
@@ -689,6 +790,8 @@ def main():
     # Print configuration
     logger.info("Training Configuration:")
     logger.info("  Model: %s", config.model.model_id)
+    logger.info("  Dataset: %s", config.training.dataset_name)
+    logger.info("  Split Seed: %s", config.training.split_seed)
     logger.info("  LoRA Rank: %s", config.lora.rank)
     logger.info("  LoRA Alpha: %s", config.lora.alpha)
     logger.info("  Group Size: %s", config.grpo.group_size)
@@ -732,6 +835,9 @@ def main():
     logger.info("  Generation Temperature: %s", config.training.generation_temperature)
     logger.info("  Generation Top-p: %s", config.training.generation_top_p)
     logger.info("  Generation Do Sample: %s", config.training.generation_do_sample)
+    logger.info("  Eval Every Optimizer Steps: %s", config.training.eval_every_optimizer_steps)
+    logger.info("  Eval Num Samples: %s", config.training.eval_num_samples)
+    logger.info("  Transfer Eval Enabled: %s", config.training.transfer_eval_enabled)
     logger.info("  Output Directory: %s", config.training.output_dir)
     logger.info("  WandB Enabled: %s", config.wandb.enabled)
     logger.info("  Profiler Enabled: %s", config.training.profile_enabled)

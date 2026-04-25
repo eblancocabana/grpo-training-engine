@@ -16,6 +16,12 @@ from src.utils.logging_utils import get_logger
 from src.core.memory_manager import MemoryManager
 from src.grpo.verifier import RuleBasedVerifier
 from src.data.gsm8k_loader import GRPOGSM8KDataset
+from src.data.math_dataset import (
+    DEFAULT_SPLIT_RATIOS,
+    DEFAULT_SPLIT_SEED,
+    GRPOMathDataset,
+    supported_dataset_names,
+)
 
 logger = get_logger("grpo.benchmark")
 
@@ -54,6 +60,12 @@ class GSM8KBenchmark:
         do_sample: bool = False,
         temperature: float = 1.0,
         top_p: Optional[float] = None,
+        dataset_name: str = "gsm8k",
+        split_seed: int = DEFAULT_SPLIT_SEED,
+        split_ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
+        use_split_abstraction: bool = False,
+        strict_filter_invalid: bool = False,
+        eval_seed: int = 42,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -66,20 +78,38 @@ class GSM8KBenchmark:
         self.do_sample = do_sample
         self.temperature = temperature
         self.top_p = top_p
+        self.dataset_name = dataset_name
+        self.dataset_split = dataset_split
+        self.eval_seed = int(eval_seed)
 
         # Initialize verifier
         self.verifier = RuleBasedVerifier()
 
         # Load dataset
-        logger.info(f"Loading GSM8K {dataset_split} split for benchmark...")
-        full_dataset = GRPOGSM8KDataset(
-            tokenizer=tokenizer,
-            split=dataset_split,
-            max_prompt_length=max_prompt_length,
+        logger.info(
+            "Loading %s %s split for benchmark...",
+            dataset_name,
+            dataset_split,
         )
+        if use_split_abstraction or dataset_name != "gsm8k":
+            full_dataset = GRPOMathDataset(
+                tokenizer=tokenizer,
+                dataset_name=dataset_name,
+                split=dataset_split,
+                max_prompt_length=max_prompt_length,
+                split_seed=split_seed,
+                split_ratios=split_ratios,
+                strict_filter_invalid=strict_filter_invalid,
+            )
+        else:
+            full_dataset = GRPOGSM8KDataset(
+                tokenizer=tokenizer,
+                split=dataset_split,
+                max_prompt_length=max_prompt_length,
+            )
 
         # Select fixed subset
-        subset_rng = random.Random(42)
+        subset_rng = random.Random(self.eval_seed)
         if len(full_dataset) > num_samples:
             self.indices = subset_rng.sample(range(len(full_dataset)), num_samples)
         else:
@@ -88,14 +118,26 @@ class GSM8KBenchmark:
         self.dataset = [full_dataset[i] for i in self.indices]
 
         logger.info(
-            f"Initialized GSM8K Benchmark with {len(self.dataset)} samples from {dataset_split} split"
+            "Initialized %s Benchmark with %d samples from %s split",
+            dataset_name,
+            len(self.dataset),
+            dataset_split,
         )
 
     def run(self, step: int) -> Dict[str, float]:
         """
         Run benchmark evaluation.
         """
-        logger.info(f"Running GSM8K Benchmark at step {step}...")
+        logger.info(
+            "Running %s Benchmark at step %s (split=%s samples=%d do_sample=%s seed=%d max_response_length=%d)...",
+            self.dataset_name,
+            step,
+            self.dataset_split,
+            len(self.dataset),
+            self.do_sample,
+            self.eval_seed,
+            self.max_new_tokens,
+        )
 
         # Switch to inference mode
         self.model.eval()
@@ -187,9 +229,22 @@ class GSM8KBenchmark:
             "val/acc": metrics["correct_count"] / n,
             "val/format_compliance": metrics["format_compliant_count"] / n,
             "val/avg_len": metrics["total_len"] / n,
+            "exact_answer_accuracy": metrics["correct_count"] / n,
+            "avg_response_length": metrics["total_len"] / n,
+            "eval_dataset_name": self.dataset_name,
+            "eval_split": self.dataset_split,
+            "eval_sample_count": n,
+            "eval_do_sample": float(bool(self.do_sample)),
+            "eval_seed": self.eval_seed,
+            "max_response_length": self.max_new_tokens,
         }
 
-        logger.info(f"Benchmark Results: Acc={final_metrics['val/acc']:.2f}")
+        logger.info(
+            "Benchmark Results [%s/%s]: Acc=%.2f",
+            self.dataset_name,
+            self.dataset_split,
+            final_metrics["val/acc"],
+        )
 
         if WANDB_AVAILABLE and wandb.run is not None:
             wandb.log(final_metrics, step=step)
@@ -208,3 +263,17 @@ class GSM8KBenchmark:
         self.memory_manager.optimize_for_training()
 
         return final_metrics
+
+
+class MathBenchmark(GSM8KBenchmark):
+    """Split-aware benchmark for all supported math RL datasets."""
+
+    def __init__(self, *args, **kwargs):
+        dataset_name = kwargs.get("dataset_name", "gsm8k")
+        if dataset_name not in supported_dataset_names():
+            raise ValueError(
+                f"Unsupported eval dataset_name='{dataset_name}'. "
+                f"Allowed: {', '.join(supported_dataset_names())}"
+            )
+        kwargs["use_split_abstraction"] = True
+        super().__init__(*args, **kwargs)

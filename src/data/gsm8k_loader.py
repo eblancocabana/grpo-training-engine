@@ -14,6 +14,17 @@ import torch
 
 from ..utils.logging_utils import get_logger
 from ..utils.config import SENTConfig
+from .math_dataset import (
+    DEFAULT_SPLIT_RATIOS,
+    DEFAULT_SPLIT_SEED,
+    GRPOMathDataset,
+    PROMPT_FORMAT_VERSION,
+    canonical_dataset_name,
+    collate_grpo_math_batch,
+    prompt_format_hash,
+    safe_dataset_cache_stem,
+    split_ratios_dict,
+)
 
 logger = get_logger("data.gsm8k")
 
@@ -40,6 +51,10 @@ def _make_sent_cache_key(
     tokenizer: Optional[object] = None,
     max_prompt_length: Optional[int] = None,
     model_id: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    split: Optional[str] = None,
+    split_seed: Optional[int] = None,
+    split_ratios: Optional[object] = None,
 ) -> str:
     """Build a compatibility hash for SENT cache reuse."""
     sent_dict = sent_config.to_dict() if hasattr(sent_config, "to_dict") else {}
@@ -61,6 +76,16 @@ def _make_sent_cache_key(
         "tokenizer_name": tokenizer_name,
         "tokenizer_class": tokenizer.__class__.__name__ if tokenizer is not None else None,
         "chat_template_hash": chat_template_hash,
+        "dataset_name": dataset_name,
+        "split": split,
+        "split_seed": split_seed,
+        "split_ratios": (
+            split_ratios_dict(split_ratios)
+            if split_ratios is not None
+            else None
+        ),
+        "prompt_format_version": PROMPT_FORMAT_VERSION,
+        "prompt_format_hash": prompt_format_hash(tokenizer),
     }
     payload_json = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(payload_json.encode()).hexdigest()
@@ -127,6 +152,10 @@ def _validate_cache(
     tokenizer: Optional[object] = None,
     max_prompt_length: Optional[int] = None,
     model_id: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    split: Optional[str] = None,
+    split_seed: Optional[int] = None,
+    split_ratios: Optional[object] = None,
 ) -> tuple[bool, str]:
     """Validate cache file exists and has valid metadata."""
     if not os.path.exists(cache_path):
@@ -149,6 +178,25 @@ def _validate_cache(
             )
 
         if config is not None:
+            effective_dataset_name = dataset_name
+            effective_split = split
+            effective_split_seed = split_seed
+            effective_split_ratios = split_ratios
+            if effective_dataset_name is None and metadata.get("dataset_name") is not None:
+                effective_dataset_name = metadata.get("dataset_name")
+            if effective_split is None and metadata.get("split") is not None:
+                effective_split = metadata.get("split")
+            if effective_split_seed is None and metadata.get("split_seed") is not None:
+                effective_split_seed = metadata.get("split_seed")
+            if effective_split_ratios is None and metadata.get("split_ratios") is not None:
+                ratio_meta = metadata.get("split_ratios")
+                if isinstance(ratio_meta, dict):
+                    effective_split_ratios = (
+                        ratio_meta.get("train", 0.90),
+                        ratio_meta.get("validation", 0.05),
+                        ratio_meta.get("test", 0.05),
+                    )
+
             expected_model_id = model_id
             if expected_model_id is None:
                 tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
@@ -159,6 +207,10 @@ def _validate_cache(
                 tokenizer=tokenizer,
                 max_prompt_length=max_prompt_length,
                 model_id=expected_model_id,
+                dataset_name=effective_dataset_name,
+                split=effective_split,
+                split_seed=effective_split_seed,
+                split_ratios=effective_split_ratios,
             )
             cached_key = metadata.get("sent_cache_key")
             if cached_key:
@@ -169,6 +221,18 @@ def _validate_cache(
                     False,
                     "Legacy SENT cache metadata lacks compatibility key; regenerate cache.",
                 )
+
+        if dataset_name is not None and metadata.get("dataset_name") not in (None, dataset_name):
+            return False, "SENT cache dataset_name mismatch"
+        if split is not None and metadata.get("split") not in (None, split):
+            return False, "SENT cache split mismatch"
+        if split_seed is not None and metadata.get("split_seed") not in (None, split_seed):
+            return False, "SENT cache split_seed mismatch"
+        if split_ratios is not None and metadata.get("split_ratios") not in (
+            None,
+            split_ratios_dict(split_ratios),
+        ):
+            return False, "SENT cache split ratios mismatch"
 
         return True, "Cache valid"
     except Exception as e:
@@ -381,6 +445,154 @@ class SENTGSM8KDataset(GRPOGSM8KDataset):
         return super().__getitem__(idx)
 
 
+class SENTMathDataset(GRPOMathDataset):
+    """Generic normalized math dataset with SENT curriculum ordering."""
+
+    def __init__(
+        self,
+        tokenizer,
+        *,
+        dataset_name: str,
+        split: str = "train",
+        max_prompt_length: int = 512,
+        use_sent: bool = True,
+        cache_path: str = "data/cache/gsm8k_sent_sorted.pt",
+        sent_config: Optional[SENTConfig] = None,
+        num_stages: int = 2,
+        model_id: Optional[str] = None,
+        split_seed: int = DEFAULT_SPLIT_SEED,
+        split_ratios: object = DEFAULT_SPLIT_RATIOS,
+        strict_filter_invalid: bool = False,
+    ):
+        super().__init__(
+            tokenizer=tokenizer,
+            dataset_name=dataset_name,
+            split=split,
+            max_prompt_length=max_prompt_length,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
+            strict_filter_invalid=strict_filter_invalid,
+        )
+        self.use_sent = bool(use_sent)
+        self.cache_path = cache_path
+        self.sent_config = sent_config or SENTConfig()
+        self.num_stages = max(1, int(num_stages))
+        tokenizer_model_id = getattr(tokenizer, "name_or_path", None)
+        self.model_id = (
+            model_id
+            if model_id is not None
+            else tokenizer_model_id if isinstance(tokenizer_model_id, str) else None
+        )
+        self.sorted_indices: List[int] = []
+        self.entropies: List[float] = []
+        self.current_stage = 0
+        self.current_stage_indices: List[int] = []
+
+        if not self.use_sent:
+            return
+        if split != "train":
+            raise ValueError("SENTMathDataset only supports SENT ordering on train split.")
+
+        is_valid, msg = _validate_cache(
+            self.cache_path,
+            self.sent_config,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.max_prompt_length,
+            model_id=self.model_id,
+            dataset_name=self.dataset_name,
+            split=self.split,
+            split_seed=self.split_seed,
+            split_ratios=self.split_ratios,
+        )
+        if not is_valid:
+            raise ValueError(
+                f"SENT cache invalid: {msg}. Regenerate cache for "
+                f"{self.dataset_name}/{self.split} or disable SENT."
+            )
+
+        if self.cache_path.endswith(".json"):
+            with open(self.cache_path, "r") as f:
+                cache_data = json.load(f)
+        else:
+            cache_data = torch.load(self.cache_path, weights_only=False)
+        self.sorted_indices = cache_data.get("indices", [])
+        self.entropies = cache_data.get("entropies", [])
+        if any(
+            not isinstance(idx, int) or idx < 0 or idx >= len(self.rows)
+            for idx in self.sorted_indices
+        ):
+            raise ValueError(
+                "SENT cache indices must be positional indices inside the normalized "
+                "training split. Regenerate the cache for the current split metadata."
+            )
+
+        self._compute_stage_boundaries()
+        self.set_stage(1)
+        logger.info("[SENT] Curriculum Learning enabled for %s", self.dataset_name)
+        logger.info("[SENT] Cache loaded from: %s", self.cache_path)
+        logger.info("[SENT] Total sorted samples: %d", len(self.sorted_indices))
+
+    def _compute_stage_boundaries(self):
+        total = len(self.sorted_indices)
+        stage_size = total // self.num_stages
+        self.stage_boundaries = [i * stage_size for i in range(self.num_stages)] + [
+            total
+        ]
+
+    def set_stage(self, stage_idx: int):
+        if stage_idx < 1 or stage_idx > self.num_stages:
+            raise ValueError(f"Stage must be 1-{self.num_stages}, got {stage_idx}")
+        self.current_stage = stage_idx
+        start = self.stage_boundaries[stage_idx - 1]
+        end = self.stage_boundaries[stage_idx]
+        self.current_stage_indices = list(range(start, end))
+
+    def get_stage_info(self) -> Dict[str, Any]:
+        return {
+            "current_stage": self.current_stage,
+            "num_stages": self.num_stages,
+            "stage_start_idx": self.stage_boundaries[self.current_stage - 1],
+            "stage_end_idx": self.stage_boundaries[self.current_stage],
+            "total_samples": len(self.sorted_indices),
+        }
+
+    @staticmethod
+    def _sent_rank_fraction(rank: int, total_size: int) -> float:
+        if total_size <= 1:
+            return 0.0
+        return float(rank) / float(total_size - 1)
+
+    def __len__(self) -> int:
+        if self.use_sent:
+            return len(self.current_stage_indices)
+        return super().__len__()
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self.use_sent:
+            sent_rank = self.current_stage_indices[idx]
+            actual_idx = self.sorted_indices[sent_rank]
+            item = super().__getitem__(actual_idx)
+            item["sent_rank"] = sent_rank
+            item["sent_rank_fraction"] = self._sent_rank_fraction(
+                sent_rank, len(self.sorted_indices)
+            )
+            item["sent_rank_total"] = len(self.sorted_indices)
+            return item
+        return super().__getitem__(idx)
+
+
+def resolve_sent_cache_path(dataset_name: Optional[str], cache_path: str) -> str:
+    """Use dataset-specific SENT cache paths when the default GSM8K path is unchanged."""
+    if dataset_name is None:
+        return cache_path
+    dataset_name = canonical_dataset_name(dataset_name)
+    if dataset_name == "gsm8k":
+        return cache_path
+    if cache_path == "data/cache/gsm8k_sent_sorted.pt":
+        return f"data/cache/{safe_dataset_cache_stem(dataset_name)}_sent_sorted.pt"
+    return cache_path
+
+
 def create_grpo_dataloader(
     tokenizer,
     split: str = "train",
@@ -395,6 +607,10 @@ def create_grpo_dataloader(
     prefetch_factor: int = 2,
     model_id: Optional[str] = None,
     generator: Optional[torch.Generator] = None,
+    dataset_name: Optional[str] = None,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    split_ratios: object = DEFAULT_SPLIT_RATIOS,
+    strict_filter_invalid: bool = False,
 ) -> DataLoader:
     """
     Create DataLoader for GRPO training.
@@ -420,9 +636,73 @@ def create_grpo_dataloader(
         else tokenizer_model_id if isinstance(tokenizer_model_id, str) else None
     )
 
+    dataset_name = canonical_dataset_name(dataset_name) if dataset_name is not None else None
+    cache_path = resolve_sent_cache_path(dataset_name, cache_path)
     requested_use_sent = use_sent
+    if split != "train" and use_sent:
+        logger.info("[SENT] Disabled for %s split; SENT ordering is train-only.", split)
+        use_sent = False
 
-    if use_sent:
+    if dataset_name is not None:
+        if use_sent:
+            is_valid, msg = _validate_cache(
+                cache_path,
+                sent_config,
+                tokenizer=tokenizer,
+                max_prompt_length=max_prompt_length,
+                model_id=resolved_model_id,
+                dataset_name=dataset_name,
+                split=split,
+                split_seed=split_seed,
+                split_ratios=split_ratios,
+            )
+            if is_valid:
+                dataset = SENTMathDataset(
+                    tokenizer=tokenizer,
+                    dataset_name=dataset_name,
+                    split=split,
+                    max_prompt_length=max_prompt_length,
+                    use_sent=True,
+                    cache_path=cache_path,
+                    sent_config=sent_config,
+                    num_stages=num_stages,
+                    model_id=resolved_model_id,
+                    split_seed=split_seed,
+                    split_ratios=split_ratios,
+                    strict_filter_invalid=strict_filter_invalid,
+                )
+            else:
+                if not os.path.exists(cache_path):
+                    logger.warning(
+                        "SENT cache unavailable (%s); falling back to standard %s ordering.",
+                        msg,
+                        dataset_name,
+                    )
+                    dataset = GRPOMathDataset(
+                        tokenizer=tokenizer,
+                        dataset_name=dataset_name,
+                        split=split,
+                        max_prompt_length=max_prompt_length,
+                        split_seed=split_seed,
+                        split_ratios=split_ratios,
+                        strict_filter_invalid=strict_filter_invalid,
+                    )
+                    use_sent = False
+                else:
+                    raise ValueError(
+                        f"SENT cache invalid: {msg}. Regenerate the cache or disable SENT explicitly."
+                    )
+        else:
+            dataset = GRPOMathDataset(
+                tokenizer=tokenizer,
+                dataset_name=dataset_name,
+                split=split,
+                max_prompt_length=max_prompt_length,
+                split_seed=split_seed,
+                split_ratios=split_ratios,
+                strict_filter_invalid=strict_filter_invalid,
+            )
+    elif use_sent:
         is_valid, msg = _validate_cache(
             cache_path,
             sent_config,
@@ -466,6 +746,9 @@ def create_grpo_dataloader(
         )
 
     def grpo_collate(batch):
+        if dataset_name is not None:
+            return collate_grpo_math_batch(batch, tokenizer)
+
         # Determine max length in the batch
         max_len = max(len(item["input_ids"]) for item in batch)
         batch_size = len(batch)
@@ -567,5 +850,7 @@ def create_grpo_dataloader(
     dataloader.sent_num_stages = (
         int(getattr(dataset, "num_stages", 1)) if dataloader.uses_sent_curriculum else 1
     )
+    dataloader.dataset_name = dataset_name or "gsm8k"
+    dataloader.split = split
 
     return dataloader

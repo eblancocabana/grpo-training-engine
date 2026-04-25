@@ -14,10 +14,9 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from tqdm import tqdm
-from datasets import load_dataset
-
 from src.core.model_loader import load_4bit_engine
 from src.data.sent_calculator import SemanticEntropyCalculator
+from src.data.math_dataset import load_math_split_rows, supported_dataset_names
 from src.grpo.verifier import RuleBasedVerifier
 from src.utils.config import get_8gb_vram_config
 from src.utils.logging_utils import setup_logging, get_logger
@@ -26,7 +25,8 @@ logger = get_logger("preprocess_sent")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess GSM8K with SENT")
+    parser = argparse.ArgumentParser(description="Preprocess math dataset train split with SENT")
+    parser.add_argument("--dataset-name", choices=supported_dataset_names(), default="gsm8k")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--max-steps", type=int, default=None, help="Process only N queries")
     parser.add_argument("--M", type=int, default=4, help="Number of samples per query")
@@ -53,6 +53,7 @@ def main():
     logger.info("=" * 60)
     logger.info("SENT Preprocessing")
     logger.info("=" * 60)
+    logger.info("Dataset: %s", args.dataset_name)
     logger.info("Cache path: %s", args.cache_path)
     logger.info("Resume: %s", args.resume)
     logger.info("Max steps: %s", args.max_steps)
@@ -91,13 +92,24 @@ def main():
     config.sent.temperature = args.temperature
     config.sent.checkpoint_interval = args.checkpoint_interval
     config.sent.seed = args.seed
+    config.training.dataset_name = args.dataset_name
     
     calculator = SemanticEntropyCalculator(model, tokenizer, verifier, config)
     
-    logger.info("Loading GSM8K dataset...")
-    gsm8k = load_dataset("gsm8k", "main", split="train")
-    dataset = [{"id": i, "question": item["question"]} for i, item in enumerate(gsm8k)]
+    logger.info("Loading %s train split...", args.dataset_name)
+    rows, split_metadata = load_math_split_rows(
+        args.dataset_name,
+        "train",
+        split_seed=config.training.split_seed,
+        split_ratios=config.training.split_ratios,
+        strict_filter_invalid=config.training.drop_invalid_dataset_rows,
+    )
+    dataset = [
+        {"id": row.get("original_id", i), "question": row["question"]}
+        for i, row in enumerate(rows)
+    ]
     logger.info("Loaded %d examples", len(dataset))
+    logger.info("Split sizes: %s", split_metadata.get("split_sizes"))
     
     if args.max_steps:
         dataset = dataset[:args.max_steps]
