@@ -68,6 +68,87 @@ class TestIntegration:
         assert loss.item() is not None
         assert "ratio_mean" in metrics
 
+    def test_train_py_forwards_fixed_sent_stage(self, tmp_path):
+        import train as train_module
+
+        captured = {}
+
+        class DummyTrainer:
+            def __init__(self, config):
+                captured["config"] = config
+                self.checkpoint_manager = None
+
+            def setup(self):
+                captured["setup_called"] = True
+
+            def train(self, sent_stage=None):
+                captured["sent_stage"] = sent_stage
+
+        with patch.object(train_module, "GRPOTrainerLoop", DummyTrainer), patch.object(
+            train_module, "setup_logging"
+        ), patch.object(train_module, "kill_stale_train_processes"), patch.object(
+            train_module, "clear_gpu_memory"
+        ), patch.object(train_module, "check_system", return_value=True), patch(
+            "sys.argv",
+            [
+                "train.py",
+                "--output-dir",
+                str(tmp_path),
+                "--sent-stage",
+                "2",
+            ],
+        ):
+            train_module.main()
+
+        assert captured["setup_called"] is True
+        assert captured["sent_stage"] == 2
+
+    def test_train_py_forwards_fixed_sent_stage_when_resuming(self, tmp_path):
+        import train as train_module
+
+        captured = {}
+
+        class DummyCheckpointManager:
+            @staticmethod
+            def get_latest_checkpoint():
+                return "/tmp/fake_checkpoint.pt"
+
+        class DummyTrainer:
+            def __init__(self, config):
+                captured["config"] = config
+                self.checkpoint_manager = DummyCheckpointManager()
+
+            def setup(self):
+                captured["setup_called"] = True
+
+            def load_checkpoint(self, checkpoint_path):
+                captured["checkpoint_path"] = checkpoint_path
+                return {"step": 12, "epoch": 1}
+
+            def train(self, sent_stage=None):
+                captured["sent_stage"] = sent_stage
+
+        with patch.object(train_module, "GRPOTrainerLoop", DummyTrainer), patch.object(
+            train_module, "setup_logging"
+        ), patch.object(train_module, "kill_stale_train_processes"), patch.object(
+            train_module, "clear_gpu_memory"
+        ), patch.object(train_module, "check_system", return_value=True), patch(
+            "sys.argv",
+            [
+                "train.py",
+                "--output-dir",
+                str(tmp_path),
+                "--resume",
+                "--sent-stage",
+                "2",
+            ],
+        ):
+            train_module.main()
+
+        assert captured["setup_called"] is True
+        assert captured["checkpoint_path"] == "/tmp/fake_checkpoint.pt"
+        assert captured["sent_stage"] == 2
+
     def test_overfitting_tiny_dataset(self):
         from src.grpo.algorithm import GRPOTrainer
 

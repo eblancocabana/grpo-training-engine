@@ -245,6 +245,12 @@ def main():
         help="Disable SENT curriculum loading and use plain GSM8K ordering",
     )
     parser.add_argument(
+        "--sent-stage",
+        type=int,
+        default=None,
+        help="Fixed curriculum stage to train on; omit for automatic stage progression",
+    )
+    parser.add_argument(
         "--use-triton",
         action="store_true",
         default=None,
@@ -709,6 +715,10 @@ def main():
     logger.info("  Entropy Percentile: %s", config.entropy.percentile)
     logger.info("  Entropy Min Tokens: %s", config.entropy.min_tokens)
     logger.info("  SENT Enabled: %s", config.sent.enabled)
+    logger.info(
+        "  Fixed SENT Stage: %s",
+        args.sent_stage if args.sent_stage is not None else "auto",
+    )
     logger.info("  Triton Kernels: %s", config.training.use_triton_kernels)
     logger.info("  Triton Generation: %s", config.training.use_triton_generation)
     logger.info(
@@ -780,8 +790,13 @@ def main():
                 resume_info.get("step"),
                 resume_info.get("epoch"),
             )
+            if args.sent_stage is not None:
+                logger.info(
+                    "Resume override: fixed SENT stage set to %d for continued training.",
+                    args.sent_stage,
+                )
 
-        trainer.train()
+        trainer.train(sent_stage=args.sent_stage)
         logger.info("Training completed successfully!")
         logger.info("Checkpoints saved to: %s", config.training.checkpoint_dir)
     except KeyboardInterrupt:
