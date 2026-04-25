@@ -740,8 +740,16 @@ def _prefill_paged_cache(
     block_off = torch.where(valid_mask, token_slots % block_size, 0)
     block_ids = torch.gather(block_tables, 1, block_idx.clamp(min=0))
 
-    for layer_idx in range(len(past_kv)):
-        k_layer, v_layer = past_kv[layer_idx]
+    if hasattr(past_kv, "layers"):
+        kv_layers = [
+            (layer.keys, layer.values)
+            for layer in past_kv.layers
+            if getattr(layer, "keys", None) is not None
+        ]
+    else:
+        kv_layers = [past_kv[layer_idx] for layer_idx in range(len(past_kv))]
+
+    for layer_idx, (k_layer, v_layer) in enumerate(kv_layers):
         k_valid = k_layer.permute(0, 2, 1, 3)[valid_mask].to(dtype=torch.bfloat16)
         v_valid = v_layer.permute(0, 2, 1, 3)[valid_mask].to(dtype=torch.bfloat16)
         valid_block_ids = block_ids[valid_mask]
