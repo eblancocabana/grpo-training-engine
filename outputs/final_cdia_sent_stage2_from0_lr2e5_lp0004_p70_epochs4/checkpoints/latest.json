@@ -1,0 +1,5 @@
+{
+  "latest_checkpoint": "outputs/final_cdia_sent_stage2_from0_lr2e5_lp0004_p70_epochs4/checkpoints/checkpoint_step_3737_epoch_1.pt",
+  "step": 3737,
+  "epoch": 0
+}

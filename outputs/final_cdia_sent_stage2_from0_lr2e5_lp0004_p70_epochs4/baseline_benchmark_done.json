@@ -1,0 +1,1 @@
+{"model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "model_checksum": "f2b853217f23473f1ba1937add6312f71e9f237b01cc6eb4d1496d770b3f5bc1", "tokenizer_vocab_size": 151643, "time": 1776947696.2662947, "metrics": {"val/acc": 0.76, "val/format_compliance": 0.94, "val/avg_len": 422.34}, "generation": {"max_new_tokens": 640, "do_sample": true}}
