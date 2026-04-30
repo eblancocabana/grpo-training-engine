@@ -1,0 +1,5 @@
+{
+  "latest_checkpoint": "outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent/checkpoints/checkpoint_step_9496_final.pt",
+  "step": 9496,
+  "epoch": 1
+}
