@@ -1,0 +1,18 @@
+models:
+  base:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: null
+  sent_final:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: /path/to/sent/final/lora
+  sent_best:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: /path/to/sent/best/lora
+    selection_source: in_training_validation
+  no_sent_final:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: /path/to/no_sent/final/lora
+  no_sent_best:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: /path/to/no_sent/best/lora
+    selection_source: in_training_validation
