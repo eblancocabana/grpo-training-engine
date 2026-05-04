@@ -397,6 +397,28 @@ manager = CheckpointManager("./outputs/checkpoints")
 info = manager.load_checkpoint("checkpoint_step_1000.pt", model, optimizer)
 ```
 
+### Artifact Push Notes
+
+The run `outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1` was pushed with its config, metrics, benchmark marker, `checkpoints/latest.json`, and final LoRA weights. The following full checkpoint files remain local because each is about 1.5 GB and cannot be pushed to GitHub as regular Git blobs without Git LFS:
+
+```text
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_0_interrupted.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_1000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_197_interrupted.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_2000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_3000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_4000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_441_interrupted.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_5000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_6000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_7000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_8000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9000.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_epoch_1.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_final.pt
+outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_interrupted.pt
+```
+
 ## 🎯 RTX 3060 Ti Specific Optimizations
 
 ### Verified Optimal Configuration (group_size=8)
