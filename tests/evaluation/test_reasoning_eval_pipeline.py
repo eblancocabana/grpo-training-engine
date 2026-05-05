@@ -2,11 +2,13 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from scripts.evaluate_reasoning_vllm import main, parse_args
-from src.reasoning_eval.datasets import load_examples, resolve_dataset_names
+from src.reasoning_eval.adapters import prepare_vllm_adapter
+from src.reasoning_eval.datasets import DATASET_REGISTRY, load_examples, normalize_row, resolve_dataset_names
 from src.reasoning_eval.io import completed_example_keys, prepare_output_dir
-from src.reasoning_eval.models import load_models_config
+from src.reasoning_eval.models import ModelSpec, load_models_config
 from src.reasoning_eval.prompts import build_prompt
 from src.reasoning_eval.schema import EvalExample, Generation
 from src.reasoning_eval.scoring import (
@@ -67,6 +69,31 @@ def test_models_config_requires_in_training_selection_source(tmp_path: Path) -> 
         load_models_config(path)
 
 
+def test_manual_lora_pt_adapter_is_converted_for_vllm(tmp_path: Path) -> None:
+    source = tmp_path / "manual_lora.pt"
+    torch.save(
+        {
+            "lora_weights": {
+                "model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(2, 4),
+                "model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros(4, 2),
+            }
+        },
+        source,
+    )
+    adapter_dir = Path(
+        prepare_vllm_adapter(
+            ModelSpec("adapter", "base-model", adapter=str(source)),
+            tmp_path / "out",
+        )
+    )
+
+    assert (adapter_dir / "adapter_model.safetensors").exists()
+    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    assert config["r"] == 2
+    assert config["lora_alpha"] == 4
+    assert config["target_modules"] == ["q_proj"]
+
+
 def test_dataset_loading_from_local_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     dataset_path = tmp_path / "gsm8k.jsonl"
     _write_jsonl(
@@ -83,6 +110,34 @@ def test_dataset_loading_from_local_override(monkeypatch: pytest.MonkeyPatch, tm
     assert metadata["source"] == "local_file"
     assert examples[0].example_id == "a"
     assert examples[0].answer == "#### 42"
+
+
+def test_normalize_svamp_capitalized_schema() -> None:
+    row = {
+        "ID": "chal-736",
+        "Body": "There are 35 birds in Asia and 62 in Africa.",
+        "Question": "How many more are in Africa?",
+        "Answer": "27",
+        "question_concat": "There are 35 birds in Asia and 62 in Africa. How many more are in Africa?",
+    }
+
+    example = normalize_row(row, DATASET_REGISTRY["svamp"], 0)
+
+    assert example.example_id == "chal-736"
+    assert example.question.startswith("There are 35 birds")
+    assert example.answer == "27"
+
+
+def test_normalize_dapo_chat_prompt_schema() -> None:
+    row = {
+        "prompt": [{"role": "user", "content": "Solve 40+2."}],
+        "label": "42",
+    }
+
+    example = normalize_row(row, DATASET_REGISTRY["dapo-math-17k"], 0)
+
+    assert example.question == "Solve 40+2."
+    assert example.answer == "42"
 
 
 def test_prompt_construction_for_math_and_multiple_choice() -> None:
@@ -213,4 +268,3 @@ def test_end_to_end_mock_evaluation_and_resume(monkeypatch: pytest.MonkeyPatch, 
     assert main([*argv, "--resume"]) == 0
     second_raw = (out / "raw_generations.jsonl").read_text(encoding="utf-8")
     assert second_raw == first_raw
-

@@ -8,6 +8,9 @@ import os
 import sys
 import torch
 import argparse
+import gc
+import hashlib
+import json
 import random
 import shutil
 import signal
@@ -23,10 +26,254 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.grpo.trainer import GRPOTrainerLoop
 from src.utils.config import get_8gb_vram_config
 from src.utils.logging_utils import setup_logging, get_logger
-from src.data.math_dataset import supported_dataset_names
+from src.data.math_dataset import load_math_split_rows, supported_dataset_names
+from src.data.gsm8k_loader import format_grpo_prompt, resolve_sent_cache_path
+from src.grpo.verifier import RuleBasedVerifier
 
 # Module-level logger
 logger = get_logger("main")
+
+
+def _format_prompt_with_cap(tokenizer, question: str, max_prompt_length: int) -> str:
+    prompt = format_grpo_prompt(tokenizer, question)
+    encoded = tokenizer(
+        prompt,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_prompt_length,
+        padding=False,
+        return_tensors=None,
+    )
+    return tokenizer.decode(encoded["input_ids"], skip_special_tokens=False)
+
+
+def _initial_benchmark_cache_path(config) -> str:
+    training = config.training
+    payload = {
+        "dataset_name": training.dataset_name,
+        "split": "validation",
+        "model_id": config.model.model_id,
+        "num_samples": training.eval_num_samples,
+        "eval_seed": training.eval_seed,
+        "split_seed": training.split_seed,
+        "split_ratios": training.split_ratios,
+        "max_prompt_length": 512,
+        "max_response_length": training.max_response_length,
+        "do_sample": training.eval_do_sample,
+        "temperature": (
+            training.generation_temperature if training.eval_do_sample else 0.0
+        ),
+        "top_p": training.generation_top_p if training.eval_do_sample else 1.0,
+        "prompt_format": "math_grpo_prompt_v1",
+        "backend": "vllm_initial_benchmark",
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+    stem = str(training.dataset_name).replace("/", "_").replace("-", "_")
+    return os.path.join("data", "cache", f"{stem}_initial_benchmark_{digest}.json")
+
+
+def _baseline_marker_path(config) -> str:
+    return os.path.join(config.training.output_dir, "baseline_benchmark_done.json")
+
+
+def _has_checkpoints(config) -> bool:
+    ckpt_dir = getattr(config.training, "checkpoint_dir", None)
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        return False
+    return any(
+        name.startswith("checkpoint_step_") or name.endswith(".pt")
+        for name in os.listdir(ckpt_dir)
+    )
+
+
+def _load_cached_initial_benchmark(config) -> dict | None:
+    path = _initial_benchmark_cache_path(config)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    logger.info("[Benchmark:vLLM] Reusing cached initial benchmark: %s", path)
+    return payload
+
+
+def _save_initial_benchmark_marker(config, payload: dict) -> None:
+    marker_path = _baseline_marker_path(config)
+    os.makedirs(config.training.output_dir, exist_ok=True)
+    with open(marker_path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "model_id": config.model.model_id,
+                "model_checksum": payload.get("cache_key"),
+                "tokenizer_vocab_size": payload.get("tokenizer_vocab_size"),
+                "time": time.time(),
+                "metrics": payload.get("metrics"),
+                "generation": {
+                    "max_new_tokens": config.training.max_response_length,
+                    "do_sample": config.training.eval_do_sample,
+                    "backend": "vllm",
+                },
+                "reused_global_cache": bool(payload.get("reused_global_cache", False)),
+                "global_cache_path": payload.get("cache_path"),
+            },
+            fh,
+        )
+    logger.info("[Benchmark:vLLM] Baseline marker saved at %s", marker_path)
+    config.training.force_initial_benchmark = False
+
+
+def _run_initial_benchmark_vllm_if_needed(config) -> None:
+    training = config.training
+    if getattr(training, "skip_initial_benchmark", False):
+        return
+    if getattr(training, "force_initial_benchmark", False) is not True:
+        if _has_checkpoints(config):
+            logger.info("[Benchmark:vLLM] Checkpoints detected; skipping initial benchmark.")
+            return
+        marker_path = _baseline_marker_path(config)
+        if os.path.exists(marker_path):
+            logger.info("[Benchmark:vLLM] Run marker already exists; skipping.")
+            return
+
+    cached = _load_cached_initial_benchmark(config)
+    if cached is not None and getattr(training, "force_initial_benchmark", False) is not True:
+        cached["reused_global_cache"] = True
+        _save_initial_benchmark_marker(config, cached)
+        return
+
+    logger.info("[Benchmark:vLLM] Running initial validation benchmark before model setup...")
+    try:
+        from transformers import AutoTokenizer
+        from vllm import LLM, SamplingParams
+    except ImportError as exc:
+        logger.warning("[Benchmark:vLLM] Missing dependency, falling back to trainer benchmark: %s", exc)
+        return
+
+    max_prompt_length = 512
+    max_response_length = training.max_response_length
+    rows, split_metadata = load_math_split_rows(
+        training.dataset_name,
+        "validation",
+        split_seed=training.split_seed,
+        split_ratios=training.split_ratios,
+        strict_filter_invalid=training.drop_invalid_dataset_rows,
+    )
+    subset_rng = random.Random(training.eval_seed)
+    indices = (
+        subset_rng.sample(range(len(rows)), training.eval_num_samples)
+        if len(rows) > training.eval_num_samples
+        else list(range(len(rows)))
+    )
+    selected = [rows[idx] for idx in indices]
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model.model_id, trust_remote_code=True)
+    llm = LLM(
+        model=config.model.model_id,
+        max_model_len=max_prompt_length + max_response_length,
+        gpu_memory_utilization=0.70,
+        max_num_seqs=48,
+        max_num_batched_tokens=4096,
+        seed=training.eval_seed,
+        trust_remote_code=True,
+    )
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=training.generation_temperature if training.eval_do_sample else 0.0,
+        top_p=training.generation_top_p if training.eval_do_sample else 1.0,
+        max_tokens=max_response_length,
+        seed=training.eval_seed,
+    )
+    prompts = [
+        _format_prompt_with_cap(tokenizer, row["question"], max_prompt_length)
+        for row in selected
+    ]
+    outputs = llm.generate(prompts, sampling_params)
+    verifier = RuleBasedVerifier()
+
+    correct_count = 0
+    format_count = 0
+    total_len = 0
+    for row, request_output in zip(selected, outputs):
+        completion = request_output.outputs[0]
+        text = completion.text
+        token_count = len(getattr(completion, "token_ids", None) or [])
+        reward, _info = verifier.verify(text, row["answer"])
+        correct_count += int(reward == 1.0)
+        total_len += token_count
+        format_count += int("</think>" in text and ("<answer>" in text or "\\boxed{" in text))
+
+    n = max(1, len(selected))
+    metrics = {
+        "val/acc": correct_count / n,
+        "val/format_compliance": format_count / n,
+        "val/avg_len": total_len / n,
+        "exact_answer_accuracy": correct_count / n,
+        "avg_response_length": total_len / n,
+        "eval_dataset_name": training.dataset_name,
+        "eval_split": "validation",
+        "eval_sample_count": len(selected),
+        "eval_do_sample": float(bool(training.eval_do_sample)),
+        "eval_seed": training.eval_seed,
+        "max_response_length": max_response_length,
+        "optimizer_step": 0,
+        "checkpoint_step": 0,
+        "dataset_name": training.dataset_name,
+        "split": "train",
+    }
+
+    cache_path = _initial_benchmark_cache_path(config)
+    cache_key = os.path.splitext(os.path.basename(cache_path))[0]
+    payload = {
+        "cache_key": cache_key,
+        "cache_path": cache_path,
+        "metadata": {
+            "backend": "vllm",
+            "model_id": config.model.model_id,
+            "dataset_name": training.dataset_name,
+            "split": "validation",
+            "split_metadata": split_metadata,
+            "indices": indices,
+            "max_prompt_length": max_prompt_length,
+            "max_response_length": max_response_length,
+            "eval_num_samples": training.eval_num_samples,
+            "eval_seed": training.eval_seed,
+        },
+        "tokenizer_vocab_size": getattr(tokenizer, "vocab_size", None),
+        "metrics": metrics,
+    }
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    logger.info("[Benchmark:vLLM] Global initial benchmark cache saved: %s", cache_path)
+    _save_initial_benchmark_marker(config, payload)
+
+    del llm
+    del tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    logger.info("[Benchmark:vLLM] vLLM engine cleared; continuing to trainer setup.")
+
+
+def _load_sent_cache_metadata(cache_path: str) -> dict:
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        if cache_path.endswith(".json"):
+            import json
+
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        else:
+            data = torch.load(cache_path, weights_only=False)
+    except Exception as exc:
+        logger.warning("Could not read SENT cache metadata from %s: %s", cache_path, exc)
+        return {}
+    metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def _read_cmdline(pid_path: Path) -> list[str]:
@@ -437,6 +684,30 @@ def main():
         help="Gradient accumulation steps (default: 16)",
     )
     parser.add_argument(
+        "--generation-micro-batch",
+        type=int,
+        default=None,
+        help="Generation micro-batch size override",
+    )
+    parser.add_argument(
+        "--training-micro-batch",
+        type=int,
+        default=None,
+        help="Training micro-batch size override",
+    )
+    parser.add_argument(
+        "--max-generation-micro-batch",
+        type=int,
+        default=None,
+        help="Maximum generation micro-batch size for OOM recovery probing",
+    )
+    parser.add_argument(
+        "--max-training-micro-batch",
+        type=int,
+        default=None,
+        help="Maximum training micro-batch size for OOM recovery probing",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -646,6 +917,28 @@ def main():
         config.training.max_prompt_length = args.max_prompt_length
     if args.max_response_length is not None:
         config.training.max_response_length = args.max_response_length
+    if config.sent.enabled and args.max_prompt_length is None:
+        resolved_sent_cache_path = resolve_sent_cache_path(
+            config.training.dataset_name,
+            config.sent.cache_path,
+        )
+        sent_cache_metadata = _load_sent_cache_metadata(resolved_sent_cache_path)
+        cached_prompt_length = sent_cache_metadata.get("max_prompt_length")
+        if (
+            sent_cache_metadata.get("status") == "complete"
+            and sent_cache_metadata.get("dataset_name") == config.training.dataset_name
+            and sent_cache_metadata.get("split") == "train"
+            and isinstance(cached_prompt_length, int)
+            and cached_prompt_length > 0
+            and cached_prompt_length != config.training.max_prompt_length
+        ):
+            logger.info(
+                "Using max_prompt_length=%d from SENT cache metadata at %s. "
+                "Pass --max-prompt-length to override explicitly.",
+                cached_prompt_length,
+                resolved_sent_cache_path,
+            )
+            config.training.max_prompt_length = cached_prompt_length
 
     if args.use_triton is True:
         config.training.use_triton_kernels = True
@@ -720,6 +1013,22 @@ def main():
     config.training.eval_do_sample = args.eval_do_sample
     if args.gradient_accumulation_steps is not None:
         config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.generation_micro_batch is not None:
+        if args.generation_micro_batch < 1:
+            raise ValueError("generation_micro_batch must be >= 1")
+        config.training.generation_micro_batch = args.generation_micro_batch
+    if args.training_micro_batch is not None:
+        if args.training_micro_batch < 1:
+            raise ValueError("training_micro_batch must be >= 1")
+        config.training.training_micro_batch = args.training_micro_batch
+    if args.max_generation_micro_batch is not None:
+        if args.max_generation_micro_batch < 1:
+            raise ValueError("max_generation_micro_batch must be >= 1")
+        config.training.max_generation_micro_batch = args.max_generation_micro_batch
+    if args.max_training_micro_batch is not None:
+        if args.max_training_micro_batch < 1:
+            raise ValueError("max_training_micro_batch must be >= 1")
+        config.training.max_training_micro_batch = args.max_training_micro_batch
     if args.temperature is not None:
         config.training.generation_temperature = args.temperature
     if args.top_p is not None:
@@ -857,6 +1166,9 @@ def main():
         return
 
     # Create trainer and start training
+    if not args.resume and not args.resume_checkpoint:
+        _run_initial_benchmark_vllm_if_needed(config)
+
     logger.info("Initializing trainer...")
     trainer = GRPOTrainerLoop(config)
 

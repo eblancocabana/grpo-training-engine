@@ -58,6 +58,10 @@ def _make_sent_cache_key(
 ) -> str:
     """Build a compatibility hash for SENT cache reuse."""
     sent_dict = sent_config.to_dict() if hasattr(sent_config, "to_dict") else {}
+    sent_compat = {
+        "num_samples": sent_dict.get("num_samples"),
+        "temperature": sent_dict.get("temperature"),
+    }
     chat_template = getattr(tokenizer, "chat_template", None)
     if not isinstance(chat_template, str):
         chat_template = None
@@ -70,7 +74,7 @@ def _make_sent_cache_key(
         else None
     )
     payload = {
-        "sent": sent_dict,
+        "sent": sent_compat,
         "model_id": model_id,
         "max_prompt_length": max_prompt_length,
         "tokenizer_name": tokenizer_name,
@@ -215,7 +219,30 @@ def _validate_cache(
             cached_key = metadata.get("sent_cache_key")
             if cached_key:
                 if cached_key != expected_key:
-                    return False, "SENT cache compatibility mismatch"
+                    metadata_checks = (
+                        ("dataset_name", effective_dataset_name),
+                        ("split", effective_split),
+                        ("split_seed", effective_split_seed),
+                        ("split_ratios", split_ratios_dict(effective_split_ratios) if effective_split_ratios is not None else None),
+                        ("model_id", expected_model_id),
+                        ("max_prompt_length", max_prompt_length),
+                        ("num_samples", getattr(config, "num_samples", None)),
+                        ("temperature", getattr(config, "temperature", None)),
+                        ("prompt_format_version", PROMPT_FORMAT_VERSION),
+                        ("prompt_format_hash", prompt_format_hash(tokenizer)),
+                    )
+                    for field, expected_value in metadata_checks:
+                        if expected_value is None:
+                            continue
+                        cached_value = metadata.get(field)
+                        if cached_value is not None and cached_value != expected_value:
+                            return (
+                                False,
+                                f"SENT cache {field} mismatch: cached={cached_value!r}, expected={expected_value!r}",
+                            )
+                    logger.warning(
+                        "SENT cache compatibility key mismatch, but metadata fields match; accepting cache."
+                    )
             elif metadata.get("config_hash"):
                 return (
                     False,

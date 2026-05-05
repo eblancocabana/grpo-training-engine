@@ -1,0 +1,68 @@
+{
+  "cache_key": "gsm_plus_initial_benchmark_788f5323ab099448",
+  "cache_path": "data/cache/gsm_plus_initial_benchmark_788f5323ab099448.json",
+  "metadata": {
+    "backend": "vllm",
+    "dataset_name": "gsm-plus",
+    "eval_num_samples": 16,
+    "eval_seed": 42,
+    "indices": [
+      114,
+      25,
+      281,
+      250,
+      228,
+      142,
+      104,
+      89,
+      432,
+      32,
+      30,
+      95,
+      223,
+      238,
+      517,
+      27
+    ],
+    "max_prompt_length": 512,
+    "max_response_length": 768,
+    "model_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "split": "validation",
+    "split_metadata": {
+      "dataset_name": "gsm-plus",
+      "invalid_rows_dropped": 0,
+      "num_rows": 528,
+      "source_split": "test",
+      "split": "validation",
+      "split_ratios": {
+        "test": 0.05,
+        "train": 0.9,
+        "validation": 0.05
+      },
+      "split_seed": 42,
+      "split_sizes": {
+        "test": 528,
+        "train": 9496,
+        "validation": 528
+      }
+    }
+  },
+  "metrics": {
+    "avg_response_length": 559.0625,
+    "checkpoint_step": 0,
+    "dataset_name": "gsm-plus",
+    "eval_dataset_name": "gsm-plus",
+    "eval_do_sample": 0.0,
+    "eval_sample_count": 16,
+    "eval_seed": 42,
+    "eval_split": "validation",
+    "exact_answer_accuracy": 0.75,
+    "max_response_length": 768,
+    "optimizer_step": 0,
+    "split": "train",
+    "val/acc": 0.75,
+    "val/avg_len": 559.0625,
+    "val/format_compliance": 0.875
+  },
+  "tokenizer_vocab_size": 151643
+}

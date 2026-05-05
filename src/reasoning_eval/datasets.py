@@ -32,8 +32,8 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
     "aime24": DatasetSpec("aime24", "math", "math", _candidates(("HuggingFaceH4/aime_2024", None, "train"), ("Maxwell-Jia/AIME_2024", None, "train")), local_path_env="REASONING_EVAL_AIME24_PATH", default_limit=30),
     "aime25": DatasetSpec("aime25", "math", "math", _candidates(("math-ai/aime25", None, "train"), ("test-time-compute/aime_2025", None, "train")), local_path_env="REASONING_EVAL_AIME25_PATH", default_limit=30),
     "amc23": DatasetSpec("amc23", "math", "math", _candidates(("math-ai/amc23", None, "train"), ("AI-MO/aimo-validation-amc", None, "train")), local_path_env="REASONING_EVAL_AMC23_PATH", default_limit=40),
-    "minerva": DatasetSpec("minerva", "math", "math", _candidates(("EleutherAI/hendrycks_math", None, "test"), ("TIGER-Lab/MathInstruct", "minerva_math", "train")), local_path_env="REASONING_EVAL_MINERVA_PATH", default_limit=272),
-    "olympiadbench": DatasetSpec("olympiadbench", "math", "math", _candidates(("Hothan/OlympiadBench", None, "test"), ("Hothan/OlympiadBench", None, "train")), local_path_env="REASONING_EVAL_OLYMPIADBENCH_PATH"),
+    "minerva": DatasetSpec("minerva", "math", "math", _candidates(("EleutherAI/hendrycks_math", "algebra", "test"), ("EleutherAI/hendrycks_math", "number_theory", "test")), local_path_env="REASONING_EVAL_MINERVA_PATH", default_limit=272),
+    "olympiadbench": DatasetSpec("olympiadbench", "math", "math", _candidates(("Hothan/OlympiadBench", "OE_TO_maths_en_COMP", "train"), ("Hothan/OlympiadBench", "OE_MM_maths_en_COMP", "train")), local_path_env="REASONING_EVAL_OLYMPIADBENCH_PATH"),
     "gaokao": DatasetSpec("gaokao", "math", "math", _candidates(("FiveEye/GaokaoBench", None, "test"), ("FiveEye/GaokaoBench", None, "train")), local_path_env="REASONING_EVAL_GAOKAO_PATH"),
     "omni-math": DatasetSpec("omni-math", "math", "math", _candidates(("KbsdJames/Omni-MATH", None, "test"), ("KbsdJames/Omni-MATH", None, "train")), local_path_env="REASONING_EVAL_OMNI_MATH_PATH"),
     "open-rs": DatasetSpec("open-rs", "training_transfer", "math", _candidates(("knoveleng/open-rs", None, "test"), ("knoveleng/open-rs", None, "train")), local_path_env="REASONING_EVAL_OPEN_RS_PATH"),
@@ -41,10 +41,10 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
     "open-deepscaler": DatasetSpec("open-deepscaler", "training_transfer", "math", _candidates(("knoveleng/open-deepscaler", None, "test"), ("knoveleng/open-deepscaler", None, "train")), local_path_env="REASONING_EVAL_OPEN_DEEPSCALER_PATH"),
     "still": DatasetSpec("still", "training_transfer", "math", _candidates(("RUC-AIBOX/STILL-3-Preview-RL-Data", None, "train")), local_path_env="REASONING_EVAL_STILL_PATH"),
     "numinamath-cot": DatasetSpec("numinamath-cot", "training_transfer", "math", _candidates(("AI-MO/NuminaMath-CoT", None, "test"), ("AI-MO/NuminaMath-CoT", None, "train")), local_path_env="REASONING_EVAL_NUMINAMATH_COT_PATH"),
-    "gpqa-diamond": DatasetSpec("gpqa-diamond", "science_general", "multiple_choice", _candidates(("Idavidrein/gpqa", "gpqa_diamond", "train"), ("fingertap/GPQA-Diamond", None, "train")), local_path_env="REASONING_EVAL_GPQA_DIAMOND_PATH", default_limit=198),
+    "gpqa-diamond": DatasetSpec("gpqa-diamond", "science_general", "multiple_choice", _candidates(("fingertap/GPQA-Diamond", None, "test"), ("Idavidrein/gpqa", "gpqa_diamond", "train")), local_path_env="REASONING_EVAL_GPQA_DIAMOND_PATH", default_limit=198),
     "mmlu-pro": DatasetSpec("mmlu-pro", "science_general", "multiple_choice", _candidates(("TIGER-Lab/MMLU-Pro", None, "test")), local_path_env="REASONING_EVAL_MMLU_PRO_PATH"),
     "mmlu": DatasetSpec("mmlu", "science_general", "multiple_choice", _candidates(("cais/mmlu", "all", "test")), local_path_env="REASONING_EVAL_MMLU_PATH"),
-    "bbh": DatasetSpec("bbh", "science_general", "math", _candidates(("lukaemon/bbh", None, "test"), ("lukaemon/bbh", None, "train")), local_path_env="REASONING_EVAL_BBH_PATH"),
+    "bbh": DatasetSpec("bbh", "science_general", "math", _candidates(("lukaemon/bbh", "multistep_arithmetic_two", "test"), ("lukaemon/bbh", "logical_deduction_three_objects", "test")), local_path_env="REASONING_EVAL_BBH_PATH"),
     "arc-challenge": DatasetSpec("arc-challenge", "science_general", "multiple_choice", _candidates(("allenai/ai2_arc", "ARC-Challenge", "test")), local_path_env="REASONING_EVAL_ARC_CHALLENGE_PATH"),
     "drop": DatasetSpec("drop", "science_general", "drop", _candidates(("ucinlp/drop", None, "validation")), local_path_env="REASONING_EVAL_DROP_PATH"),
     "humaneval": DatasetSpec("humaneval", "coding", "code", _candidates(("openai/openai_humaneval", None, "test")), local_path_env="REASONING_EVAL_HUMANEVAL_PATH", default_limit=164),
@@ -127,11 +127,18 @@ def _first(row: Mapping[str, Any], keys: Iterable[str]) -> Any:
         current: Any = row
         found = True
         for part in key.split("."):
-            if isinstance(current, Mapping) and part in current:
-                current = current[part]
-            else:
+            if not isinstance(current, Mapping):
                 found = False
                 break
+            if part in current:
+                current = current[part]
+                continue
+            lowered = {str(raw_key).lower(): raw_key for raw_key in current}
+            raw_key = lowered.get(part.lower())
+            if raw_key is None:
+                found = False
+                break
+            current = current[raw_key]
         if found and current not in (None, ""):
             return current
     return None
@@ -150,6 +157,50 @@ def _extract_chat_question(value: Any) -> str | None:
         elif isinstance(message, str) and message.strip():
             texts.append(message.strip())
     return texts[-1] if texts else None
+
+
+def _extract_question(row: Mapping[str, Any]) -> str | None:
+    concat_question = _first(row, ("question_concat",))
+    if isinstance(concat_question, str) and concat_question.strip():
+        return concat_question.strip()
+
+    body = _first(row, ("body",))
+    direct_question = _first(row, ("question",))
+    if isinstance(body, str) and body.strip() and isinstance(direct_question, str) and direct_question.strip():
+        return f"{body.strip()} {direct_question.strip()}"
+
+    for key in ("messages", "conversations", "prompt"):
+        chat_question = _extract_chat_question(_first(row, (key,)))
+        if chat_question:
+            return chat_question
+
+    question = _first(row, ("question", "problem", "prompt", "query", "instruction", "input", "text"))
+    if isinstance(question, str) and question.strip():
+        return question.strip()
+    return None
+
+
+def _extract_after_marker(text: str) -> str | None:
+    if "####" in text:
+        answer = text.rsplit("####", 1)[1].strip()
+        if answer:
+            return answer
+    marker = "\\boxed{"
+    if marker not in text:
+        return None
+    start = text.rfind(marker) + len(marker)
+    depth = 1
+    chars: list[str] = []
+    for char in text[start:]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        chars.append(char)
+    answer = "".join(chars).strip()
+    return answer or None
 
 
 def _normalize_choices(row: Mapping[str, Any]) -> list[str]:
@@ -197,6 +248,16 @@ def _normalize_answer(row: Mapping[str, Any], spec: DatasetSpec) -> Any:
     )
     if isinstance(value, int) and spec.task_type == "multiple_choice":
         return chr(65 + value)
+    if value not in (None, ""):
+        return value
+
+    solution = _first(row, ("solution", "reference", "rationale", "cot", "response"))
+    if isinstance(solution, list):
+        solution = "\n".join(str(item) for item in solution if item is not None)
+    if isinstance(solution, str):
+        marker_answer = _extract_after_marker(solution)
+        if marker_answer:
+            return marker_answer
     return value
 
 
@@ -218,11 +279,7 @@ def _build_code_tests(row: Mapping[str, Any], dataset_name: str) -> str:
 
 
 def normalize_row(row: Mapping[str, Any], spec: DatasetSpec, index: int) -> EvalExample:
-    question = (
-        _extract_chat_question(row.get("messages"))
-        or _extract_chat_question(row.get("conversations"))
-        or _first(row, ("question", "problem", "prompt", "query", "instruction", "input", "text"))
-    )
+    question = _extract_question(row)
     if not isinstance(question, str) or not question.strip():
         raise ValueError(f"Could not extract question for {spec.name} row {index}")
 
@@ -243,7 +300,7 @@ def normalize_row(row: Mapping[str, Any], spec: DatasetSpec, index: int) -> Eval
         if row.get("prompt") and spec.name == "humaneval":
             question = str(row["prompt"])
 
-    example_id = str(row.get("id") or row.get("task_id") or row.get("uid") or row.get("problem_id") or index)
+    example_id = str(_first(row, ("id", "task_id", "uid", "problem_id", "ID")) or index)
     return EvalExample(
         dataset=spec.name,
         family=spec.family,

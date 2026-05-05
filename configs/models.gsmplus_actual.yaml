@@ -1,0 +1,63 @@
+# Actual local GSM-Plus SENT vs no-SENT comparison config.
+#
+# These are the matched runs:
+# - SENT:    outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent
+# - no-SENT: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1
+#
+# Best checkpoints are selected from in-training periodic_validation metrics only.
+# Note: the SENT run's absolute logged validation peak is step 7196, but no
+# checkpoint_step_7196.pt exists locally. The best existing saved validation
+# checkpoint for that run is checkpoint_step_4000.pt.
+models:
+  base:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: null
+
+  sent_final:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent/lora_weights_final.pt
+    run_dir: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent
+    checkpoint_path: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent/checkpoints/checkpoint_step_9496_final.pt
+    checkpoint_step: 9496
+    dataset_name: gsm-plus
+    sent_enabled: true
+
+  sent_best:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent/checkpoints/checkpoint_step_4000.pt
+    selection_source: in_training_validation
+    run_dir: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent
+    checkpoint_path: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1_sent/checkpoints/checkpoint_step_4000.pt
+    checkpoint_step: 4000
+    dataset_name: gsm-plus
+    sent_enabled: true
+    validation_metric: val/acc
+    validation_value: 0.6875
+    validation_phase: periodic_validation
+    validation_format_compliance: 0.875
+    validation_avg_len: 495.625
+    note: "Best existing saved validation checkpoint. Absolute logged validation peak was step 7196 with val/acc 0.6875, but checkpoint_step_7196.pt is not present locally."
+
+  no_sent_final:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/lora_weights_final.pt
+    run_dir: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1
+    checkpoint_path: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_final.pt
+    checkpoint_step: 9496
+    dataset_name: gsm-plus
+    sent_enabled: false
+
+  no_sent_best:
+    model_id: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    adapter: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_8000.pt
+    selection_source: in_training_validation
+    run_dir: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1
+    checkpoint_path: outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_8000.pt
+    checkpoint_step: 8000
+    dataset_name: gsm-plus
+    sent_enabled: false
+    validation_metric: val/acc
+    validation_value: 0.6875
+    validation_phase: periodic_validation
+    validation_format_compliance: 0.875
+    validation_avg_len: 480.875

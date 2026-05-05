@@ -40,6 +40,20 @@ from src.data.math_dataset import load_math_split_rows, supported_dataset_names
 logger = get_logger("preprocess_sent_vllm")
 
 
+def _format_prompt_with_cap(tokenizer: Any, question: str, max_prompt_length: int) -> str:
+    prompt = format_grpo_prompt(tokenizer, question)
+    encoded = tokenizer(
+        prompt,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_prompt_length,
+        padding=False,
+        return_tensors=None,
+    )
+    input_ids = encoded["input_ids"]
+    return tokenizer.decode(input_ids, skip_special_tokens=False)
+
+
 def _assert_resume_cache_compatible(
     cache_path: str,
     expected_key: str,
@@ -76,12 +90,12 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="./logs")
     parser.add_argument("--model-id", type=str, default=None)
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (number of queries)")
-    parser.add_argument("--max-model-len", type=int, default=2048, help="Max model context length")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size (number of queries)")
+    parser.add_argument("--max-model-len", type=int, default=None, help="Max model context length")
     parser.add_argument(
         "--max-prompt-length",
         type=int,
-        default=None,
+        default=512,
         help="Alias for the prompt length used in SENT cache metadata.",
     )
     parser.add_argument(
@@ -90,12 +104,12 @@ def main():
         default=None,
         help="Maximum sampled response length for SENT generations.",
     )
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
-                        help="Fraction of GPU memory for vLLM (default: 0.90)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.70,
+                        help="Fraction of GPU memory for vLLM (default: 0.70)")
     parser.add_argument(
         "--max-num-seqs",
         type=int,
-        default=16,
+        default=48,
         help="Maximum active vLLM sequences. Lower this on 8GB GPUs to avoid sampler warmup OOM.",
     )
     parser.add_argument(
@@ -141,11 +155,19 @@ def main():
     config.sent.cache_path = args.cache_path
     config.sent.checkpoint_interval = args.checkpoint_interval
     config.sent.seed = args.seed
-    config.training.max_prompt_length = (
-        args.max_prompt_length if args.max_prompt_length is not None else args.max_model_len
-    )
     if args.max_response_length is not None:
         config.training.max_response_length = args.max_response_length
+    if args.max_prompt_length is not None:
+        config.training.max_prompt_length = args.max_prompt_length
+    if args.max_model_len is None:
+        args.max_model_len = (
+            config.training.max_prompt_length + config.training.max_response_length
+        )
+    else:
+        config.training.max_prompt_length = max(
+            1,
+            args.max_model_len - config.training.max_response_length,
+        )
 
     logger.info("Loading vLLM engine: %s ...", model_id)
     start_time = time.time()
@@ -258,7 +280,14 @@ def main():
             batch = remaining[batch_start:batch_end]
 
             # Build prompts for this batch
-            prompts = [format_grpo_prompt(tokenizer, ex["question"]) for ex in batch]
+            prompts = [
+                _format_prompt_with_cap(
+                    tokenizer,
+                    ex["question"],
+                    config.training.max_prompt_length,
+                )
+                for ex in batch
+            ]
 
             # vLLM generates n=M samples per prompt
             outputs = llm.generate(prompts, sampling_params)

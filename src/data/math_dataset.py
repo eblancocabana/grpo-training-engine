@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -45,10 +46,13 @@ class MathDatasetSpec:
 
 DATASET_SPECS: Dict[str, MathDatasetSpec] = {
     "gsm8k": MathDatasetSpec("gsm8k", "gsm8k", "main"),
+    "gsm-plus": MathDatasetSpec("gsm-plus", "qintongli/GSM-Plus"),
     "open-rs": MathDatasetSpec("open-rs", "knoveleng/open-rs"),
     "dapo-math-17k": MathDatasetSpec("dapo-math-17k", "OpenRLHF/dapo-math-17k"),
     "open-deepscaler": MathDatasetSpec("open-deepscaler", "knoveleng/open-deepscaler"),
 }
+
+NUMBER_PATTERN = re.compile(r"-?(?:(?:\d{1,3}(?:,\d{3})+)|(?:\d+))(?:\.\d+)?")
 
 FILTERED_DATASET_DIRS: Dict[str, str] = {
     "dapo-open-rs-lenfilter-640": "data/filtered/dapo-open-rs_lenfilter_640",
@@ -219,6 +223,15 @@ def _extract_user_from_chat(value: Any) -> Optional[str]:
 
 def extract_question(row: Mapping[str, Any]) -> str:
     """Extract a user-facing math problem from common dataset schemas."""
+    concat_question = _first_string(row, ("question_concat", "Question_Concat"))
+    if concat_question:
+        return concat_question
+
+    body = _first_string(row, ("body", "Body"))
+    direct_question = _first_string(row, ("question", "Question"))
+    if body and direct_question:
+        return f"{body} {direct_question}".strip()
+
     for key in ("messages", "conversations", "prompt"):
         chat_question = _extract_user_from_chat(row.get(key))
         if chat_question:
@@ -300,6 +313,26 @@ def extract_answer(row: Mapping[str, Any]) -> str:
     )
 
 
+def normalize_gold_answer_text(answer: str) -> str:
+    """Normalize dataset gold answers into numeric text when units are present."""
+    answer = str(answer).strip()
+    if not answer:
+        return answer
+    marker_answer = _extract_after_gsm8k_marker(answer)
+    if marker_answer:
+        answer = marker_answer
+    cleaned = answer.replace("$", "").replace("%", "").strip()
+    try:
+        float(cleaned.replace(",", ""))
+        return cleaned
+    except ValueError:
+        pass
+    numbers = NUMBER_PATTERN.findall(cleaned)
+    if numbers:
+        return numbers[-1].strip()
+    return answer
+
+
 def extract_solution(row: Mapping[str, Any]) -> Optional[str]:
     """Extract optional reference reasoning text."""
     return _first_string(row, ("solution", "reference", "cot", "rationale", "answer"))
@@ -315,7 +348,7 @@ def normalize_math_row(
     """Normalize one raw row into trainer-ready metadata."""
     row = _as_mapping(row)
     question = extract_question(row)
-    answer = extract_answer(row)
+    answer = normalize_gold_answer_text(extract_answer(row))
     solution = extract_solution(row)
     original_id = row.get("id") or row.get("uid") or row.get("uuid") or raw_index
     return {
@@ -481,13 +514,17 @@ def load_math_split_rows(
             raw_indices = split_assignments[split]
             source_label = "train"
     else:
-        source_rows = _sequence_from_split(raw, "train") if isinstance(raw, Mapping) else raw
+        if isinstance(raw, Mapping):
+            source_label = "train" if "train" in raw else next(iter(raw.keys()))
+            source_rows = _sequence_from_split(raw, source_label)
+        else:
+            source_label = "train"
+            source_rows = raw
         split_assignments = deterministic_split_indices(
             len(source_rows), seed=split_seed, ratios=split_ratios
         )
         assert_split_separation(split_assignments)
         raw_indices = split_assignments[split]
-        source_label = "train"
 
     for split_name in SUPPORTED_SPLITS:
         if split_name == "test" and isinstance(raw, Mapping) and "train" in raw and "test" in raw:

@@ -48,7 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--n-samples", type=int, default=None)
     parser.add_argument("--limit-per-dataset", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of prompts submitted to one blocking vLLM generate call. "
+            "Defaults to min(max_num_seqs, 32) for frequent global progress updates."
+        ),
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.70)
     parser.add_argument("--dtype", default="auto")
@@ -69,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--resume and --overwrite are mutually exclusive")
     if args.n_samples is not None and args.n_samples < 1:
         parser.error("--n-samples must be >= 1")
-    if args.batch_size < 1:
+    if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
     if args.temperature is not None and args.temperature < 0:
         parser.error("--temperature must be >= 0")
@@ -77,6 +85,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--top-p must be in (0, 1]")
     args.protocol = args.protocol or _default_protocol(args.tier)
     args.max_new_tokens = args.max_new_tokens or _default_max_tokens(args.tier)
+    if args.batch_size is None:
+        args.batch_size = max(1, min(int(args.max_num_seqs), 32))
     return args
 
 

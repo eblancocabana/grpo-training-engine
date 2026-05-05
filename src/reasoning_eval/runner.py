@@ -13,6 +13,7 @@ from typing import Any, Iterable
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from src.reasoning_eval.adapters import prepare_vllm_adapter
 from src.reasoning_eval.datasets import DATASET_REGISTRY, load_examples
 from src.reasoning_eval.io import append_jsonl, completed_example_keys, read_jsonl, write_csv
 from src.reasoning_eval.models import ModelSpec
@@ -276,9 +277,24 @@ class EvaluationRunner:
         examples_by_dataset: dict[str, list[EvalExample]] = {}
         dataset_metadata: dict[str, Any] = {}
         for dataset_name in self.dataset_names:
-            examples, metadata = load_examples(dataset_name, limit=self.limit_per_dataset, seed=self.seed)
+            try:
+                examples, metadata = load_examples(dataset_name, limit=self.limit_per_dataset, seed=self.seed)
+            except Exception as exc:
+                metadata = {
+                    "source": "unavailable",
+                    "loaded_examples": 0,
+                    "seed": self.seed,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "local_path_env": DATASET_REGISTRY[dataset_name].local_path_env,
+                }
+                examples = []
             examples_by_dataset[dataset_name] = examples
             dataset_metadata[dataset_name] = metadata
+        (self.output_dir / "dataset_metadata.json").write_text(
+            json.dumps(dataset_metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
         completed = completed_example_keys(self.output_dir / "scores_by_example.jsonl")
         raw_path = self.output_dir / "raw_generations.jsonl"
@@ -288,9 +304,13 @@ class EvaluationRunner:
         models_by_base: dict[str, list[ModelSpec]] = defaultdict(list)
         for model in self.models:
             models_by_base[model.model_id].append(model)
+        adapter_paths = {
+            model.key: prepare_vllm_adapter(model, self.output_dir)
+            for model in self.models
+        }
 
         adapter_ids = {model.key: idx + 1 for idx, model in enumerate(self.models)}
-        total_units = 0
+        total_samples = 0
         for model in self.models:
             for dataset_name, examples in examples_by_dataset.items():
                 for protocol in protocol_plan(
@@ -300,20 +320,21 @@ class EvaluationRunner:
                     temperature=self.temperature,
                     top_p=self.top_p,
                     n_samples=self.n_samples,
-                    seed=self.seed,
-                    dataset_name=dataset_name,
-                ):
-                    total_units += sum(
-                        1
+                        seed=self.seed,
+                        dataset_name=dataset_name,
+                    ):
+                    total_samples += sum(
+                        protocol.n
                         for example in examples
                         if (model.key, dataset_name, protocol.name, example.example_id) not in completed
                     )
 
-        pbar = tqdm(total=total_units, desc="Evaluating", unit="example")
+        completed_samples = 0
+        pbar = tqdm(total=total_samples, desc="Evaluating samples", unit="sample")
         started = time.time()
         for base_model_id, base_models in models_by_base.items():
             tokenizer = None if self.use_mock_generator else AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
-            enable_lora = any(model.adapter for model in base_models)
+            enable_lora = any(adapter_paths[model.key] for model in base_models)
             if self.use_mock_generator:
                 generator: Any = MockGenerator(tokenizer)
             else:
@@ -359,7 +380,7 @@ class EvaluationRunner:
                                 dataset=dataset_name,
                                 protocol=protocol,
                                 example_ids=batch_ids,
-                                adapter_path=model.adapter,
+                                adapter_path=adapter_paths[model.key],
                                 adapter_id=adapter_ids[model.key],
                             )
                             parsed_rows, score_rows = _score_rows(
@@ -372,14 +393,21 @@ class EvaluationRunner:
                             append_jsonl(parsed_path, parsed_rows)
                             append_jsonl(scores_path, score_rows)
                             completed.update((model.key, dataset_name, protocol.name, example.example_id) for example in batch)
-                            pbar.update(len(batch))
+                            completed_samples += len(generations)
+                            pbar.update(len(generations))
                             elapsed = time.time() - started
-                            examples_per_s = pbar.n / max(1e-9, elapsed)
-                            eta_s = (total_units - pbar.n) / examples_per_s if examples_per_s > 0 else 0.0
+                            samples_per_s = pbar.n / max(1e-9, elapsed)
+                            remaining_samples = max(0, total_samples - pbar.n)
+                            eta_s = remaining_samples / samples_per_s if samples_per_s > 0 else 0.0
                             generated_tokens = sum(gen.token_count for gen in generations)
                             pbar.set_postfix(
                                 {
-                                    "ex/s": f"{examples_per_s:.2f}",
+                                    "done": f"{completed_samples}/{total_samples}",
+                                    "remaining": remaining_samples,
+                                    "model": model.key,
+                                    "dataset": dataset_name,
+                                    "protocol": protocol.name,
+                                    "sample/s": f"{samples_per_s:.2f}",
                                     "tok/s": f"{generated_tokens / max(1e-9, time.time() - batch_started):.1f}",
                                     "elapsed": f"{elapsed / 60:.1f}m",
                                     "eta": f"{eta_s / 60:.1f}m",
@@ -393,8 +421,3 @@ class EvaluationRunner:
         write_csv(self.output_dir / "summary_by_dataset.csv", dataset_summary)
         write_csv(self.output_dir / "summary_by_model.csv", model_summary)
         write_csv(self.output_dir / "macro_family_summary.csv", family_summary)
-        (self.output_dir / "dataset_metadata.json").write_text(
-            json.dumps(dataset_metadata, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-

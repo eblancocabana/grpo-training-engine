@@ -1,137 +1,0 @@
-[INFO][grpo.main] ============================================================
-[INFO][grpo.main] System Check for RTX 3060 Ti
-[INFO][grpo.main] ============================================================
-[INFO][grpo.main] GPU: NVIDIA GeForce RTX 3060 Ti
-[INFO][grpo.main] VRAM: 7.7 GB
-[INFO][grpo.main] CUDA Version: 12.8
-[INFO][grpo.main] PyTorch Version: 2.9.1+cu128
-[INFO][grpo.main] ============================================================
-[INFO][grpo.main] Loading 8GB VRAM optimized configuration...
-[INFO][grpo.main] Training Configuration:
-[INFO][grpo.main]   Model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-[INFO][grpo.main]   LoRA Rank: 32
-[INFO][grpo.main]   LoRA Alpha: 32
-[INFO][grpo.main]   Group Size: 4
-[INFO][grpo.main]   Clip Epsilon: 0.2
-[INFO][grpo.main]   Epsilon High: 0.3
-[INFO][grpo.main]   Delta (safety cap): 1.5
-[INFO][grpo.main]   Mask Truncated: True
-[INFO][grpo.main]   Learning Rate: 0.0001
-[INFO][grpo.main]   Epochs: 3
-[INFO][grpo.main]   Gradient Accumulation: 4
-[INFO][grpo.main]   Entropy Mask: True
-[INFO][grpo.main]   Triton Kernels: True
-[INFO][grpo.main]   Max Prompt Length: 128
-[INFO][grpo.main]   Max Response Length: 1024
-[INFO][grpo.main]   Output Directory: benchmarks/output/ing_inf/triton_on_lora_rank_32
-[INFO][grpo.main]   WandB Enabled: True
-[INFO][grpo.main]   Profiler Enabled: False
-[INFO][grpo.main]   Metrics JSONL: False
-[INFO][grpo.main]   WandB Project: grpo-training
-[INFO][grpo.main]   WandB Implementation: python
-[INFO][grpo.main] Initializing trainer...
-[INFO][grpo.trainer] ============================================================
-[INFO][grpo.trainer] GRPO Training Engine - 8GB VRAM Optimized
-[INFO][grpo.trainer] ============================================================
-[INFO][grpo.trainer] 
-[Setup] Loading model and tokenizer...
-[INFO][grpo.core.model_loader] Loading model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B...
-[INFO][grpo.core.model_loader] Model loaded to: cuda:0
-[INFO][grpo.trainer] 
-[Setup] Injecting LoRA layers...
-[INFO][grpo.core.lora] Total LoRA layers injected: 112
-[INFO][grpo.core.lora] Trainable parameters: 8,716,288
-[INFO][grpo.core.memory_manager] Model with LoRA Memory Usage:
-[INFO][grpo.core.memory_manager]   Total parameters: 1,130,706,432
-[INFO][grpo.core.memory_manager]   Trainable parameters: 8,716,288 (0.77%)
-[INFO][grpo.core.memory_manager]   Estimated memory: 0.54 GB
-[INFO][grpo.trainer] 
-[Setup] Optimizing 224 LoRA parameter tensors
-[INFO][grpo.core.memory_manager] Gradient checkpointing disabled (vram_auto).
-[INFO][grpo.grpo.benchmark] Loading GSM8K test split for benchmark...
-[INFO][grpo.data.gsm8k] Loading GSM8K test split for GRPO...
-[INFO][grpo.data.gsm8k] Loaded 1319 examples
-[INFO][grpo.grpo.benchmark] Initialized GSM8K Benchmark with 50 samples from test split
-wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/ndk/.netrc.
-wandb: Currently logged in as: e-blanco (e-blanco-universidad-de-deusto) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
-wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
-wandb: setting up run mzf1aclk
-wandb: Tracking run with wandb version 0.24.2
-wandb: Run data is saved locally in /home/ndk/proyectos/clase/pfg/wandb/run-20260409_055012-mzf1aclk
-wandb: Run `wandb offline` to turn off syncing.
-wandb: Syncing run INF-triton_on_lora_rank_32
-wandb: ⭐️ View project at https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training
-wandb: 🚀 View run at https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training/runs/mzf1aclk
-[INFO][grpo.trainer] [WandB] Initialized run: INF-triton_on_lora_rank_32
-[INFO][grpo.trainer] [WandB] Project: grpo-training
-wandb: WARNING The get_url method is deprecated and will be removed in a future release. Please use `run.url` instead.
-[INFO][grpo.trainer] [WandB] URL: https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training/runs/mzf1aclk
-[INFO][grpo.trainer] 
-[Setup] Complete!
-[INFO][grpo.core.memory_manager] [Setup] VRAM: 1.60GB / 7.66GB (29.7%) | Free: 5.39GB
-[INFO][grpo.trainer] 
-[Train] Creating dataloader...
-[INFO][grpo.data.gsm8k] Loading GSM8K train split for GRPO...
-[INFO][grpo.data.gsm8k] Loaded 7473 examples
-[WARNING][grpo.data.gsm8k] Config hash mismatch: cache=431b974c4ba65f60611fd211fb2fc0a1699d7df4233ae39d25da2d75497ee8f4, current=d01c597d8728895af6efb348b82cfdf9da258c4127631ff7420475dded933f07
-[INFO][grpo.data.gsm8k] [SENT] Curriculum Learning enabled
-[INFO][grpo.data.gsm8k] [SENT] Cache loaded from: data/cache/gsm8k_sent_sorted.pt
-[INFO][grpo.data.gsm8k] [SENT] Total sorted samples: 7473
-[INFO][grpo.data.gsm8k] [SENT] Curriculum stages: 2 (Current: 1)
-[INFO][grpo.trainer] [SENT] Training on stage 1/2 (samples 0-3736)
-[INFO][grpo.trainer] [Train] Starting training for 3 epochs...
-[INFO][grpo.trainer] [Train] Steps per epoch: ~3736
-[INFO][grpo.trainer] [Train] Gradient accumulation: 4
-[INFO][grpo.trainer] [Train] Effective batch size: 4
-[INFO][grpo.utils.checkpoint] Saved config to benchmarks/output/ing_inf/triton_on_lora_rank_32/config.json
-[INFO][grpo.trainer] [Benchmark] Initial benchmark skipped by configuration.
-Epoch 1:   0%|          | 0/3736 [00:00<?, ?it/s]                                                 [INFO][grpo.trainer] 
-[OOM] Backoff #1: gen_batch=2, train_batch=2
-Epoch 1:   0%|          | 0/3736 [00:26<?, ?it/s]Epoch 1:   0%|          | 1/3736 [00:26<27:59:41, 26.98s/it]Epoch 1:   0%|          | 1/3736 [00:58<27:59:41, 26.98s/it, loss=0.0347, reward=0.803, tokens_per_sec=25.193, vram=3.8GB, step=1]Epoch 1:   0%|          | 2/3736 [00:58<30:39:30, 29.56s/it, loss=0.0347, reward=0.803, tokens_per_sec=25.193, vram=3.8GB, step=1]                                                                                                                                  [INFO][grpo.trainer] 
-[OOM] Backoff #2: gen_batch=1, train_batch=1
-Epoch 1:   0%|          | 2/3736 [02:45<30:39:30, 29.56s/it, loss=0.0347, reward=0.803, tokens_per_sec=25.193, vram=3.8GB, step=1]Epoch 1:   0%|          | 3/3736 [02:45<67:37:30, 65.22s/it, loss=0.0347, reward=0.803, tokens_per_sec=25.193, vram=3.8GB, step=1]Epoch 1:   0%|          | 3/3736 [03:41<67:37:30, 65.22s/it, loss=0.0015, reward=0.790, tokens_per_sec=15.222, vram=2.6GB, step=2]Epoch 1:   0%|          | 4/3736 [03:41<63:28:33, 61.23s/it, loss=0.0015, reward=0.790, tokens_per_sec=15.222, vram=2.6GB, step=2]Epoch 1:   0%|          | 4/3736 [04:39<63:28:33, 61.23s/it, loss=0.1876, reward=0.766, tokens_per_sec=15.944, vram=2.9GB, step=3]Epoch 1:   0%|          | 5/3736 [04:39<62:28:11, 60.28s/it, loss=0.1876, reward=0.766, tokens_per_sec=15.944, vram=2.9GB, step=3]Epoch 1:   0%|          | 5/3736 [06:03<62:28:11, 60.28s/it, loss=0.4416, reward=0.633, tokens_per_sec=17.634, vram=3.4GB, step=4]Epoch 1:   0%|          | 6/3736 [06:03<70:33:58, 68.11s/it, loss=0.4416, reward=0.633, tokens_per_sec=17.634, vram=3.4GB, step=4]Epoch 1:   0%|          | 6/3736 [07:06<70:33:58, 68.11s/it, loss=0.0087, reward=0.763, tokens_per_sec=14.943, vram=2.9GB, step=5]Epoch 1:   0%|          | 7/3736 [07:06<68:58:08, 66.58s/it, loss=0.0087, reward=0.763, tokens_per_sec=14.943, vram=2.9GB, step=5]Epoch 1:   0%|          | 7/3736 [07:57<68:58:08, 66.58s/it, loss=0.3511, reward=0.788, tokens_per_sec=16.491, vram=2.8GB, step=6]Epoch 1:   0%|          | 8/3736 [07:57<63:57:13, 61.76s/it, loss=0.3511, reward=0.788, tokens_per_sec=16.491, vram=2.8GB, step=6]Epoch 1:   0%|          | 8/3736 [08:57<63:57:13, 61.76s/it, loss=0.1145, reward=0.736, tokens_per_sec=17.592, vram=2.9GB, step=7]Epoch 1:   0%|          | 9/3736 [08:57<63:21:30, 61.20s/it, loss=0.1145, reward=0.736, tokens_per_sec=17.592, vram=2.9GB, step=7]Epoch 1:   0%|          | 9/3736 [10:25<63:21:30, 61.20s/it, loss=0.1893, reward=0.601, tokens_per_sec=18.301, vram=3.5GB, step=8]Epoch 1:   0%|          | 10/3736 [10:25<71:39:10, 69.23s/it, loss=0.1893, reward=0.601, tokens_per_sec=18.301, vram=3.5GB, step=8]Epoch 1:   0%|          | 10/3736 [12:12<71:39:10, 69.23s/it, loss=0.3072, reward=-0.455, tokens_per_sec=16.996, vram=4.0GB, step=9]Epoch 1:   0%|          | 11/3736 [12:12<83:38:30, 80.83s/it, loss=0.3072, reward=-0.455, tokens_per_sec=16.996, vram=4.0GB, step=9]Epoch 1:   0%|          | 11/3736 [13:18<83:38:30, 80.83s/it, loss=0.3339, reward=0.719, tokens_per_sec=17.094, vram=3.0GB, step=10]                                                                                                                                    [INFO][grpo.core.memory_manager] [Step 10] VRAM: 2.97GB / 7.66GB (47.9%) | Free: 3.99GB
-Epoch 1:   0%|          | 11/3736 [13:18<83:38:30, 80.83s/it, loss=0.3339, reward=0.719, tokens_per_sec=17.094, vram=3.0GB, step=10]Epoch 1:   0%|          | 12/3736 [13:18<78:53:36, 76.27s/it, loss=0.3339, reward=0.719, tokens_per_sec=17.094, vram=3.0GB, step=10]Epoch 1:   0%|          | 12/3736 [14:13<78:53:36, 76.27s/it, loss=0.0334, reward=0.774, tokens_per_sec=16.316, vram=2.6GB, step=11]Epoch 1:   0%|          | 13/3736 [14:13<72:21:23, 69.97s/it, loss=0.0334, reward=0.774, tokens_per_sec=16.316, vram=2.6GB, step=11]Epoch 1:   0%|          | 13/3736 [15:37<72:21:23, 69.97s/it, loss=0.6297, reward=0.623, tokens_per_sec=17.851, vram=3.4GB, step=12]Epoch 1:   0%|          | 14/3736 [15:37<76:51:11, 74.33s/it, loss=0.6297, reward=0.623, tokens_per_sec=17.851, vram=3.4GB, step=12]Epoch 1:   0%|          | 14/3736 [17:42<76:51:11, 74.33s/it, loss=48.5531, reward=0.187, tokens_per_sec=18.110, vram=5.2GB, step=13]Epoch 1:   0%|          | 15/3736 [17:42<92:22:56, 89.38s/it, loss=48.5531, reward=0.187, tokens_per_sec=18.110, vram=5.2GB, step=13]Epoch 1:   0%|          | 15/3736 [18:55<92:22:56, 89.38s/it, loss=5.0020, reward=0.684, tokens_per_sec=17.130, vram=4.0GB, step=14] Epoch 1:   0%|          | 16/3736 [18:55<87:28:23, 84.65s/it, loss=5.0020, reward=0.684, tokens_per_sec=17.130, vram=4.0GB, step=14]Epoch 1:   0%|          | 16/3736 [20:08<87:28:23, 84.65s/it, loss=0.1670, reward=0.692, tokens_per_sec=16.918, vram=3.0GB, step=15]Epoch 1:   0%|          | 17/3736 [20:08<83:45:28, 81.08s/it, loss=0.1670, reward=0.692, tokens_per_sec=16.918, vram=3.0GB, step=15]Epoch 1:   0%|          | 17/3736 [23:21<83:45:28, 81.08s/it, loss=0.0000, reward=-0.896, tokens_per_sec=18.542, vram=5.3GB, step=16]Epoch 1:   0%|          | 18/3736 [23:21<118:33:32, 114.80s/it, loss=0.0000, reward=-0.896, tokens_per_sec=18.542, vram=5.3GB, step=16]Epoch 1:   0%|          | 18/3736 [25:33<118:33:32, 114.80s/it, loss=18.5472, reward=0.371, tokens_per_sec=19.068, vram=5.0GB, step=17]Epoch 1:   1%|          | 19/3736 [25:33<123:51:48, 119.96s/it, loss=18.5472, reward=0.371, tokens_per_sec=19.068, vram=5.0GB, step=17]Epoch 1:   1%|          | 19/3736 [26:39<123:51:48, 119.96s/it, loss=0.0210, reward=0.732, tokens_per_sec=16.380, vram=2.9GB, step=18] Epoch 1:   1%|          | 20/3736 [26:39<106:57:15, 103.62s/it, loss=0.0210, reward=0.732, tokens_per_sec=16.380, vram=2.9GB, step=18]Epoch 1:   1%|          | 20/3736 [28:01<106:57:15, 103.62s/it, loss=0.0922, reward=-0.380, tokens_per_sec=18.449, vram=3.4GB, step=19]Epoch 1:   1%|          | 21/3736 [28:01<100:22:06, 97.26s/it, loss=0.0922, reward=-0.380, tokens_per_sec=18.449, vram=3.4GB, step=19] Epoch 1:   1%|          | 21/3736 [29:28<100:22:06, 97.26s/it, loss=-3.3941, reward=0.351, tokens_per_sec=18.381, vram=3.5GB, step=20]                                                                                                                                      [INFO][grpo.core.memory_manager] [Step 20] VRAM: 3.48GB / 7.66GB (54.6%) | Free: 3.48GB
-Epoch 1:   1%|          | 21/3736 [29:28<100:22:06, 97.26s/it, loss=-3.3941, reward=0.351, tokens_per_sec=18.381, vram=3.5GB, step=20]Epoch 1:   1%|          | 22/3736 [29:28<97:04:44, 94.10s/it, loss=-3.3941, reward=0.351, tokens_per_sec=18.381, vram=3.5GB, step=20]                                                                                                                                      [INFO][grpo.trainer] Reached max steps (20); stopping epoch.
-Epoch 1:   1%|          | 22/3736 [29:28<97:04:44, 94.10s/it, loss=-3.3941, reward=0.351, tokens_per_sec=18.381, vram=3.5GB, step=20]Epoch 1:   1%|          | 22/3736 [29:28<82:56:09, 80.39s/it, loss=-3.3941, reward=0.351, tokens_per_sec=18.381, vram=3.5GB, step=20]
-[INFO][grpo.trainer] 
-[Epoch 1] Avg Loss: 3.5811, Avg Reward: 0.464
-[INFO][grpo.trainer] [Train] Reached max steps (20); stopping training loop.
-[INFO][grpo.trainer] 
-[Train] Training complete!
-wandb: uploading data; updating run metadata
-wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
-wandb: uploading history steps 18-19, summary, console lines 23-23
-wandb: 
-wandb: Run history:
-wandb:             epoch/advantage_std ▁
-wandb:       epoch/avg_response_length ▁
-wandb:                epoch/avg_reward ▁
-wandb:      epoch/entropy_masked_ratio ▁
-wandb:           epoch/gen_micro_batch ▁
-wandb:                   epoch/kl_loss ▁
-wandb:                      epoch/loss ▁
-wandb:         epoch/oom_backoff_count ▁
-wandb:               epoch/policy_loss ▁
-wandb: epoch/positive_advantages_ratio ▁
-wandb:                             +46 ...
-wandb: 
-wandb: Run summary:
-wandb:             epoch/advantage_std 0
-wandb:       epoch/avg_response_length 360.8625
-wandb:                epoch/avg_reward 0.46414
-wandb:      epoch/entropy_masked_ratio 0
-wandb:           epoch/gen_micro_batch 1.05
-wandb:                   epoch/kl_loss 0
-wandb:                      epoch/loss 3.58108
-wandb:         epoch/oom_backoff_count 1.95
-wandb:               epoch/policy_loss 0.01807
-wandb: epoch/positive_advantages_ratio 0.5125
-wandb:                             +46 ...
-wandb: 
-wandb: 🚀 View run INF-triton_on_lora_rank_32 at: https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training/runs/mzf1aclk
-wandb: ⭐️ View project at: https://wandb.ai/e-blanco-universidad-de-deusto/grpo-training
-wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
-wandb: Find logs at: ./wandb/run-20260409_055012-mzf1aclk/logs
-[INFO][grpo.trainer] [WandB] Run finished successfully
-[INFO][grpo.main] Training completed successfully!
-[INFO][grpo.main] Checkpoints saved to: None

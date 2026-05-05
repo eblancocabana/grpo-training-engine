@@ -1,5 +1,0 @@
-{
-  "latest_checkpoint": "/home/ndk/proyectos/clase/pfg/benchmarks/output/cdia_final_validation/cdia_length_penalty_0005_mask_truncated_off_seed2/checkpoints/checkpoint_step_120_final.pt",
-  "step": 120,
-  "epoch": 0
-}
