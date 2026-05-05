@@ -1,0 +1,16 @@
+model_key,family,protocol,datasets,macro_pass@k,macro_avg@k
+base,coding,deterministic,2,0.33499999999999996,0.33499999999999996
+base,math,deterministic,8,0.5357279116465864,0.5357279116465864
+base,science_general,deterministic,2,0.355,0.355
+no_sent_best,coding,deterministic,2,0.31,0.31
+no_sent_best,math,deterministic,8,0.5364959839357429,0.5364959839357429
+no_sent_best,science_general,deterministic,2,0.34,0.34
+no_sent_final,coding,deterministic,2,0.33499999999999996,0.33499999999999996
+no_sent_final,math,deterministic,8,0.5335491967871486,0.5335491967871486
+no_sent_final,science_general,deterministic,2,0.365,0.365
+sent_best,coding,deterministic,2,0.35,0.35
+sent_best,math,deterministic,8,0.558995983935743,0.558995983935743
+sent_best,science_general,deterministic,2,0.37,0.37
+sent_final,coding,deterministic,2,0.32999999999999996,0.32999999999999996
+sent_final,math,deterministic,8,0.5287399598393574,0.5287399598393574
+sent_final,science_general,deterministic,2,0.345,0.345

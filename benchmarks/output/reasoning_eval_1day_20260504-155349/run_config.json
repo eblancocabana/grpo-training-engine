@@ -1,0 +1,52 @@
+{
+  "args": {
+    "batch_size": 8,
+    "datasets": "gsm8k,gsm-plus,svamp,math500,aime24,aime25,amc23,minerva,gpqa-diamond,arc-challenge,humaneval,mbpp",
+    "dtype": "auto",
+    "gpu_memory_utilization": 0.9,
+    "limit_per_dataset": 100,
+    "max_new_tokens": 8192,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "mock_generator": false,
+    "models": null,
+    "models_config": "configs/models.gsmplus_actual.yaml",
+    "n_samples": null,
+    "output_dir": "benchmarks/output/reasoning_eval_1day_20260504-155349",
+    "overwrite": false,
+    "protocol": "deterministic",
+    "quantization": null,
+    "resume": false,
+    "seed": 42,
+    "temperature": null,
+    "tensor_parallel_size": 1,
+    "tier": "maximal",
+    "top_p": null
+  },
+  "dataset_names": [
+    "gsm8k",
+    "gsm-plus",
+    "svamp",
+    "math500",
+    "aime24",
+    "aime25",
+    "amc23",
+    "minerva",
+    "gpqa-diamond",
+    "arc-challenge",
+    "humaneval",
+    "mbpp"
+  ],
+  "environment": {
+    "cwd": "/home/ndk/proyectos/clase/pfg",
+    "python": "3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]"
+  },
+  "model_keys": [
+    "base",
+    "sent_final",
+    "sent_best",
+    "no_sent_final",
+    "no_sent_best"
+  ],
+  "repository": "/home/ndk/proyectos/clase/pfg"
+}

@@ -1,0 +1,6 @@
+{
+  "format": "manual_lora_pt_to_peft_safetensors",
+  "model_key": "no_sent_best",
+  "source_adapter": "outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_8000.pt",
+  "tensor_count": 224
+}

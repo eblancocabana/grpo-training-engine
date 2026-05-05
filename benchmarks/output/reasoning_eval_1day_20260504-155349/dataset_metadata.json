@@ -1,0 +1,110 @@
+{
+  "aime24": {
+    "config": null,
+    "loaded_examples": 30,
+    "order_checksum": 0.6394267984578837,
+    "path": "HuggingFaceH4/aime_2024",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "train"
+  },
+  "aime25": {
+    "config": null,
+    "loaded_examples": 30,
+    "order_checksum": 0.6394267984578837,
+    "path": "test-time-compute/aime_2025",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "train"
+  },
+  "amc23": {
+    "config": null,
+    "loaded_examples": 83,
+    "order_checksum": 0.6394267984578837,
+    "path": "AI-MO/aimo-validation-amc",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "train"
+  },
+  "arc-challenge": {
+    "config": "ARC-Challenge",
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "allenai/ai2_arc",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "gpqa-diamond": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "fingertap/GPQA-Diamond",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "gsm-plus": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "qintongli/GSM-Plus",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "gsm8k": {
+    "config": "main",
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "gsm8k",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "humaneval": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "openai/openai_humaneval",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "math500": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "HuggingFaceH4/MATH-500",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "mbpp": {
+    "config": "sanitized",
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "google-research-datasets/mbpp",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "minerva": {
+    "config": "algebra",
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "EleutherAI/hendrycks_math",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "svamp": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.6394267984578837,
+    "path": "ChilleD/SVAMP",
+    "seed": 42,
+    "source": "huggingface",
+    "split": "test"
+  }
+}
