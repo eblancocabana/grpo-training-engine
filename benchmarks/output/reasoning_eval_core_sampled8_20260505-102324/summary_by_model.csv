@@ -1,0 +1,5 @@
+model_key,protocol,datasets,overall_macro_average,overall_macro_avg_at_k,total_tokens_generated
+base,sampled,4,0.7791666666666667,0.6202083333333334,8609682
+no_sent_final,sampled,4,0.755,0.6044791666666667,8421170
+sent_best,sampled,4,0.76,0.6059375,8521085
+sent_final,sampled,4,0.7625,0.6189583333333333,8452004
