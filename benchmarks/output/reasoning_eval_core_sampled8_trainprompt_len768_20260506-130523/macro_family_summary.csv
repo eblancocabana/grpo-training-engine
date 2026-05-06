@@ -1,0 +1,5 @@
+model_key,family,protocol,datasets,macro_pass@k,macro_avg@k
+base,math,sampled,4,0.5533333333333333,0.3314583333333333
+no_sent_final,math,sampled,4,0.5483333333333333,0.3495833333333333
+sent_best,math,sampled,4,0.5508333333333333,0.34979166666666667
+sent_final,math,sampled,4,0.5458333333333334,0.35291666666666666

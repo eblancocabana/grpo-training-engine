@@ -1,0 +1,38 @@
+{
+  "aime24": {
+    "config": null,
+    "loaded_examples": 30,
+    "order_checksum": 0.8882680764524881,
+    "path": "HuggingFaceH4/aime_2024",
+    "seed": 46,
+    "source": "huggingface",
+    "split": "train"
+  },
+  "gsm-plus": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.8882680764524881,
+    "path": "qintongli/GSM-Plus",
+    "seed": 46,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "gsm8k": {
+    "config": "main",
+    "loaded_examples": 100,
+    "order_checksum": 0.8882680764524881,
+    "path": "gsm8k",
+    "seed": 46,
+    "source": "huggingface",
+    "split": "test"
+  },
+  "math500": {
+    "config": null,
+    "loaded_examples": 100,
+    "order_checksum": 0.8882680764524881,
+    "path": "HuggingFaceH4/MATH-500",
+    "seed": 46,
+    "source": "huggingface",
+    "split": "test"
+  }
+}
