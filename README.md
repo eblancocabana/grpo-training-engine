@@ -1,496 +1,301 @@
-# GRPO Training Engine for RTX 3060 Ti (8GB VRAM)
+# GRPO Training Engine
 
-A native PyTorch training engine for GRPO (Group Relative Policy Optimization) specifically optimized for the NVIDIA RTX 3060 Ti with 8GB VRAM.
+Native PyTorch training and evaluation stack for GRPO-style reasoning-model
+fine-tuning on constrained NVIDIA GPUs.
 
-## 🎯 Key Features
+The project was built around an RTX 3060 Ti with 8 GB of VRAM and
+`deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`. The point is to train a small
+reasoning model while keeping the awkward parts visible: memory pressure,
+rollout cost, curriculum choices, benchmark selection, and recovery after OOMs.
+Those details are easy to lose inside a high-level trainer.
 
-- **Native 4-bit Quantization** using `bitsandbytes` (~0.85GB for 1.5B parameters)
-- **Manual LoRA Implementation** without PEFT dependencies
-- **GRPO from Scratch** without HF Trainer or TRL
-- **Selective Backpropagation** based on token entropy
-- **Curriculum Learning (SENT)**: Sorts training data by semantic entropy (easy to hard)
-- **Surgical Memory Management** designed for 8GB VRAM constraints
+## What this repo contains
 
-## 📋 System Requirements
+- A native GRPO training loop without HF Trainer, TRL, or PEFT.
+- 4-bit base-model loading through `bitsandbytes`.
+- Manual LoRA adapters over the Q/K/V/O projections.
+- Entropy-based selective backpropagation.
+- SENT curriculum support based on semantic-entropy ordering.
+- Split-aware math dataset loading for GSM8K, GSM-Plus, Open-RS,
+  DAPO-MATH-17K, and Open-DeepScaler style workflows.
+- Optional Triton kernels for selected hot paths.
+- Replay-aware OOM recovery and adaptive micro-batching for low-VRAM runs.
+- Benchmark harnesses, optimizer tooling, VRAM profiling, and vLLM reasoning
+  evaluation for base/final/best-checkpoint comparisons.
 
+## Thesis context
+
+This repository supports an integrated double-degree final project with two
+separate readings of the same system.
+
+### Computer engineering
+
+The computer engineering side is the constrained-system training engine:
+explicit VRAM budgeting, 4-bit loading, manual LoRA injection, phase-aware
+memory cleanup, checkpoint/retry behavior, Triton/PyTorch execution choices,
+profiler support, and benchmark-backed defaults for a consumer 8 GB GPU.
+
+### Data science and artificial intelligence
+
+The data science and artificial intelligence side is the GRPO reasoning
+experiment: reward and verifier design, grouped rollout behavior, clipping and
+length-control choices, SENT curriculum experiments, dataset selection,
+validation methodology, and post-training reasoning evaluation across math
+benchmarks.
+
+## Hardware and software
+
+The default configuration is tuned for this environment:
+
+```text
+GPU: NVIDIA RTX 3060 Ti, 8 GB VRAM
+CUDA: 12.1-class environment
+Python: 3.10+
+Model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 ```
-- GPU: NVIDIA RTX 3060 Ti (8GB VRAM)
-- Python: 3.10+
-- CUDA: 12.1
-- PyTorch: 2.10.0+cu121
-```
 
-## 🚀 Quick Install
+Other CUDA-capable NVIDIA GPUs may work, but memory-related defaults may need
+adjustment. CPU-only execution is not a primary target.
+
+## Install
 
 ```bash
-# 1. Load shell environment and activate conda environment
-source ~/.zshrc
 conda activate grpo-3060ti
-
-# 2. Install dependencies
 bash scripts/install_dependencies.sh
-
-# 3. Verify installation
 python train.py --dry-run
 ```
 
-### Manual Installation
+Manual install:
 
 ```bash
-# PyTorch with CUDA 12.1
-pip install torch==2.10.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Core dependencies
-pip install transformers accelerate bitsandbytes datasets scipy numpy tqdm wandb
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 ```
 
-## 📁 Project Structure
+`vllm` is optional for core training, but required for the vLLM SENT
+preprocessing path and the standalone reasoning-evaluation pipeline.
 
-```
-.
-├── src/
-│   ├── core/
-│   │   ├── model_loader.py      # 4-bit model loading
-│   │   ├── lora.py              # Manual LoRA implementation
-│   │   └── memory_manager.py    # VRAM management
-│   ├── grpo/
-│   │   ├── algorithm.py         # GRPO loss & advantage calculation
-│   │   ├── benchmark.py         # GSM8K benchmark loop
-│   │   ├── trainer.py           # Native training loop
-│   │   └── verifier.py          # Response verification
-│   ├── selective/
-│   │   └── entropy_mask.py      # Entropy-based masking
-│   ├── data/
-│   │   ├── gsm8k_loader.py      # GSM8K Dataset loader (with Curriculum)
-│   │   └── sent_calculator.py   # Semantic Entropy calculation
-│   └── utils/
-│       ├── config.py            # Configuration management
-│       ├── checkpoint.py        # Checkpoint save/load
-│       └── logging_utils.py     # Structured logging
-├── train.py                     # Main training script
-├── scripts/
-│   ├── inference.py             # Post-training inference
-│   ├── preprocess_sent.py       # SENT preprocessing
-│   ├── preprocess_sent_vllm.py  # SENT Preprocessing (vLLM optimized)
-│   └── install_dependencies.sh  # Auto-installation script
-├── tests/                       # Test suite
-│   ├── optimizer/               # Optimizer workflow tests
-│   ├── test_grpo_algorithm.py   # GRPO math and clipping
-│   ├── test_integration.py      # Training loop integration
-│   ├── test_lora.py             # LoRA injection tests
-│   ├── test_sent.py             # Curriculum Learning tests
-│   ├── test_triton_*.py         # Triton correctness / perf coverage
-│   └── ... (see tests/ for full list)
-└── requirements.txt             # Dependencies
-```
+## Quick start
 
-## 💻 Usage
-
-### 1. Verify System
+Run a short configuration and system check:
 
 ```bash
 python train.py --dry-run
 ```
 
-Runs the setup/configuration validation path without starting training.
-Use `pytest tests/` for the full automated test suite.
+Run a small smoke training job without Weights & Biases or the initial
+benchmark:
 
-### 2. Running Tests
-
-The project uses `pytest` for correctness, integration, optimizer, and Triton coverage.
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run focused subsets
-pytest tests/test_sent.py
-pytest tests/test_grpo_algorithm.py
-pytest tests/optimizer/
-pytest tests/test_triton_generation_correctness.py
-```
-
-### 3. Preprocessing (SENT Curriculum)
-
-To enable Curriculum Learning, you must generate the sorted dataset cache. We provide a vLLM-optimized script for speed:
-
-```bash
-# 1. Be sure to have vLLM installed (optional but recommended for speed)
-pip install vllm
-
-# 2. Run preprocessing (generates data/cache/gsm8k_sent_sorted.pt)
-python scripts/preprocess_sent_vllm.py
-```
-
-> **Note:** If you skip this, training will proceed without Curriculum Learning (standard shuffling).
-
-### 3. Training
-
-**Basic training:**
-```bash
-python train.py
-```
-
-**With custom options (including WandB & Entropy):**
 ```bash
 python train.py \
-    --epochs 3 \
-    --group-size 4 \
-    --lora-rank 16 \
-    --learning-rate 1e-4 \
-    --use-entropy-mask \
-    --wandb-project "grpo-experiment-1"
+  --no-wandb \
+  --no-initial-benchmark \
+  --max-steps 5 \
+  --group-size 4 \
+  --max-response-length 768
 ```
 
-**Configuration Test (Dry Run):**
+Run the current 8 GB preset:
+
 ```bash
-python train.py --dry-run
+python train.py \
+  --use-triton \
+  --no-triton-generation \
+  --triton-grpo-loss \
+  --triton-entropy-mask \
+  --triton-lora \
+  --group-size 4 \
+  --gradient-accumulation-steps 16 \
+  --max-response-length 768 \
+  --lora-rank 16 \
+  --lora-adapter-quant none
 ```
 
-### 4. Inference
+The benchmark results favor selective Triton use. Keep Triton for GRPO loss,
+entropy masking, and LoRA forward paths, but leave Triton generation off.
+`group_size=4` and `max_response_length=768` are the safest defaults for the
+8 GB target.
+
+## Training options
+
+Common training flags:
+
+```bash
+python train.py \
+  --dataset-name gsm8k \
+  --epochs 3 \
+  --group-size 4 \
+  --lora-rank 16 \
+  --learning-rate 1e-4 \
+  --max-response-length 768 \
+  --use-entropy-mask \
+  --log-metrics-jsonl \
+  --output-dir ./outputs/run_name
+```
+
+Useful switches:
+
+- `--no-sent`: disable SENT curriculum ordering.
+- `--sent-stage N`: train on a fixed curriculum stage.
+- `--no-mask-truncated`: keep truncated completions in the loss.
+- `--length-penalty-coef X`: apply a response-length penalty before advantage
+  calculation.
+- `--temperature X` and `--top-p X`: control rollout sampling.
+- `--resume` or `--resume-checkpoint PATH`: continue from a checkpoint.
+- `--profile`: enable the live profiler server and profiler hooks.
+- `--no-triton`: force the pure PyTorch path.
+
+## SENT preprocessing
+
+SENT orders training examples by semantic entropy. The vLLM path is the
+faster preprocessing route when available:
+
+```bash
+python scripts/preprocess_sent_vllm.py \
+  --dataset-name gsm8k \
+  --cache-path data/cache/gsm8k_sent_sorted.pt \
+  --M 4 \
+  --temperature 1.0 \
+  --batch-size 32
+```
+
+For non-GSM8K datasets, set `--dataset-name` and use a dataset-specific cache
+path. Training resolves compatible SENT caches from dataset metadata when
+possible.
+
+## Reasoning evaluation
+
+Use the standalone vLLM evaluator to compare the base model, final LoRA
+adapters, and validation-selected best checkpoints:
+
+```bash
+python scripts/evaluate_reasoning_vllm.py \
+  --models-config configs/models.example.yaml \
+  --datasets gsm8k,gsm-plus,math500,aime24 \
+  --tier strong \
+  --protocol sampled \
+  --n-samples 8 \
+  --max-new-tokens 8192 \
+  --output-dir benchmarks/output/reasoning_eval
+```
+
+Model entries live in YAML files under `configs/`. Best checkpoints should be
+selected from in-training validation, not from the final benchmark suite.
+
+## Project structure
+
+```text
+.
+├── train.py                         # Main training CLI
+├── src/
+│   ├── core/                        # Model loading, LoRA, memory manager
+│   ├── data/                        # GSM8K and generic math dataset loading
+│   ├── grpo/                        # GRPO algorithm, verifier, trainer, benchmark
+│   ├── reasoning_eval/              # vLLM evaluation pipeline
+│   ├── selective/                   # Entropy mask logic
+│   ├── triton_kernels/              # Optional Triton kernels
+│   └── utils/                       # Config, checkpoints, logging
+├── scripts/                         # Inference, SENT, filtering, evaluation
+├── benchmarks/                      # Bounded benchmark suites
+├── optimizer/                       # Benchmark-authoritative optimizer loop
+├── tools/                           # Profiling and comparison tools
+├── tests/                           # Unit, integration, Triton, SENT, optimizer tests
+└── configs/                         # Reasoning-evaluation model configs
+```
+
+## Core design
+
+The training loop expands each prompt into a group of sampled completions,
+verifies each answer with a rule-based verifier, centers rewards inside the
+group, and optimizes LoRA adapter weights with a clipped GRPO objective. The
+base model remains quantized and frozen.
+
+```text
+prompt -> grouped generation -> verification -> centered advantages
+       -> old log-probs -> GRPO loss -> optional entropy mask -> LoRA update
+```
+
+The low-VRAM setup relies on these choices:
+
+- 4-bit frozen base model.
+- BF16 LoRA adapters only on selected projection layers.
+- No value network.
+- Response-length caps and grouped rollout limits.
+- Gradient checkpointing.
+- Explicit cleanup between generation, scoring, and training.
+- Adaptive micro-batching and retry behavior after recoverable OOMs.
+
+## Outputs
+
+Training runs write artifacts under the configured `--output-dir`:
+
+```text
+outputs/
+├── checkpoints/                 # Full checkpoints and latest metadata
+├── logs/                        # Runtime logs
+├── metrics.jsonl                # Optional structured metrics
+├── lora_weights_final.pt        # Final adapter weights
+└── baseline_benchmark_done.json # Optional initial benchmark marker
+```
+
+Benchmark, reasoning-evaluation, optimizer, SENT, and profiler workflows write
+their own outputs under `benchmarks/output/`, `optimizer/artifacts/`,
+`data/cache/`, and profiler-specific directories.
+
+Large full checkpoints are not suitable for regular Git blobs. Keep them local
+or publish them through an artifact store or Git LFS.
+
+## Testing
+
+```bash
+pytest tests/
+```
+
+Focused subsets:
+
+```bash
+pytest tests/test_grpo_algorithm.py
+pytest tests/test_sent.py
+pytest tests/test_triton_generation_correctness.py
+pytest tests/optimizer/
+pytest tests/evaluation/
+```
+
+## Inference
 
 ```bash
 python scripts/inference.py \
-    --lora-weights ./outputs/lora_weights_final.pt \
-    --prompt "What is 15 + 27?" \
-    --max-tokens 200
+  --lora-weights ./outputs/lora_weights_final.pt \
+  --prompt "What is 15 + 27?" \
+  --max-tokens 200 \
+  --temperature 0.7
 ```
 
-## ⚙️ Configuration for 8GB VRAM
-
-The optimized configuration for RTX 3060 Ti is located in `src/utils/config.py::get_8gb_vram_config()`:
-
-```python
-# Model
-- Model: DeepSeek-R1-Distill-Qwen-1.5B
-- Quantization: 4-bit (NF4)
-- Model Memory: ~0.85 GB
-
-# LoRA
-- Rank: 16
-- Alpha: 32
-- Target modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
-- Trainable Params: ~30M (<0.05 GB)
-
-# GRPO
-- Group size: 4 (Safe default) - Up to 8 possible with strict memory management
-- No KL divergence (VRAM saving)
-- Clip epsilon: 0.2
-
-# Training
-- Batch size: 1
-- Gradient accumulation: 16
-- Sequence length: 4096 (prompt) + 768 (response)
-- Gradient checkpointing: Enabled
-```
-
-### VRAM Budget (group_size=8)
-
-| Component | Memory (GB) |
-|-----------|-------------|
-| Model (4-bit) | ~0.85 |
-| LoRA (trainable) | ~0.05 |
-| Optimizer (AdamW) | ~0.10 |
-| KV Cache | ~0.50 |
-| Activations (8 responses) | ~4.5 |
-| CUDA Overhead | ~0.5 |
-| **Peak Total** | **~6.5** |
-| **Safety Margin** | **~1.5** |
-
-## 🔧 Key Components
-
-### 1. Manual LoRA (`src/core/lora.py`)
-
-Custom LoRA implementation without PEFT:
-
-```python
-Y = W_4bit(x) + B(A(x)) * (alpha / rank)
-```
-
-- **Base**: 4-bit quantized weights (frozen)
-- **Adapters**: Matrices A and B in BF16 (trainable)
-- **Gradients**: Flow only through A and B
-
-### 2. GRPO Algorithm (`src/grpo/algorithm.py`)
-
-Group Relative Policy Optimization:
-
-```python
-# No Value Network (VRAM saving)
-Advantage_i = r_i - mean(r_group)
-
-# GRPO Loss
-loss = -E[min(ratio * A, clip(ratio) * A)]
-```
-
-**Advantages over PPO:**
-- ~40-50% less VRAM (no Critic network)
-- Simpler implementation
-- Group baseline instead of Value function
-- Global normalization by `group_size`
-- Two-sided clipping with `epsilon_high` and hard cap `delta`
-
-### 3. Selective Backpropagation (`src/selective/entropy_mask.py`)
-
-Entropy-based filtering:
-
-```python
-H(x) = -sum(p * log(p))  # Entropy per token
-mask = H > threshold     # Keep uncertain tokens
-loss = (loss * mask).mean()
-```
-
-**Benefits:**
-- Blocks gradients for trivial tokens
-- Accelerates training
-- Focuses on "hard" tokens
-
-### 5. Curriculum Learning (`src/data/sent_calculator.py`)
-
-Implementation of **SENT (Semantic Entropy)**:
-1. Sample `M` responses for each query (Temperature=1.0)
-2. Cluster responses by semantic meaning (exact answer match)
-3. Compute Entropy: `H = -sum(P(c) * log P(c))`
-4. Sort dataset: Low Entropy (Easy) → High Entropy (Hard)
-5. Train in stages (Curriculum)
-
-### 6. Memory Manager (`src/core/memory_manager.py`)
-
-Aggressive VRAM management:
-
-```python
-- Periodic torch.cuda.empty_cache()
-- Gradient checkpointing
-- Cleanup between phases (gen/train)
-- Pre-allocated buffers
-```
-
-## 📊 Training Flow
-
-```
-1. GENERATION (torch.no_grad)
-   ├── Load prompt batch
-   ├── Expand to group_size (G=4-8)
-   ├── Generate responses
-   ├── Verify responses → Rewards
-   └── Mask truncated completions if configured
-
-2. ADVANTAGE CALCULATION
-   ├── Group rewards by prompt
-   └── Center rewards: (r - mean)
-
-3. TRAINING
-   ├── Pre-compute old_log_probs
-   ├── Forward pass with prompt + generated tokens
-   ├── Calculate entropy per token
-   ├── Create selection mask
-   ├── GRPO Loss + mask
-   ├── Backward (selected tokens only if enabled)
-   └── Optimizer step
-```
-
-## 🎛️ Configurable Parameters
-
-### Training (`train.py`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--epochs` | 3 | Number of epochs |
-| `--group-size` | 4 | Responses per prompt |
-| `--lora-rank` | 16 | LoRA Rank |
-| `--learning-rate` | 1e-4 | Learning rate |
-| `--use-entropy-mask` | True | Entropy-based filtering |
-| `--use-triton` / `--no-triton` | True | Use Triton kernels (falls back to PyTorch if missing) |
-| `--wandb` | True | Enable Weights & Biases logging |
-
-### Advanced Configuration
-
-Edit `src/utils/config.py`:
-
-```python
-# In get_8gb_vram_config()
-config.training.max_response_length = 768
-config.training.gradient_accumulation_steps = 16
-config.entropy.percentile = 0.5  # % tokens to keep
-config.grpo.clip_epsilon = 0.2
-config.grpo.epsilon_high = 0.3
-config.grpo.delta = 1.5
-```
-
-### Triton Kernels
-
-The project includes optional Triton kernels for optimized performance. By default, training attempts to use Triton kernels. If Triton is not installed, it falls back to pure PyTorch implementations automatically.
-
-```bash
-# Explicitly disable Triton kernels
-python train.py --no-triton
-
-# Explicitly enable (default)
-python train.py --use-triton
-```
-
-> **Note:** If you encounter issues with Triton, use `--no-triton` to fall back to PyTorch.
-
-## 🐛 Troubleshooting
-
-### Out of Memory (OOM)
-
-**Symptoms:** `CUDA out of memory` error
-
-**Solutions:**
-```python
-# 1. Reduce group_size (Minimum recommended: 4)
-config.grpo.group_size = 4
-
-# 2. Reduce sequence length
-config.training.max_response_length = 256
-
-# 3. Reduce LoRA rank
-config.lora.rank = 8
-
-# 4. Increase cache cleanup frequency
-config.training.clear_cache_frequency = 2
-```
-
-### SLOWNESS
-
-**Symptoms:** Very slow training
-
-**Common Causes:**
-1. **Gradient checkpointing**: Saves VRAM but is slower
-2. **High Group size**: More generations = more time
-3. **CPU bottleneck**: Check GPU usage with `nvidia-smi`
-
-## 📈 Monitoring
-
-The training process uses **Weights & Biases (WandB)** by default.
-
-**Terminal Output:**
-```
-[Step 100] VRAM: 5.2GB / 8.0GB (65.0%) | Free: 2.8GB
-Epoch 1:  45%|████▌     | 450/1000 [12:30<15:20, loss=0.2341, reward=0.523]
-```
-
-**Important Metrics:**
-- `loss`: GRPO Loss (should decrease)
-- `reward`: Correct response rate (0-1)
-- `advantage`: Average advantage
-- `VRAM`: GPU Memory usage
-
-## 💾 Checkpoints
-
-Automatically saved in `./outputs/checkpoints/`:
-
-```
-checkpoints/
-├── checkpoint_step_500.pt      # Full checkpoint
-├── checkpoint_step_1000.pt
-├── lora_weights_final.pt       # LoRA weights only
-└── ...
-```
-
-**Load checkpoint:**
-```python
-from src.utils.checkpoint import CheckpointManager
-
-manager = CheckpointManager("./outputs/checkpoints")
-info = manager.load_checkpoint("checkpoint_step_1000.pt", model, optimizer)
-```
-
-### Artifact Push Notes
-
-The run `outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1` was pushed with its config, metrics, benchmark marker, `checkpoints/latest.json`, and final LoRA weights. The following full checkpoint files remain local because each is about 1.5 GB and cannot be pushed to GitHub as regular Git blobs without Git LFS:
-
-```text
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_0_interrupted.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_1000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_197_interrupted.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_2000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_3000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_4000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_441_interrupted.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_5000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_6000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_7000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_8000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9000.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_epoch_1.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_final.pt
-outputs/gsmplus_raw_grpo_lr5e6_ep4_len768_t1_p1_ga8_seed1/checkpoints/checkpoint_step_9496_interrupted.pt
-```
-
-## 🎯 RTX 3060 Ti Specific Optimizations
-
-### Verified Optimal Configuration (group_size=8)
-
-The following configuration has been verified as stable:
-
-```bash
-python train.py --no-wandb --epochs 1 --group-size 8
-```
-
-| Parameter | Value | Justification |
-|-----------|-------|---------------|
-| `group_size` | 8 | Maximum stable without OOM |
-| `max_response_length` | 768 | Good balance of reasoning length and VRAM |
-| `max_prompt_length` | 4096 | Matches current config defaults |
-| `lora_rank` | 16 | Quality/Memory balance |
-| `gradient_accumulation` | 16 | Effective batch size = 16 |
-| `learning_rate` | 1e-4 | Stable for GRPO |
-
-#### Performance Metrics
-
-| Config | Time/Step | Peak VRAM | Status |
-|--------|-----------|-----------|--------|
-| group_size=4 | ~16s | ~6.3GB | ✅ Stable |
-| group_size=8 | ~33s | ~6.5GB | ✅ Stable, NO OOM |
-
-### 1. Ampere Architecture
-
-- **TF32 enabled**: `torch.backends.cuda.matmul.allow_tf32 = True`
-- **cuDNN TF32**: `torch.backends.cudnn.allow_tf32 = True`
-- **cuDNN Benchmark**: `torch.backends.cudnn.benchmark = True`
-- Uses BF16 (natively supported, better performance than FP16)
-
-### 2. 8GB VRAM Strategy
-
-- Double quantization enabled
-- No KL divergence (reference model saving)
-- Group size up to 8 (verified stable)
-- Micro-batching in generation
-
-### 3. Gradient Checkpointing
-
-- Trade compute ↔ memory
-- Essential for 8GB
-- Enabled by default
-
-### 4. GRPO Algorithm Fix
-
-Current Dr. GRPO implementation uses centered rewards directly:
-- `advantage = reward - group_mean`
-- no standard deviation normalization
-- no `min_std` clamp or synthetic baseline for uniform groups
-
-## 📚 References
-
-- **DeepSeek-R1**: [HuggingFace](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B)
-- **GRPO Paper**: DeepSeekMath (arXiv:2402.03300)
-- **LoRA**: Low-Rank Adaptation of Large Language Models
-- **bitsandbytes**: 8-bit & 4-bit quantization
-
-## 🤝 Contributions
-
-This project is part of a Double Degree Thesis (TFG):
-- **Computer Engineering**: Efficient training engine
-- **Data Science & AI**: GRPO algorithm and reasoning
-
-## 📝 License
-
-Academic project for TFG.
-
----
-
-**Author**: Endika Blanco Cabana
-**Hardware**: NVIDIA RTX 3060 Ti (8GB)
-**Date**: April 2026
+## Limitations
+
+- The repository is optimized for NVIDIA CUDA hardware, especially an 8 GB RTX
+  3060 Ti. Other GPUs may require different batch, response-length, or
+  micro-batch settings.
+- vLLM workflows require a compatible vLLM installation and enough memory for
+  the selected evaluation configuration.
+- SENT and reward-design results are experimental. The strongest claims should
+  be made from benchmark outputs, validation-selected checkpoints, and matched
+  comparisons rather than from a single final training checkpoint.
+
+## References
+
+- DeepSeek-R1-Distill-Qwen-1.5B:
+  <https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B>
+- DeepSeekMath / GRPO: <https://arxiv.org/abs/2402.03300>
+- Dr. GRPO / Understanding R1-Zero-like training:
+  <https://openreview.net/forum?id=5PAF7PAY2Y>
+- LoRA: <https://arxiv.org/abs/2106.09685>
+- QLoRA: Efficient Finetuning of Quantized LLMs:
+  <https://proceedings.neurips.cc/paper_files/paper/2023/hash/1feb87871436031bdc0f2beaa62a049b-Abstract-Conference.html>
+- bitsandbytes: <https://github.com/bitsandbytes-foundation/bitsandbytes>
+
+## License
+
+Academic project for a double-degree final thesis.
+
+Author: Endika Blanco Cabana
