@@ -9,7 +9,7 @@ from src.reasoning_eval.adapters import prepare_vllm_adapter
 from src.reasoning_eval.datasets import DATASET_REGISTRY, load_examples, normalize_row, resolve_dataset_names
 from src.reasoning_eval.io import completed_example_keys, prepare_output_dir
 from src.reasoning_eval.models import ModelSpec, load_models_config
-from src.reasoning_eval.prompts import build_prompt
+from src.reasoning_eval.prompts import build_evaluation_prompt, build_prompt
 from src.reasoning_eval.schema import EvalExample, Generation
 from src.reasoning_eval.scoring import (
     extract_final_answer,
@@ -56,6 +56,29 @@ def test_cli_parsing_sets_tier_defaults(tmp_path: Path) -> None:
 
     assert args.protocol == "both"
     assert args.max_new_tokens == 16384
+    assert args.prompt_style == "reasoning"
+
+
+def test_cli_parsing_accepts_training_prompt_style_and_768_tokens(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--models-config",
+            str(tmp_path / "models.yaml"),
+            "--datasets",
+            "gsm8k",
+            "--tier",
+            "minimal",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--prompt-style",
+            "training",
+            "--max-new-tokens",
+            "768",
+        ]
+    )
+
+    assert args.prompt_style == "training"
+    assert args.max_new_tokens == 768
 
 
 def test_models_config_requires_in_training_selection_source(tmp_path: Path) -> None:
@@ -156,6 +179,32 @@ def test_prompt_construction_for_math_and_multiple_choice() -> None:
     mc_prompt = build_prompt(mc_example)
     assert "A. alpha" in mc_prompt
     assert "B. beta" in mc_prompt
+
+
+def test_evaluation_prompt_styles_use_reasoning_or_training_format() -> None:
+    class TemplateTokenizer:
+        chat_template = "template"
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, str]],
+            tokenize: bool = False,
+            add_generation_prompt: bool = True,
+        ) -> str:
+            assert tokenize is False
+            assert add_generation_prompt is True
+            return f"<user>{messages[0]['content']}</user><assistant>"
+
+    example = EvalExample("gsm8k", "math", "math", "1", "What is 6*7?", "42")
+
+    reasoning_prompt = build_evaluation_prompt(example, TemplateTokenizer(), "reasoning")
+    training_prompt = build_evaluation_prompt(example, TemplateTokenizer(), "training")
+
+    assert "Solve the problem" in reasoning_prompt
+    assert "\\boxed{}" in reasoning_prompt
+    assert training_prompt == "<user>What is 6*7?</user><assistant>"
+    assert "Solve the problem" not in training_prompt
+    assert "\\boxed{}" not in training_prompt
 
 
 @pytest.mark.parametrize(

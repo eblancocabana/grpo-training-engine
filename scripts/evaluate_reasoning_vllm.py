@@ -43,7 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tier", choices=("minimal", "strong", "maximal"), required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--protocol", choices=("deterministic", "sampled", "both"), default=None)
-    parser.add_argument("--max-new-tokens", type=int, choices=(8192, 16384, 32768), default=None)
+    parser.add_argument("--prompt-style", choices=("reasoning", "training"), default="reasoning")
+    parser.add_argument("--max-new-tokens", type=int, choices=(768, 8192, 16384, 32768), default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--n-samples", type=int, default=None)
@@ -171,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        prompt_style=args.prompt_style,
         use_mock_generator=args.mock_generator,
     )
     runner.run()

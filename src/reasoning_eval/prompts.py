@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
+from src.data.gsm8k_loader import format_grpo_prompt
 from src.reasoning_eval.schema import EvalExample
+
+PromptStyle = Literal["reasoning", "training"]
 
 
 MATH_SUFFIX = (
@@ -59,3 +62,17 @@ def build_prompt(example: EvalExample, tokenizer: Any | None = None) -> str:
 
     return _chat_format(tokenizer, content) if tokenizer is not None else content
 
+
+def build_evaluation_prompt(
+    example: EvalExample,
+    tokenizer: Any | None = None,
+    prompt_style: PromptStyle = "reasoning",
+) -> str:
+    """Build an evaluation prompt using the requested prompting style."""
+    if prompt_style == "reasoning":
+        return build_prompt(example, tokenizer)
+    if prompt_style == "training":
+        if tokenizer is None:
+            return example.question
+        return format_grpo_prompt(tokenizer, example.question)
+    raise ValueError(f"Unsupported prompt style: {prompt_style}")

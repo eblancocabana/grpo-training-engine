@@ -17,7 +17,7 @@ from src.reasoning_eval.adapters import prepare_vllm_adapter
 from src.reasoning_eval.datasets import DATASET_REGISTRY, load_examples
 from src.reasoning_eval.io import append_jsonl, completed_example_keys, read_jsonl, write_csv
 from src.reasoning_eval.models import ModelSpec
-from src.reasoning_eval.prompts import build_prompt
+from src.reasoning_eval.prompts import PromptStyle, build_evaluation_prompt
 from src.reasoning_eval.schema import EvalExample, Generation
 from src.reasoning_eval.scoring import avg_at_k, median, pass_at_k, score_generation
 from src.reasoning_eval.vllm_engine import GenerationProtocol, MockGenerator, VLLMGenerator
@@ -251,6 +251,7 @@ class EvaluationRunner:
         seed: int,
         max_num_seqs: int,
         max_num_batched_tokens: int,
+        prompt_style: PromptStyle = "reasoning",
         use_mock_generator: bool = False,
     ) -> None:
         self.output_dir = output_dir
@@ -271,6 +272,7 @@ class EvaluationRunner:
         self.seed = seed
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.prompt_style = prompt_style
         self.use_mock_generator = use_mock_generator
 
     def run(self) -> None:
@@ -354,7 +356,14 @@ class EvaluationRunner:
 
             for model in base_models:
                 for dataset_name, examples in examples_by_dataset.items():
-                    prompts = {example.example_id: build_prompt(example, tokenizer) for example in examples}
+                    prompts = {
+                        example.example_id: build_evaluation_prompt(
+                            example,
+                            tokenizer,
+                            self.prompt_style,
+                        )
+                        for example in examples
+                    }
                     for protocol in protocol_plan(
                         selected_protocol=self.selected_protocol,
                         tier=self.tier,
