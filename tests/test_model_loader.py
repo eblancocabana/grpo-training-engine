@@ -4,6 +4,9 @@ from unittest.mock import patch
 import torch
 
 
+DEPRECATED_DTYPE_KEY = "torch" + "_dtype"
+
+
 def test_load_4bit_engine_uses_model_config_knobs_without_quantization():
     from src.core import model_loader
 
@@ -41,7 +44,8 @@ def test_load_4bit_engine_uses_model_config_knobs_without_quantization():
     tok_loader.assert_called_once_with("custom-model")
     bnb_cls.assert_not_called()
     _, kwargs = model_loader_fn.call_args
-    assert kwargs["torch_dtype"] is torch.float16
+    assert kwargs["dtype"] is torch.float16
+    assert DEPRECATED_DTYPE_KEY not in kwargs
     assert kwargs["attn_implementation"] == "eager"
     assert kwargs["device_map"] == "cpu"
     assert "quantization_config" not in kwargs
@@ -89,6 +93,7 @@ def test_load_4bit_engine_builds_quantization_config_from_model_settings():
     )
     _, kwargs = model_loader_fn.call_args
     assert kwargs["quantization_config"] == "bnb-config"
-    assert kwargs["torch_dtype"] is torch.bfloat16
+    assert kwargs["dtype"] is torch.bfloat16
+    assert DEPRECATED_DTYPE_KEY not in kwargs
     assert kwargs["device_map"] == "balanced"
     assert kwargs["attn_implementation"] == "sdpa"

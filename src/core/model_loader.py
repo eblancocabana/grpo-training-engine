@@ -10,7 +10,7 @@ from src.utils.logging_utils import get_logger
 logger = get_logger("core.model_loader")
 
 
-def _resolve_torch_dtype(dtype_name):
+def _resolve_dtype(dtype_name):
     """Resolve a config dtype string into a torch dtype."""
     if isinstance(dtype_name, torch.dtype):
         return dtype_name
@@ -47,7 +47,7 @@ def load_4bit_engine(
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    compute_dtype = _resolve_torch_dtype(bnb_4bit_compute_dtype)
+    compute_dtype = _resolve_dtype(bnb_4bit_compute_dtype)
     bnb_config = None
     if load_in_4bit and BitsAndBytesConfig is not None:
         bnb_config = BitsAndBytesConfig(
@@ -58,7 +58,7 @@ def load_4bit_engine(
         )
     elif load_in_4bit:
         logger.warning(
-            "bitsandbytes unavailable; loading model with torch_dtype=%s without quantization.",
+            "bitsandbytes unavailable; loading model with dtype=%s without quantization.",
             compute_dtype,
         )
 
@@ -70,7 +70,7 @@ def load_4bit_engine(
 
         model_kwargs = {
             "device_map": device_map,
-            "torch_dtype": compute_dtype,
+            "dtype": compute_dtype,
         }
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
