@@ -28,6 +28,10 @@ Those details are easy to lose inside a high-level trainer.
 This repository supports an integrated double-degree final project with two
 separate readings of the same system.
 
+The full final project reports are available under `docs/thesis/`:
+[Computer Engineering](docs/thesis/INF_Endika_Blanco_Cabana.pdf) and
+[Data Science and Artificial Intelligence](docs/thesis/CDIA_Endika_Blanco_Cabana.pdf).
+
 ### Computer engineering
 
 The computer engineering side is the constrained-system training engine:

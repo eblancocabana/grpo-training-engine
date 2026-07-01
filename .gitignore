@@ -51,6 +51,9 @@ Thumbs.db
 
 # Docs and markdown files
 docs/
+!docs/
+!docs/thesis/
+!docs/thesis/*.pdf
 *.md
 !/.gitignore
 !/README.md
